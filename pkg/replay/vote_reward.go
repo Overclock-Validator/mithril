@@ -31,6 +31,10 @@ const voteAccountsPerWorker = 64
 // maxVoteAccountWorkers caps the workers; tests set it to 1 for the serial reference.
 var maxVoteAccountWorkers = 8
 
+// voteAccountClaim is how many vote accounts a worker takes at a time. Zero
+// gives each worker one fixed share (tests compare the two).
+var voteAccountClaim = 16
+
 // A reward update detaches its payload from execution's reusable arenas. Only
 // the exact value written here can share these bytes at final publication.
 type votePublicationVersions map[solana.PublicKey]*accounts.Account
@@ -456,25 +460,41 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 	if len(votePubkeys) >= 2*voteAccountsPerWorker {
 		workers = min(runtime.GOMAXPROCS(0), maxVoteAccountWorkers, len(votePubkeys)/voteAccountsPerWorker)
 	}
+	// Workers claim short runs of accounts instead of owning a fixed share, so
+	// a worker that starts late (the block's other goroutines can hold every
+	// processor for a few hundred microseconds) does less instead of deciding
+	// when the step ends. Results are kept by account index, so what follows
+	// the join does not depend on which worker updated which account.
 	type voteAccountChunk struct {
 		leaderReward uint64
-		written      []creditedVoteAccount
+		errIndex     int
 		err          error
 	}
 	chunks := make([]voteAccountChunk, workers)
+	claim := voteAccountClaim
+	if claim <= 0 || workers == 1 {
+		claim = (len(votePubkeys) + workers - 1) / workers
+	}
+	var claimed atomic.Int64
+	written := make([]creditedVoteAccount, len(votePubkeys))
+	wrote := make([]bool, len(votePubkeys))
 	updateChunk := func(w int) {
 		chunk := &chunks[w]
-		start := w * len(votePubkeys) / workers
-		keys := votePubkeys[start : (w+1)*len(votePubkeys)/workers]
-		chunk.written = make([]creditedVoteAccount, 0, len(keys))
-		for i, votePubkey := range keys {
-			credited, err := updateVoteAccount(votePubkey, &chunk.leaderReward, start+i)
-			if err != nil {
-				chunk.err = err
+		for {
+			end := int(claimed.Add(int64(claim)))
+			start := end - claim
+			if start >= len(votePubkeys) {
 				return
 			}
-			if credited != nil {
-				chunk.written = append(chunk.written, *credited)
+			for i := start; i < min(end, len(votePubkeys)); i++ {
+				credited, err := updateVoteAccount(votePubkeys[i], &chunk.leaderReward, i)
+				if err != nil {
+					chunk.err, chunk.errIndex = err, i
+					return
+				}
+				if credited != nil {
+					written[i], wrote[i] = *credited, true
+				}
 			}
 		}
 	}
@@ -492,22 +512,32 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 		updateChunk(0)
 		wg.Wait()
 	}
+	// Report the failure of the earliest account, whichever worker met it.
+	var firstErr error
+	firstErrIndex := len(votePubkeys)
 	for i := range chunks {
-		if chunks[i].err != nil {
-			return 0, 0, false, chunks[i].err
+		if chunks[i].err != nil && chunks[i].errIndex < firstErrIndex {
+			firstErr, firstErrIndex = chunks[i].err, chunks[i].errIndex
 		}
+	}
+	if firstErr != nil {
+		return 0, 0, false, firstErr
 	}
 	for i := range chunks {
 		leaderRewardAccum += chunks[i].leaderReward
-		for _, update := range chunks[i].written {
-			if update.parent != nil {
-				recordParentImage(slotCtx, update.key, update.parent)
-			}
-			slotCtx.RecordModifiedAcct(update.key)
-			voteAccountsUpdated++
-			if update.key == u.leaderVote {
-				leaderUpdatedInUnion = true
-			}
+	}
+	for i := range written {
+		if !wrote[i] {
+			continue
+		}
+		update := &written[i]
+		if update.parent != nil {
+			recordParentImage(slotCtx, update.key, update.parent)
+		}
+		slotCtx.RecordModifiedAcct(update.key)
+		voteAccountsUpdated++
+		if update.key == u.leaderVote {
+			leaderUpdatedInUnion = true
 		}
 	}
 	for i, acct := range creditedVersions {

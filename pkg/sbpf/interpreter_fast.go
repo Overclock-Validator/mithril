@@ -549,7 +549,7 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 				if fastCalls == nil {
 					return pc, due
 				}
-				target = fastCalls[pc]
+				target = int64(fastCalls[pc])
 			}
 			if target < 0 || target >= int64(len(text)) {
 				return pc, due

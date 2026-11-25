@@ -120,8 +120,14 @@ func TestApplyVoteAccountUpdatesParallelMatchesSerial(t *testing.T) {
 			require.False(t, serial.modified[k], "corrupt account %s must be skipped", k)
 		}
 		for _, workers := range []int{2, 3, 8} {
-			got := runVoteUpdates(t, f, workers)
-			require.Equal(t, serial, got, "seed %d, %d workers", seed, workers)
+			// 0 is one fixed share per worker; the others are claimed runs.
+			for _, claim := range []int{0, 1, 7, 16, 100000} {
+				old := voteAccountClaim
+				voteAccountClaim = claim
+				got := runVoteUpdates(t, f, workers)
+				voteAccountClaim = old
+				require.Equal(t, serial, got, "seed %d, %d workers, claim %d", seed, workers, claim)
+			}
 		}
 	}
 }

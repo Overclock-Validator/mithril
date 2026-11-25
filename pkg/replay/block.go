@@ -2704,11 +2704,18 @@ func ReplayBlocks(
 		prefetcher = newAccountPrefetcher(src, acctsDb, accountPrefetchAhead, accountPrefetchWorkers, tipWarmEnabled)
 		defer prefetcher.Close()
 		defer prefetcher.installRefsHook()()
-		blockStream.SetReplayEmitHook(prefetcher.Offer)
 		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
 	} else {
 		mlog.Log.Infof("account prefetch: off (MITHRIL_ACCOUNT_PREFETCH=0)")
 	}
+	// Work a queued block needs that does not depend on its parent's execution
+	// starts when the block is queued, so it overlaps the blocks ahead of it.
+	blockStream.SetReplayEmitHook(func(blk *b.Block) {
+		if prefetcher != nil {
+			prefetcher.Offer(blk)
+		}
+		offerRewardCertPrefetch(blk, epochSchedule)
+	})
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -4312,7 +4319,18 @@ func appendModifiedAccountCopiesWithVotes(dst []*accounts.Account, slotCtx *seal
 					continue
 				}
 			}
-			acct, err := slotCtx.GetAccount(key)
+			var acct *accounts.Account
+			var err error
+			if modifiedAccountCopySplitLarge {
+				// Same copy as GetAccount, with a large account's data copied
+				// in several pieces at once.
+				acct, err = slotCtx.GetAccountShared(key)
+				if err == nil {
+					acct = acct.CloneLarge(modifiedAccountCopyMaxWorkers)
+				}
+			} else {
+				acct, err = slotCtx.GetAccount(key)
+			}
 			if err != nil {
 				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
 				return
@@ -5068,3 +5086,6 @@ func recordFullToReplayed(block *b.Block) time.Time {
 	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
 	return now
 }
+
+// MITHRIL_MODIFIED_COPY_SPLIT_LARGE=0 copies every modified account on one goroutine.
+var modifiedAccountCopySplitLarge = os.Getenv("MITHRIL_MODIFIED_COPY_SPLIT_LARGE") != "0"

@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"encoding/binary"
 	"math/rand"
 	"testing"
 
@@ -250,5 +251,33 @@ func TestWorkingSetModelAgainstShadow(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A lookup large enough to be split across goroutines returns exactly what a
+// key-by-key lookup does, for hits and misses alike.
+func TestWorkingSetLookupBatchSplitMatchesSingleLookups(t *testing.T) {
+	w := NewWorkingSet()
+	const total = 16 * lookupBatchChunk
+	keys := make([]solana.PublicKey, total)
+	delta := make([]*Account, 0, total)
+	for i := range keys {
+		binary.LittleEndian.PutUint32(keys[i][:], uint32(i+1))
+		if i%3 != 0 {
+			delta = append(delta, &Account{Key: keys[i], Lamports: uint64(i + 1)})
+		}
+	}
+	w.Add(10, delta)
+
+	out := make([]*Account, total)
+	w.LookupBatch(keys, out)
+	for i, key := range keys {
+		if i%3 == 0 {
+			require.Nil(t, out[i])
+			continue
+		}
+		require.NotNil(t, out[i])
+		require.Equal(t, key, out[i].Key)
+		require.EqualValues(t, i+1, out[i].Lamports)
 	}
 }

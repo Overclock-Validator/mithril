@@ -26,7 +26,7 @@
 	MOVQ R10, newRem+80(FP); \
 	RET
 
-// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
+// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int32) (newPC int64, newRem uint64)
 TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-88
 	MOVQ text+0(FP), SI
 	MOVQ textLen+8(FP), R9
@@ -2019,7 +2019,7 @@ TEXT asmOpCallLegacy<>(SB), NOSPLIT|NOFRAME, $0-88
 	MOVQ calls+64(FP), R15
 	TESTQ R15, R15
 	JEQ out
-	MOVQ (R15)(R8*8), R13
+	MOVLQSX (R15)(R8*4), R13
 	CMPQ R13, R9
 	JCC out
 	MOVQ stack+40(FP), R15

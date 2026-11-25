@@ -1,7 +1,9 @@
 package accounts
 
 import (
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gagliardetto/solana-go"
 )
@@ -78,7 +80,10 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 			continue
 		}
 		key := [32]byte(a.Key)
-		if previous, exists := layer.writes[key]; exists {
+		// Each map is read once per key: flat holds every retained key, so
+		// a second lookup of the same key is a second walk of a large table.
+		previous, again := layer.writes[key]
+		if again {
 			cost := RetainedAccountBytes(previous)
 			layer.retainedBytes -= cost
 			w.retainedBytes -= cost
@@ -86,18 +91,19 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 		cost := RetainedAccountBytes(a)
 		layer.retainedBytes += cost
 		w.retainedBytes += cost
-		if _, again := layer.writes[key]; !again {
+		held, inFlat := w.flat[key]
+		if !again {
 			// First write of this key in this slot: journal what flat held.
-			if e, exists := w.flat[key]; exists && e.slot != slot {
-				layer.undo = append(layer.undo, undoPtr{key: key, prevSlot: e.slot, existed: true})
-			} else if !exists {
+			if inFlat && held.slot != slot {
+				layer.undo = append(layer.undo, undoPtr{key: key, prevSlot: held.slot, existed: true})
+			} else if !inFlat {
 				layer.undo = append(layer.undo, undoPtr{key: key})
 			}
 		}
 		layer.writes[key] = a
 		// Newest wins. Guard on owner slot so an out-of-order add can never
 		// install an older value over a newer one.
-		if e, exists := w.flat[key]; !exists || slot >= e.slot {
+		if !inFlat || slot >= held.slot {
 			w.flat[key] = flatEntry{slot: slot, acct: a}
 		}
 	}
@@ -141,8 +147,43 @@ func (w *WorkingSet) LookupBatch(pubkeys []solana.PublicKey, out []*Account) {
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	for i, pubkey := range pubkeys {
-		if e, ok := w.flat[[32]byte(pubkey)]; ok {
+	workers := min(runtime.GOMAXPROCS(0), len(pubkeys)/lookupBatchChunk)
+	if workers <= 1 {
+		w.lookupRangeLocked(pubkeys, out, 0, len(pubkeys))
+		return
+	}
+	// The flat map is only read here and cannot change while the read lock is
+	// held, and each run of keys writes its own part of out. Goroutines claim
+	// runs as they free up, so one that starts late does less.
+	var claimed atomic.Int64
+	lookupRuns := func() {
+		for {
+			lo := int(claimed.Add(lookupBatchChunk)) - lookupBatchChunk
+			if lo >= len(pubkeys) {
+				return
+			}
+			w.lookupRangeLocked(pubkeys, out, lo, min(lo+lookupBatchChunk, len(pubkeys)))
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers - 1)
+	for range workers - 1 {
+		go func() {
+			defer wg.Done()
+			lookupRuns()
+		}()
+	}
+	lookupRuns()
+	wg.Wait()
+}
+
+// lookupBatchChunk is the run of keys one goroutine looks up at a time, and
+// the fewest keys worth a goroutine of their own.
+const lookupBatchChunk = 512
+
+func (w *WorkingSet) lookupRangeLocked(pubkeys []solana.PublicKey, out []*Account, lo, hi int) {
+	for i := lo; i < hi; i++ {
+		if e, ok := w.flat[[32]byte(pubkeys[i])]; ok {
 			out[i] = e.acct
 		}
 	}

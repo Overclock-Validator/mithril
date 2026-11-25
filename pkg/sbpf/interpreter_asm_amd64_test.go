@@ -215,7 +215,7 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 			table := buildAsmTable(f, gaps)
 			name := fmt.Sprintf("v%d gaps=%t %+v", cfg.ver, !cfg.disableGaps, f)
 			text := make([]Slot, 12)
-			callTable := make([]int64, len(text))
+			callTable := make([]int32, len(text))
 			for op := 0; op < 256; op++ {
 				n, isMem := trials, false
 				switch uint8(op) {
@@ -263,12 +263,12 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 					// Resolved legacy call targets: mostly present, with
 					// entries that are absent, valid, and out of the text in
 					// both directions. The static versions never have a table.
-					var calls []int64
-					var asmCalls *int64
+					var calls []int32
+					var asmCalls *int32
 					if !f.staticSyscalls && rng.Intn(8) != 0 {
 						calls, asmCalls = callTable, &callTable[0]
 						for k := range calls {
-							calls[k] = []int64{-1, -1, int64(rng.Intn(len(text))), int64(rng.Intn(len(text))), int64(len(text)), int64(len(text)) + 1, -2, 1 << 40, -1 << 63}[rng.Intn(9)]
+							calls[k] = []int32{-1, -1, int32(rng.Intn(len(text))), int32(rng.Intn(len(text))), int32(len(text)), int32(len(text)) + 1, -2, 1<<31 - 1, -1 << 31}[rng.Intn(9)]
 						}
 					}
 					ref.ip.fastCalls, got.ip.fastCalls = calls, calls

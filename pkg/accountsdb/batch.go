@@ -30,9 +30,9 @@ var systemProgramAddr [32]byte
 const (
 	appendVecReadChunkSize = 64
 
-	// Point Gets remain useful for tiny requests and for recent keys high in a
-	// deep LSM. Above this conservative crossover, monotonic snapshot iterators
-	// amortize Pebble's per-key read-state and iterator setup.
+	// The batch size from which sorted snapshot iterators replace point Gets:
+	// always for compaction's liveness check, and for account batch reads only
+	// when batchIndexIterators is set.
 	batchIndexIteratorThreshold = 16
 	batchIndexKeysPerIterator   = 1024
 	batchIndexMinIterators      = 4
@@ -149,7 +149,6 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	}()
 
 	out := make([]*accounts.Account, len(pks))
-	cold := make([]int, 0, len(pks))
 	var indexSnapshot *pebble.Snapshot
 	var cacheEpoch uint64
 	var admission *commonCacheAdmission
@@ -160,27 +159,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	phaseStart = time.Now()
 	cacheEpoch = db.readCacheEpoch
 	admission = db.commonAdmission
-	for i, pk := range pks {
-		if acct, ok, pending := db.getCachedAccountLocked(pk); ok {
-			if pending {
-				stats.PendingFoldHits++
-			} else {
-				stats.CacheHits++
-			}
-			if acct == nil || acct.Lamports == 0 {
-				stats.PlaceholderObjects++
-			}
-			out[i] = batchAccountOrPlaceholder(pk, acct)
-			continue
-		}
-		if db.batchAccountAbsentLocked(pk) {
-			stats.NegativeCacheHits++
-			stats.PlaceholderObjects++
-			out[i] = missingAccount(pk)
-			continue
-		}
-		cold = append(cold, i)
-	}
+	cold := db.probeBatchCachesLocked(ctx, pks, out, &stats)
 	stats.CacheLookupNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
 	if len(cold) > 0 && db.Index != nil {
 		// The cache probes and snapshot share one publication epoch. A fold
@@ -358,6 +337,103 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	return out, stats, nil
 }
 
+// batchCacheProbeChunk is the run of keys one goroutine probes at a time, and
+// the fewest keys worth a goroutine of their own: a probe costs a few hundred
+// nanoseconds, so smaller batches stay on the caller.
+const batchCacheProbeChunk = 256
+
+// probeBatchCachesLocked answers every key the pending fold, the account
+// caches or the negative cache can, writing those results to out, and returns
+// the indexes of the remaining keys in ascending order. A whole block's keys
+// are probed by several goroutines, which claim runs of keys as they free up:
+// the probes only read state that is fixed while readCacheEpochMu is held,
+// which the caller holds (for reading or writing) until this returns.
+func (db *AccountsDb) probeBatchCachesLocked(ctx context.Context, pks []solana.PublicKey, out []*accounts.Account, stats *BatchReadStats) []int {
+	cold := make([]int, 0, len(pks))
+	workers := batchCacheProbeWorkers(ctx, len(pks))
+	if workers <= 1 {
+		db.probeBatchCacheRangeLocked(pks, out, 0, len(pks), &cold, stats)
+		return cold
+	}
+	// Run k covers keys [k*chunk, (k+1)*chunk) and collects its cold indexes in
+	// that same stretch of cold's backing array, so runs never overlap.
+	runs := (len(pks) + batchCacheProbeChunk - 1) / batchCacheProbeChunk
+	runCold := make([]int, runs)
+	workerStats := make([]BatchReadStats, workers)
+	backing := cold[:len(pks)]
+	var claimed atomic.Int64
+	probeRuns := func(worker int) {
+		for {
+			run := int(claimed.Add(1)) - 1
+			if run >= runs {
+				return
+			}
+			lo := run * batchCacheProbeChunk
+			hi := min(lo+batchCacheProbeChunk, len(pks))
+			part := backing[lo:lo:hi]
+			db.probeBatchCacheRangeLocked(pks, out, lo, hi, &part, &workerStats[worker])
+			runCold[run] = len(part)
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers - 1)
+	for worker := 1; worker < workers; worker++ {
+		go func() {
+			defer wg.Done()
+			probeRuns(worker)
+		}()
+	}
+	probeRuns(0)
+	wg.Wait()
+
+	// Close the gaps between the runs' cold indexes, keeping ascending order.
+	for run, n := range runCold {
+		lo := run * batchCacheProbeChunk
+		cold = append(cold, backing[lo:lo+n]...)
+	}
+	for i := range workerStats {
+		stats.PendingFoldHits += workerStats[i].PendingFoldHits
+		stats.CacheHits += workerStats[i].CacheHits
+		stats.NegativeCacheHits += workerStats[i].NegativeCacheHits
+		stats.PlaceholderObjects += workerStats[i].PlaceholderObjects
+	}
+	return cold
+}
+
+func batchCacheProbeWorkers(ctx context.Context, keyCount int) int {
+	if batchCacheProbeSerial {
+		return 1
+	}
+	return limitBatchWorkers(ctx, min(runtime.GOMAXPROCS(0), keyCount/batchCacheProbeChunk))
+}
+
+// probeBatchCacheRangeLocked probes keys [lo, hi). It writes only out[lo:hi],
+// *cold and *stats, so disjoint ranges may run concurrently.
+func (db *AccountsDb) probeBatchCacheRangeLocked(pks []solana.PublicKey, out []*accounts.Account, lo, hi int, cold *[]int, stats *BatchReadStats) {
+	for i := lo; i < hi; i++ {
+		pk := pks[i]
+		if acct, ok, pending := db.getCachedAccountLocked(pk); ok {
+			if pending {
+				stats.PendingFoldHits++
+			} else {
+				stats.CacheHits++
+			}
+			if acct == nil || acct.Lamports == 0 {
+				stats.PlaceholderObjects++
+			}
+			out[i] = batchAccountOrPlaceholder(pk, acct)
+			continue
+		}
+		if db.batchAccountAbsentLocked(pk) {
+			stats.NegativeCacheHits++
+			stats.PlaceholderObjects++
+			out[i] = missingAccount(pk)
+			continue
+		}
+		*cold = append(*cold, i)
+	}
+}
+
 func resolveBatchAccountLocations(
 	ctx context.Context,
 	snapshot *pebble.Snapshot,
@@ -365,7 +441,7 @@ func resolveBatchAccountLocations(
 	cold []int,
 	out []*accounts.Account,
 ) ([]batchAccountLocation, []bool, error) {
-	if len(cold) < batchIndexIteratorThreshold {
+	if !batchIndexIterators || len(cold) < batchIndexIteratorThreshold {
 		return resolveBatchAccountLocationsPointGets(ctx, snapshot, pks, cold, out)
 	}
 	return resolveBatchAccountLocationsIterators(
@@ -377,6 +453,15 @@ func resolveBatchAccountLocations(
 		limitBatchWorkers(ctx, batchIndexIteratorWorkers(len(cold))),
 	)
 }
+
+// batchIndexIterators makes account batch reads of batchIndexIteratorThreshold
+// or more cold keys use sorted snapshot iterators, as they did before
+// (MITHRIL_INDEX_BATCH_ITERATORS=1). Point Gets are the default at every size:
+// on a block's keys a merging iterator seeks every level of the index for each
+// key, while a Get stops at the first level holding it, and a block's keys are
+// too sparse in a billion-key index for the iterator's forward-seek state to
+// pay that back.
+var batchIndexIterators = os.Getenv("MITHRIL_INDEX_BATCH_ITERATORS") == "1"
 
 func batchIndexIteratorWorkers(keyCount int) int {
 	workers := (keyCount + batchIndexKeysPerIterator - 1) / batchIndexKeysPerIterator

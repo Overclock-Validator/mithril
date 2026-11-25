@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"sync"
-
-	"filippo.io/edwards25519"
 )
 
 const MaxSeeds = 16
@@ -48,7 +46,7 @@ func CreateProgramAddressBytes(seeds [][]byte, programID []byte) ([]byte, error)
 }
 
 // IsOnCurve checks if 'b' is on the ed25519 curve
-// The on-curve check (a field square root) is most of a PDA derivation's cost,
+// The on-curve check is most of a PDA derivation's cost,
 // and programs derive the same addresses over and over. It is a pure function of
 // the 32 bytes, so recent answers are remembered, in shards that are simply
 // emptied when full to bound memory.
@@ -82,9 +80,4 @@ func IsOnCurve(b []byte) bool {
 	shard.m[key] = onCurve
 	shard.mu.Unlock()
 	return onCurve
-}
-
-func isOnCurve(b []byte) bool {
-	_, err := new(edwards25519.Point).SetBytes(b)
-	return err == nil
 }
