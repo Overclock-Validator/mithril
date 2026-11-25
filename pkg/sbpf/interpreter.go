@@ -65,6 +65,10 @@ type Interpreter struct {
 	// memRegion.dirty: 4 KiB page bitmap of writes through the fast path.
 	dirtyLo [numFastRegions]uint64
 	dirtyHi [numFastRegions]uint64
+
+	// inputRegionHint is the index inputRegionIndex found last; only a
+	// starting guess, checked before use.
+	inputRegionHint int
 }
 
 // dirtyRange returns the union of the byte ranges that may have been written
@@ -1118,20 +1122,38 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 	}
 }
 
+// inputRegionIndex returns the index of the input region whose reserved
+// address range holds offset, or -1. Regions are sorted by Offset and do not
+// overlap.
+//
+// With direct mapping this runs for every load and store that leaves the
+// region the interpreter has cached, which is several times per instruction of
+// a program walking its accounts. Such accesses cluster, so the region found
+// last time is tried first; otherwise a plain binary search over the slice,
+// with no callback and no copies of the 80-byte elements.
 func (ip *Interpreter) inputRegionIndex(offset uint64) int {
-	idx, found := slices.BinarySearchFunc(ip.inputRegions, offset, func(region InputRegion, target uint64) int {
-		if target < region.Offset {
-			return 1
+	regions := ip.inputRegions
+	if hint := ip.inputRegionHint; hint < len(regions) {
+		region := &regions[hint]
+		if offset >= region.Offset && offset < region.Offset+region.AddressSpaceReserved {
+			return hint
 		}
-		if target >= region.Offset+region.AddressSpaceReserved {
-			return -1
-		}
-		return 0
-	})
-	if !found {
-		return -1
 	}
-	return idx
+	lo, hi := 0, len(regions)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		region := &regions[mid]
+		switch {
+		case offset < region.Offset:
+			hi = mid
+		case offset >= region.Offset+region.AddressSpaceReserved:
+			lo = mid + 1
+		default:
+			ip.inputRegionHint = mid
+			return mid
+		}
+	}
+	return -1
 }
 
 func (ip *Interpreter) translateInputRegion(offset, size uint64, write bool) (unsafe.Pointer, error) {
