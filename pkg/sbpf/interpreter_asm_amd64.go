@@ -30,7 +30,7 @@ var asmChunk uint64 = 1 << 14
 // (Interpreter.fastCalls).
 //
 //go:noescape
-func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
+func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int32) (newPC int64, newRem uint64)
 
 // asmHandlerTable returns the handler addresses, indexed by handler ID.
 func asmHandlerTable() *[numAsmHandlers]uintptr
@@ -274,7 +274,7 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 
 // asmCalls returns runAsmLoop's calls argument: the resolved legacy call
 // targets, one per text slot, or nil when legacy calls must stay with Run.
-func (ip *Interpreter) asmCalls() *int64 {
+func (ip *Interpreter) asmCalls() *int32 {
 	if len(ip.fastCalls) == 0 || len(ip.fastCalls) != len(ip.text) {
 		return nil
 	}

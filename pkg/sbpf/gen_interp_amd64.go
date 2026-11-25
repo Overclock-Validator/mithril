@@ -278,7 +278,7 @@ func main() {
 	// (Interpreter.fastCalls). An entry of -1 fails the unsigned bound check.
 	add("CallLegacy", append([]string{
 		"MOVQ calls+64(FP), R15", "TESTQ R15, R15", "JEQ out",
-		"MOVQ (R15)(R8*8), R13", "CMPQ R13, R9", "JCC out"}, pushFrame...)...)
+		"MOVLQSX (R15)(R8*4), R13", "CMPQ R13, R9", "JCC out"}, pushFrame...)...)
 	// Return from an inner frame: pop the shadow frame. Returning from the
 	// entry frame (depth 1) ends the program and stays in Go.
 	add("Exit",
@@ -334,7 +334,7 @@ func main() {
 	MOVQ R10, newRem+80(FP); \
 	RET
 
-// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
+// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int32) (newPC int64, newRem uint64)
 TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-88
 	MOVQ text+0(FP), SI
 	MOVQ textLen+8(FP), R9

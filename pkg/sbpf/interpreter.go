@@ -53,11 +53,11 @@ type Interpreter struct {
 
 	// callTargets[pc] is the resolved internal-function target of the `call imm`
 	// at pc (or -1). Computed once per Program at load time.
-	callTargets []int64
+	callTargets []int32
 	// fastCalls is callTargets when every slot with a target there is an
 	// internal call under this invocation's registry, so the registry need
 	// not be asked (Program.unshadowedCallTargets); otherwise nil.
-	fastCalls []int64
+	fastCalls []int32
 
 	// Fast-path translation table indexed by (vaddr >> 32); see fastmem.go.
 	regions [numFastRegions]memRegion
@@ -318,7 +318,7 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	// Non-nil when the amd64 assembly loop is enabled.
 	asmTable := ip.asmLoopTable(fast)
 	var asmText *Slot
-	var asmCalls *int64
+	var asmCalls *int32
 	if asmTable != nil {
 		asmText = &text[0]
 		asmCalls = ip.asmCalls()
@@ -838,7 +838,7 @@ mainLoop:
 				if fastCalls != nil && fastCalls[pc] >= 0 {
 					// An internal call that no syscall of this invocation's
 					// registry shadows: the lookup below would fail.
-					target := fastCalls[pc]
+					target := int64(fastCalls[pc])
 					if !ip.stack.Push(&r, pc+1) {
 						err = ExcCallDepth
 					}
@@ -855,7 +855,7 @@ mainLoop:
 					var target int64
 					var ok bool
 					if callTargets != nil {
-						target = callTargets[pc]
+						target = int64(callTargets[pc])
 						ok = target >= 0
 					} else {
 						target, ok = ip.funcs[ins.Uimm()]

@@ -1,6 +1,7 @@
 package sbpf
 
 import (
+	"math"
 	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/sbpfver"
@@ -18,7 +19,7 @@ type Program struct {
 
 	// CallTargets[pc] holds the resolved internal function target for a
 	// `call imm` slot at pc (non-static-syscall versions), or -1.
-	CallTargets []int64
+	CallTargets []int32
 
 	// callCheck remembers the last answer of unshadowedCallTargets.
 	callCheck atomic.Pointer[callCheck]
@@ -41,7 +42,7 @@ type callCheck struct {
 // answer is fixed, so it is checked once: if the registry knows none of the
 // immediates that have an internal target, every slot with CallTargets[pc] >= 0
 // is an internal call. If it knows even one, the program keeps the lookup.
-func (p *Program) unshadowedCallTargets(id any, gen uint64, registry SyscallRegistry) []int64 {
+func (p *Program) unshadowedCallTargets(id any, gen uint64, registry SyscallRegistry) []int32 {
 	if id == nil || registry == nil || len(p.CallTargets) == 0 || len(p.CallTargets) != len(p.Text) {
 		return nil
 	}
@@ -72,12 +73,20 @@ func (p *Program) ResolveCallTargets() {
 		p.CallTargets = nil
 		return
 	}
-	targets := make([]int64, len(p.Text))
+	targets := make([]int32, len(p.Text))
 	for pc, slot := range p.Text {
 		targets[pc] = -1
 		if slot.Op() == OpCall {
 			if t, ok := p.Funcs[slot.Uimm()]; ok {
-				targets[pc] = t
+				// Loaded ELF targets fit. Keep the map path available for
+				// programs constructed with a wider instruction index.
+				if t > math.MaxInt32 {
+					p.CallTargets = nil
+					return
+				}
+				if t >= 0 {
+					targets[pc] = int32(t)
+				}
 			}
 		}
 	}
@@ -88,7 +97,7 @@ func (p *Program) MemoryBytes() uint64 {
 	if p == nil {
 		return 0
 	}
-	total := uint64(len(p.RO)) + uint64(len(p.Text))*8 + uint64(len(p.CallTargets))*8
+	total := uint64(len(p.RO)) + uint64(len(p.Text))*8 + uint64(len(p.CallTargets))*4
 	if len(p.RO) == 0 {
 		total += uint64(len(p.TextBytes))
 	}
