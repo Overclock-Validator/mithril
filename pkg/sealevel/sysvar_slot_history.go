@@ -2,7 +2,9 @@ package sealevel
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
@@ -43,13 +45,22 @@ func (sh *SysvarSlotHistory) UnmarshalWithDecoder(decoder *bin.Decoder) (err err
 			return fmt.Errorf("failed to read BlocksLen when decoding SysvarSlotHistory: %w", err)
 		}
 
-		for count := 0; count < int(sh.Bits.Bits.BlocksLen); count++ {
-			block, err := decoder.ReadUint64(bin.LE)
-			if err != nil {
-				return fmt.Errorf("failed to read a block when decoding Bitvec in SysvarSlotHistory: %w", err)
-			}
-			sh.Bits.Bits.Blocks = append(sh.Bits.Bits.Blocks, block)
+		// The bit vector is 16,384 words on mainnet and is decoded for every
+		// bank, so it is read in one piece. A count the data cannot hold is
+		// an error before anything is allocated for it.
+		words := sh.Bits.Bits.BlocksLen
+		if words > uint64(decoder.Remaining())/8 {
+			return fmt.Errorf("failed to read a block when decoding Bitvec in SysvarSlotHistory: %d words in %d bytes", words, decoder.Remaining())
 		}
+		raw, err := decoder.ReadNBytes(int(words) * 8)
+		if err != nil {
+			return fmt.Errorf("failed to read a block when decoding Bitvec in SysvarSlotHistory: %w", err)
+		}
+		blocks := slices.Grow(sh.Bits.Bits.Blocks, int(words))
+		for ; len(raw) >= 8; raw = raw[8:] {
+			blocks = append(blocks, binary.LittleEndian.Uint64(raw))
+		}
+		sh.Bits.Bits.Blocks = blocks
 	}
 
 	sh.Bits.Len, err = decoder.ReadUint64(bin.LE)
@@ -72,53 +83,31 @@ func (sr *SysvarSlotHistory) MustUnmarshalWithDecoder(decoder *bin.Decoder) {
 	}
 }
 
+// MustMarshal encodes the sysvar: an option byte, then, when the bit vector
+// has words, their count and the words, then the bit length and the next
+// slot, all little-endian. It runs for every bank, so it writes straight into
+// a buffer of the final size.
 func (sr *SysvarSlotHistory) MustMarshal() []byte {
-	data := new(bytes.Buffer)
-	enc := bin.NewBinEncoder(data)
-
-	var err error
-
-	if sr.Bits.Bits.BlocksLen != 0 {
-		err = enc.WriteByte(1)
-		if err != nil {
-			err = fmt.Errorf("failed to serialize opt byte for SlotHistory sysvar: %w", err)
-			panic(err)
-		}
-
-		err = enc.WriteUint64(sr.Bits.Bits.BlocksLen, bin.LE)
-		if err != nil {
-			err = fmt.Errorf("failed to serialize BlocksLen for SlotHistory sysvar: %w", err)
-			panic(err)
-		}
-
-		for count := 0; count < int(sr.Bits.Bits.BlocksLen); count++ {
-			err = enc.WriteUint64(sr.Bits.Bits.Blocks[count], bin.LE)
-			if err != nil {
-				err = fmt.Errorf("failed to serialize a Block for SlotHistory sysvar: %w", err)
-				panic(err)
-			}
-		}
-	} else {
-		err = enc.WriteByte(0)
-		if err != nil {
-			err = fmt.Errorf("failed to serialize opt byte for SlotHistory sysvar: %w", err)
-			panic(err)
-		}
+	words := sr.Bits.Bits.BlocksLen
+	if words == 0 {
+		data := make([]byte, 1+8+8)
+		binary.LittleEndian.PutUint64(data[1:], sr.Bits.Len)
+		binary.LittleEndian.PutUint64(data[9:], sr.NextSlot)
+		return data
 	}
-
-	err = enc.WriteUint64(sr.Bits.Len, bin.LE)
-	if err != nil {
-		err = fmt.Errorf("failed to serialize Bits.Len for SlotHistory sysvar: %w", err)
-		panic(err)
+	_ = sr.Bits.Bits.Blocks[words-1] // panics, as before, if BlocksLen overstates the words held
+	blocks := sr.Bits.Bits.Blocks[:words]
+	data := make([]byte, 1+8+8*len(blocks)+8+8)
+	data[0] = 1
+	binary.LittleEndian.PutUint64(data[1:], words)
+	at := data[9:]
+	for _, block := range blocks {
+		binary.LittleEndian.PutUint64(at, block)
+		at = at[8:]
 	}
-
-	err = enc.WriteUint64(sr.NextSlot, bin.LE)
-	if err != nil {
-		err = fmt.Errorf("failed to serialize NextSlot for SlotHistory sysvar: %w", err)
-		panic(err)
-	}
-
-	return data.Bytes()
+	binary.LittleEndian.PutUint64(at, sr.Bits.Len)
+	binary.LittleEndian.PutUint64(at[8:], sr.NextSlot)
+	return data
 }
 
 func (sr *SysvarSlotHistory) Add(slot uint64) {

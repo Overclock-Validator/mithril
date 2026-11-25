@@ -230,7 +230,9 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 	}
 	// Newest first, so a key listed twice counts once, with its final value
 	// (the working set and the lattice hash keep the last write too).
-	var counted map[solana.PublicKey]struct{}
+	// Sized for the whole list: growing it key by key cost more than the
+	// lookups themselves.
+	counted := make(map[solana.PublicKey]struct{}, len(modified))
 	for i := len(modified) - 1; i >= 0; i-- {
 		acct := modified[i]
 		if acct == nil {
@@ -239,9 +241,6 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 		key := acct.Key
 		if _, dup := counted[key]; dup {
 			continue
-		}
-		if counted == nil {
-			counted = make(map[solana.PublicKey]struct{})
 		}
 		counted[key] = struct{}{}
 		// Fast exact filter: a record can count only if its data starts with

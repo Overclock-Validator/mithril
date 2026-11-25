@@ -80,7 +80,10 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 			continue
 		}
 		key := [32]byte(a.Key)
-		if previous, exists := layer.writes[key]; exists {
+		// Each map is read once per key: flat holds every retained key, so
+		// a second lookup of the same key is a second walk of a large table.
+		previous, again := layer.writes[key]
+		if again {
 			cost := RetainedAccountBytes(previous)
 			layer.retainedBytes -= cost
 			w.retainedBytes -= cost
@@ -88,18 +91,19 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 		cost := RetainedAccountBytes(a)
 		layer.retainedBytes += cost
 		w.retainedBytes += cost
-		if _, again := layer.writes[key]; !again {
+		held, inFlat := w.flat[key]
+		if !again {
 			// First write of this key in this slot: journal what flat held.
-			if e, exists := w.flat[key]; exists && e.slot != slot {
-				layer.undo = append(layer.undo, undoPtr{key: key, prevSlot: e.slot, existed: true})
-			} else if !exists {
+			if inFlat && held.slot != slot {
+				layer.undo = append(layer.undo, undoPtr{key: key, prevSlot: held.slot, existed: true})
+			} else if !inFlat {
 				layer.undo = append(layer.undo, undoPtr{key: key})
 			}
 		}
 		layer.writes[key] = a
 		// Newest wins. Guard on owner slot so an out-of-order add can never
 		// install an older value over a newer one.
-		if e, exists := w.flat[key]; !exists || slot >= e.slot {
+		if !inFlat || slot >= held.slot {
 			w.flat[key] = flatEntry{slot: slot, acct: a}
 		}
 	}
