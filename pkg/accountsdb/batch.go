@@ -30,9 +30,9 @@ var systemProgramAddr [32]byte
 const (
 	appendVecReadChunkSize = 64
 
-	// Point Gets remain useful for tiny requests and for recent keys high in a
-	// deep LSM. Above this conservative crossover, monotonic snapshot iterators
-	// amortize Pebble's per-key read-state and iterator setup.
+	// The batch size from which sorted snapshot iterators replace point Gets:
+	// always for compaction's liveness check, and for account batch reads only
+	// when batchIndexIterators is set.
 	batchIndexIteratorThreshold = 16
 	batchIndexKeysPerIterator   = 1024
 	batchIndexMinIterators      = 4
@@ -441,7 +441,7 @@ func resolveBatchAccountLocations(
 	cold []int,
 	out []*accounts.Account,
 ) ([]batchAccountLocation, []bool, error) {
-	if len(cold) < batchIndexIteratorThreshold {
+	if !batchIndexIterators || len(cold) < batchIndexIteratorThreshold {
 		return resolveBatchAccountLocationsPointGets(ctx, snapshot, pks, cold, out)
 	}
 	return resolveBatchAccountLocationsIterators(
@@ -453,6 +453,15 @@ func resolveBatchAccountLocations(
 		limitBatchWorkers(ctx, batchIndexIteratorWorkers(len(cold))),
 	)
 }
+
+// batchIndexIterators makes account batch reads of batchIndexIteratorThreshold
+// or more cold keys use sorted snapshot iterators, as they did before
+// (MITHRIL_INDEX_BATCH_ITERATORS=1). Point Gets are the default at every size:
+// on a block's keys a merging iterator seeks every level of the index for each
+// key, while a Get stops at the first level holding it, and a block's keys are
+// too sparse in a billion-key index for the iterator's forward-seek state to
+// pay that back.
+var batchIndexIterators = os.Getenv("MITHRIL_INDEX_BATCH_ITERATORS") == "1"
 
 func batchIndexIteratorWorkers(keyCount int) int {
 	workers := (keyCount + batchIndexKeysPerIterator - 1) / batchIndexKeysPerIterator

@@ -141,6 +141,9 @@ func TestLargeBatchSelectivelyAdmitsReusableAccounts(t *testing.T) {
 func TestGetAccountsBatchIteratorExactMatchOrderAndInputImmutability(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
+	previousIterators := batchIndexIterators
+	batchIndexIterators = true
+	defer func() { batchIndexIterators = previousIterators }()
 
 	const count = batchIndexIteratorThreshold*2 + 17
 	delta := make([]*accounts.Account, count)
