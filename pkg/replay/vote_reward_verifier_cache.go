@@ -54,6 +54,16 @@ func (material *voteRewardVerifierMaterial) validateRewardCertificates(
 		bytes.Equal(cached.skipRaw, skipRaw) && bytes.Equal(cached.notarRaw, notarRaw) {
 		return cloneValidatedRewardCert(cached.validated), rewardcerts.RewardCertificateValidationTimings{}, nil
 	}
+	if validated, ok := rewardCertPrefetches.take(currentSlot, skipRaw, notarRaw, material); ok {
+		// Validated in the background while an earlier block executed.
+		material.lastRewardValidation = &voteRewardCertificateValidation{
+			slot:      currentSlot,
+			skipRaw:   bytes.Clone(skipRaw),
+			notarRaw:  bytes.Clone(notarRaw),
+			validated: validated,
+		}
+		return cloneValidatedRewardCert(validated), rewardcerts.RewardCertificateValidationTimings{}, nil
+	}
 	validated, timings, err := rewardcerts.ValidateRewardCertificatesWithVerifier(
 		currentSlot, skipRaw, notarRaw, material.snapshot.Epoch, material.verifier, measureTimings,
 	)

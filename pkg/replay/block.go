@@ -2704,11 +2704,18 @@ func ReplayBlocks(
 		prefetcher = newAccountPrefetcher(src, acctsDb, accountPrefetchAhead, accountPrefetchWorkers, tipWarmEnabled)
 		defer prefetcher.Close()
 		defer prefetcher.installRefsHook()()
-		blockStream.SetReplayEmitHook(prefetcher.Offer)
 		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
 	} else {
 		mlog.Log.Infof("account prefetch: off (MITHRIL_ACCOUNT_PREFETCH=0)")
 	}
+	// Work a queued block needs that does not depend on its parent's execution
+	// starts when the block is queued, so it overlaps the blocks ahead of it.
+	blockStream.SetReplayEmitHook(func(blk *b.Block) {
+		if prefetcher != nil {
+			prefetcher.Offer(blk)
+		}
+		offerRewardCertPrefetch(blk, epochSchedule)
+	})
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
