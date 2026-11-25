@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -71,10 +73,13 @@ func calculateDeltaLtHash(slotCtx *sealevel.SlotCtx, modifiedAccts []*accounts.A
 		return &lthash.LtHash{}
 	}
 
-	numWorkers := min(32, len(modifiedAccts))
+	// Workers take short runs of accounts as they free up. With one fixed share
+	// each, the step lasted as long as its slowest share: the one holding a
+	// multi-megabyte account, or the one whose goroutine started last.
+	numWorkers := min(ltHashMaxWorkers, runtime.GOMAXPROCS(0), (len(modifiedAccts)+ltHashAccountsPerClaim-1)/ltHashAccountsPerClaim)
 	partials := make([]lthash.LtHash, numWorkers)
 	workerStats := make([]ltHashWorkerStats, numWorkers)
-	chunkSize := (len(modifiedAccts) + numWorkers - 1) / numWorkers
+	var claimed atomic.Int64
 
 	var workerStart time.Time
 	if recordMetrics {
@@ -85,18 +90,23 @@ func calculateDeltaLtHash(slotCtx *sealevel.SlotCtx, modifiedAccts []*accounts.A
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			start := workerID * chunkSize
-			end := min(start+chunkSize, len(modifiedAccts))
 			var partial lthash.LtHash
 			var stats ltHashWorkerStats
 
 			// Reuse one 2 KiB hash and one BLAKE3 hasher for every old/new
-			// account value owned by this worker.
+			// account value this worker hashes.
 			var scratch lthash.LtHash
 			var hasher lthash.AccountHasher
 
-			for j := start; j < end; j++ {
-				accumulateSingleDeltaLtHash(slotCtx, modifiedAccts[j], &partial, &scratch, &hasher, &stats)
+			for {
+				end := int(claimed.Add(ltHashAccountsPerClaim))
+				start := end - ltHashAccountsPerClaim
+				if start >= len(modifiedAccts) {
+					break
+				}
+				for j := start; j < min(end, len(modifiedAccts)); j++ {
+					accumulateSingleDeltaLtHash(slotCtx, modifiedAccts[j], &partial, &scratch, &hasher, &stats)
+				}
 			}
 			partials[workerID] = partial
 			workerStats[workerID] = stats
@@ -226,11 +236,44 @@ func accumulateSingleDeltaLtHash(
 
 	stats.oldDataBytes += uint64(len(previousAcct.Data))
 	stats.newDataBytes += uint64(len(modifiedAcct.Data))
+	if ltHashSplitLarge && len(previousAcct.Data)+len(modifiedAcct.Data) >= ltHashLargeAccountBytes {
+		// A large account's old and new values take long enough to hash that
+		// one worker doing both sets the length of the whole step. The two
+		// hashes are independent and LtHash addition commutes, so the old value
+		// is hashed on its own goroutine while this worker hashes the new one.
+		var oldHash lthash.LtHash
+		oldDone := make(chan struct{})
+		go func() {
+			defer close(oldDone)
+			var oldHasher lthash.AccountHasher
+			oldHasher.HashInto(&oldHash, previousAcct)
+		}()
+		hasher.HashInto(scratch, modifiedAcct)
+		deltaLtHash.Add(scratch)
+		<-oldDone
+		deltaLtHash.Sub(&oldHash)
+		return
+	}
 	hasher.HashInto(scratch, previousAcct)
 	deltaLtHash.Sub(scratch)
 	hasher.HashInto(scratch, modifiedAcct)
 	deltaLtHash.Add(scratch)
 }
+
+// ltHashMaxWorkers caps the goroutines of the delta hash, and
+// ltHashAccountsPerClaim is how many accounts one takes at a time.
+const (
+	ltHashMaxWorkers       = 32
+	ltHashAccountsPerClaim = 8
+)
+
+// ltHashLargeAccountBytes is the combined old and new data size from which an
+// account's two hashes run on separate goroutines. Below it the hashes take
+// tens of microseconds and a goroutine is not worth starting.
+const ltHashLargeAccountBytes = 256 << 10
+
+// MITHRIL_LTHASH_SPLIT_LARGE=0 hashes both values of every account on one worker.
+var ltHashSplitLarge = os.Getenv("MITHRIL_LTHASH_SPLIT_LARGE") != "0"
 
 func acctsLtHashEqual(a *accounts.Account, b *accounts.Account) bool {
 	return a.Lamports == b.Lamports &&

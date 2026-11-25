@@ -4319,7 +4319,18 @@ func appendModifiedAccountCopiesWithVotes(dst []*accounts.Account, slotCtx *seal
 					continue
 				}
 			}
-			acct, err := slotCtx.GetAccount(key)
+			var acct *accounts.Account
+			var err error
+			if modifiedAccountCopySplitLarge {
+				// Same copy as GetAccount, with a large account's data copied
+				// in several pieces at once.
+				acct, err = slotCtx.GetAccountShared(key)
+				if err == nil {
+					acct = acct.CloneLarge(modifiedAccountCopyMaxWorkers)
+				}
+			} else {
+				acct, err = slotCtx.GetAccount(key)
+			}
 			if err != nil {
 				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
 				return
@@ -5075,3 +5086,6 @@ func recordFullToReplayed(block *b.Block) time.Time {
 	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
 	return now
 }
+
+// MITHRIL_MODIFIED_COPY_SPLIT_LARGE=0 copies every modified account on one goroutine.
+var modifiedAccountCopySplitLarge = os.Getenv("MITHRIL_MODIFIED_COPY_SPLIT_LARGE") != "0"

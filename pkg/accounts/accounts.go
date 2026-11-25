@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	bin "github.com/gagliardetto/binary"
@@ -142,6 +143,36 @@ func (a *Account) Clone() *Account {
 	newCopy := *a
 	newCopy.Data = make([]byte, len(a.Data))
 	copy(newCopy.Data, a.Data)
+	return &newCopy
+}
+
+// largeCloneChunk is the smallest piece of account data copied on its own
+// goroutine by CloneLarge.
+const largeCloneChunk = 256 << 10
+
+// CloneLarge returns the same copy as Clone. Data of at least two chunks is
+// copied in up to workers pieces at once: for a multi-megabyte account one
+// goroutine copying it sets the length of the step that copies a block's
+// modified accounts.
+func (a *Account) CloneLarge(workers int) *Account {
+	pieces := min(workers, len(a.Data)/largeCloneChunk)
+	if pieces <= 1 {
+		return a.Clone()
+	}
+	newCopy := *a
+	data := make([]byte, len(a.Data))
+	var wg sync.WaitGroup
+	wg.Add(pieces - 1)
+	for piece := 1; piece < pieces; piece++ {
+		lo, hi := len(data)*piece/pieces, len(data)*(piece+1)/pieces
+		go func() {
+			defer wg.Done()
+			copy(data[lo:hi], a.Data[lo:hi])
+		}()
+	}
+	copy(data[:len(data)/pieces], a.Data[:len(data)/pieces])
+	wg.Wait()
+	newCopy.Data = data
 	return &newCopy
 }
 
