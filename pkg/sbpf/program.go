@@ -1,8 +1,10 @@
 package sbpf
 
 import (
+	"encoding/binary"
 	"math"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/sbpfver"
 )
@@ -93,13 +95,42 @@ func (p *Program) ResolveCallTargets() {
 	p.CallTargets = targets
 }
 
+// SetLoadedText installs loader-owned instruction bytes after all relocations.
+// The resulting program and its byte and instruction views are immutable.
+func (p *Program) SetLoadedText(text []byte) {
+	if len(text)%SlotSize != 0 {
+		panic("instruction text must contain whole slots")
+	}
+	p.TextBytes = text
+	if len(text) == 0 {
+		p.Text = nil
+		return
+	}
+	ptr := unsafe.Pointer(unsafe.SliceData(text))
+	if binary.NativeEndian.Uint16([]byte{1, 0}) == 1 && uintptr(ptr)%unsafe.Alignof(Slot(0)) == 0 {
+		// Slot contains only a uint64. The view lies wholly inside the original
+		// allocation, and the slice keeps that allocation live.
+		p.Text = unsafe.Slice((*Slot)(ptr), len(text)/SlotSize)
+		return
+	}
+	p.Text = make([]Slot, len(text)/SlotSize)
+	for i := range p.Text {
+		p.Text[i] = Slot(binary.LittleEndian.Uint64(text[i*SlotSize:]))
+	}
+}
+
 func (p *Program) MemoryBytes() uint64 {
 	if p == nil {
 		return 0
 	}
-	total := uint64(len(p.RO)) + uint64(len(p.Text))*8 + uint64(len(p.CallTargets))*4
-	if len(p.RO) == 0 {
+	total := uint64(len(p.RO)) + uint64(len(p.CallTargets))*4
+	// Legacy text is a subrange of RO; strict ELF text is separately allocated.
+	if len(p.TextBytes) > 0 && !containsText(p.RO, p.TextBytes) {
 		total += uint64(len(p.TextBytes))
+	}
+	if len(p.Text) > 0 && (len(p.TextBytes) != len(p.Text)*SlotSize ||
+		unsafe.Pointer(unsafe.SliceData(p.Text)) != unsafe.Pointer(unsafe.SliceData(p.TextBytes))) {
+		total += uint64(len(p.Text)) * SlotSize
 	}
 	if len(p.Funcs) > 0 {
 		total += uint64(len(p.Funcs)) * 32
@@ -110,4 +141,14 @@ func (p *Program) MemoryBytes() uint64 {
 // Verify runs the static bytecode verifier.
 func (p *Program) Verify() error {
 	return NewVerifier(p).VerifyProgram()
+}
+
+// containsText checks containment without computing a pointer past the allocation.
+func containsText(ro, text []byte) bool {
+	if len(text) > len(ro) {
+		return false
+	}
+	start := uintptr(unsafe.Pointer(unsafe.SliceData(ro)))
+	addr := uintptr(unsafe.Pointer(unsafe.SliceData(text)))
+	return addr >= start && addr-start <= uintptr(len(ro)-len(text))
 }
