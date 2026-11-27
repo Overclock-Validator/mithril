@@ -168,3 +168,19 @@ func TestWorkingSetCompactionPreservesVersions(t *testing.T) {
 func sortDelta(d []*Account) {
 	sort.Slice(d, func(i, j int) bool { return bytes.Compare(d[i].Key[:], d[j].Key[:]) < 0 })
 }
+
+// Finality can be reported before the tail holds those slots; compaction must
+// not mark slots it has not seen as covered.
+func TestWorkingSetCompactionFinalityAhead(t *testing.T) {
+	w := NewWorkingSet()
+	k := solana.PublicKey{1}
+	w.Add(10, []*Account{{Key: k, Lamports: 1, Data: make([]byte, 100)}})
+	require.Equal(t, 0, w.CompactThrough(20)) // 11..20 not held yet
+	require.EqualValues(t, 10, w.CompactedThrough())
+	w.Add(11, []*Account{{Key: k, Lamports: 2, Data: make([]byte, 100)}})
+	require.Equal(t, 1, w.CompactThrough(20))
+	require.EqualValues(t, 11, w.CompactedThrough())
+	a, ok := w.LookupAt([32]byte(k), 10)
+	require.True(t, ok)
+	require.EqualValues(t, 1, a.Lamports)
+}

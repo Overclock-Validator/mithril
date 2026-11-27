@@ -591,6 +591,7 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		return s, ok
 	}
 	var swaps []swap
+	covered := from // the highest held slot processed: finality can run ahead of the tail
 	for _, slot := range w.order {
 		if slot <= from {
 			continue
@@ -598,6 +599,7 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		if slot > through {
 			break
 		}
+		covered = slot
 		layer := w.bySlot[slot]
 		for k, cur := range layer.writes {
 			if cur.IsDummy {
@@ -615,6 +617,9 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		}
 	}
 	w.mu.RUnlock()
+	if covered == from {
+		return 0
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -646,7 +651,7 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 			w.lastFinal[k] = s
 		}
 	}
-	w.compactedThrough = through
+	w.compactedThrough = covered
 	return done
 }
 
