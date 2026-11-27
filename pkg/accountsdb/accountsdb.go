@@ -99,6 +99,7 @@ type AccountsDb struct {
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.
 	compactInventory      *compactionInventory
+	foldManifests         foldManifestDirectory
 	compactInventoryDrift uint64
 	compactPinCache       *compactionPinCache
 	compactCRCBuf         []byte // reused to stream retained manifests through their CRC

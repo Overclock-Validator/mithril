@@ -68,14 +68,14 @@ type CheckpointLoadStats struct {
 // OpenCheckpointView opens a view at the fold boundary whose last slot is
 // throughSlot. ListRewindPoints names the available boundaries.
 func (db *AccountsDb) OpenCheckpointView(throughSlot uint64) (*CheckpointView, error) {
-	headers, err := ListFoldManifests(db.AcctsDir)
+	headers, err := db.foldManifests.headers(db.AcctsDir)
 	if err != nil {
 		return nil, err
 	}
 	var target *ManifestHeader
-	for i := range headers {
-		if headers[i].ThroughSlot == throughSlot && headers[i].BatchSeq != 0 {
-			target = &headers[i]
+	for seq := range headers {
+		if header := headers[seq]; header.ThroughSlot == throughSlot {
+			target = &header
 			break
 		}
 	}
@@ -83,6 +83,11 @@ func (db *AccountsDb) OpenCheckpointView(throughSlot uint64) (*CheckpointView, e
 		return nil, fmt.Errorf("%w: no fold boundary at slot %d", ErrCheckpointExpired, throughSlot)
 	}
 	manifest, err := ReadSegmentManifest(target.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Compaction removed it since the directory was listed.
+		db.foldManifests.forget()
+		return nil, fmt.Errorf("%w: no fold boundary at slot %d", ErrCheckpointExpired, throughSlot)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read checkpoint manifest at slot %d: %w", throughSlot, err)
 	}
@@ -130,27 +135,28 @@ func (view *CheckpointView) refreshLocked(snapshot *pebble.Snapshot) error {
 	if head.BatchSeq == view.headSeq {
 		return nil
 	}
-	headers, err := ListFoldManifests(view.db.AcctsDir)
+	headers, err := view.db.foldManifests.headers(view.db.AcctsDir)
 	if err != nil {
 		return err
 	}
-	bySeq := make(map[uint64]string, len(headers))
-	for _, header := range headers {
-		if header.BatchSeq > view.headSeq && header.BatchSeq <= head.BatchSeq {
-			bySeq[header.BatchSeq] = header.Path
-		}
-	}
 	for seq := view.headSeq + 1; seq <= head.BatchSeq; seq++ {
-		path, ok := bySeq[seq]
+		header, ok := headers[seq]
 		if !ok {
-			return fmt.Errorf("%w: fold manifest %d is missing", ErrCheckpointExpired, seq)
+			// The remembered directory may predate this fold; list it afresh once.
+			view.db.foldManifests.forget()
+			if headers, err = view.db.foldManifests.headers(view.db.AcctsDir); err != nil {
+				return err
+			}
+			if header, ok = headers[seq]; !ok {
+				return fmt.Errorf("%w: fold manifest %d is missing", ErrCheckpointExpired, seq)
+			}
 		}
-		manifest, err := ReadSegmentManifest(path)
+		manifest, err := ReadSegmentManifest(header.Path)
 		if err != nil {
 			return fmt.Errorf("read fold manifest %d: %w", seq, err)
 		}
 		if manifest.Kind != ManifestKindFold || manifest.BatchSeq != seq {
-			return fmt.Errorf("fold manifest %s does not describe batch %d", path, seq)
+			return fmt.Errorf("fold manifest %s does not describe batch %d", header.Path, seq)
 		}
 		for i := range manifest.Records {
 			record := &manifest.Records[i]
@@ -302,4 +308,51 @@ func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.Publ
 		out[read.index] = account
 	}
 	return out, stats, nil
+}
+
+// foldManifestDirectory remembers where each fold's manifest is, so finding
+// one does not mean listing the accounts directory, which holds every data
+// file in the store. It is filled by one listing on first use, kept current
+// as folds commit, and dropped whenever a rewind, a recovery or compaction
+// changes the directory outside those commits.
+type foldManifestDirectory struct {
+	mu    sync.Mutex
+	bySeq map[uint64]ManifestHeader // nil until listed
+}
+
+// headers returns the manifests by batch sequence. The map is a copy.
+func (dir *foldManifestDirectory) headers(acctsDir string) (map[uint64]ManifestHeader, error) {
+	dir.mu.Lock()
+	defer dir.mu.Unlock()
+	if dir.bySeq == nil {
+		listed, err := ListFoldManifests(acctsDir)
+		if err != nil {
+			return nil, err
+		}
+		dir.bySeq = make(map[uint64]ManifestHeader, len(listed))
+		for _, header := range listed {
+			if header.BatchSeq != 0 {
+				dir.bySeq[header.BatchSeq] = header
+			}
+		}
+	}
+	out := make(map[uint64]ManifestHeader, len(dir.bySeq))
+	for seq, header := range dir.bySeq {
+		out[seq] = header
+	}
+	return out, nil
+}
+
+func (dir *foldManifestDirectory) note(header ManifestHeader) {
+	dir.mu.Lock()
+	if dir.bySeq != nil {
+		dir.bySeq[header.BatchSeq] = header
+	}
+	dir.mu.Unlock()
+}
+
+func (dir *foldManifestDirectory) forget() {
+	dir.mu.Lock()
+	dir.bySeq = nil
+	dir.mu.Unlock()
 }

@@ -257,6 +257,7 @@ func (db *AccountsDb) FoldAndParkedManifests() ([]ManifestHeader, []string, erro
 func (db *AccountsDb) invalidateCompactionInventoryLocked() {
 	db.compactInventory = nil
 	db.compactPinCache = nil
+	db.foldManifests.forget()
 }
 
 // verifyManifestCRC checks a manifest's whole body against its CRC trailer, as

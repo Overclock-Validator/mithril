@@ -324,6 +324,13 @@ func (db *AccountsDb) CommitBatch(
 		return BatchCommitResult{}, err
 	}
 	db.trackManifestLocked(segmentManifestPath(db.AcctsDir, manifest.ThroughSlot, manifest.FileId))
+	// Before the index commit: a reader that sees this batch as the head must
+	// be able to find its manifest. An entry for a batch that then fails to
+	// commit is never consulted, and the retry overwrites it.
+	db.foldManifests.note(ManifestHeader{
+		Kind: ManifestKindFold, BatchSeq: batchSeq, FromSlot: fromSlot, ThroughSlot: throughSlot, FileId: fileId,
+		DataLen: dataLen, DataCRC: dataCRC, Path: segmentManifestPath(db.AcctsDir, throughSlot, fileId),
+	})
 	fire(db.foldHooks.afterManifestRename)
 
 	clock.step(&timings.Manifest)
