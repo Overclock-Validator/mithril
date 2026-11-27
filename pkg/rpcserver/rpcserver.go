@@ -50,6 +50,7 @@ type rpcMethods interface {
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
 	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetHistoryCoverage(context.Context, jsonrpc.RawParams) (HistoryCoverageResp, error)
 	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
@@ -93,6 +94,7 @@ type RpcServer struct {
 	voteRecordsOnce             sync.Once
 	voteRecords                 rootedVoteRecordCache
 	transactionHistory          *transactionhistory.Store
+	historyRecorderStatus       func() (bool, string)
 	transactionHistoryReads     chan struct{}
 	transactionHistoryResponses chan struct{}
 	queryResponses              chan struct{}
@@ -139,6 +141,7 @@ var supportedRPCMethods = map[string]struct{}{
 	"getEpochInfo":           {},
 	"getFirstAvailableBlock": {},
 	"getGenesisHash":         {},
+	"getHistoryCoverage":     {},
 	"getInflationReward":     {},
 	"getHealth":              {},
 	"getIdentity":            {},

@@ -2672,6 +2672,9 @@ postBootstrap:
 			klog.Fatalf("unable to start RPC server: %v", err)
 		}
 		rpcServer.InitTransactionHistory(historyStore)
+		if historySession != nil {
+			rpcServer.SetHistoryRecorderStatus(historySession.Status)
+		}
 		if err := rpcServer.InitTransactionResults(resultCache); err != nil {
 			klog.Fatalf("configure signature statuses: %v", err)
 		}

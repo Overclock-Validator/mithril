@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
@@ -22,6 +23,26 @@ type TransactionHistorySession struct {
 	pending *transactionHistoryWrite
 	stopped bool
 	err     error
+	// stoppedReason mirrors err for readers outside the replay goroutine.
+	stoppedReason atomic.Pointer[string]
+}
+
+// Status reports whether the session is still recording and, if not, why.
+// It is safe to call from any goroutine.
+func (w *TransactionHistorySession) Status() (recording bool, stoppedReason string) {
+	if w == nil {
+		return false, "transaction history is disabled"
+	}
+	if reason := w.stoppedReason.Load(); reason != nil {
+		return false, *reason
+	}
+	return true, ""
+}
+
+func (w *TransactionHistorySession) stop(err error) {
+	w.err = err
+	reason := err.Error()
+	w.stoppedReason.Store(&reason)
 }
 
 type transactionHistoryWrite struct {
@@ -117,7 +138,7 @@ func (w *TransactionHistorySession) poll() error {
 			} else if w.pending.err != nil {
 				result = "write_failed"
 				if w.err == nil {
-					w.err = w.pending.err
+					w.stop(w.pending.err)
 					mlog.Log.Errorf("transaction history recording stopped at slot %d: %v", w.pending.slot, w.err)
 				}
 			}
@@ -193,7 +214,7 @@ func (w *TransactionHistorySession) disable(err error) {
 	w.stopped = true
 	w.discard()
 	if w.err == nil {
-		w.err = err
+		w.stop(err)
 		statsd.Count(statsd.TransactionHistoryCaptures, 1, []string{"capture_failed"})
 		mlog.Log.Errorf("transaction history recording stopped: %v", err)
 	}

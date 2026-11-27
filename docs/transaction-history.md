@@ -25,6 +25,18 @@ Block history (`block_history = true`, `--rpc-block-history`) retains two epochs
 rooted block summaries for `getBlock`, `getBlocks` and `getFirstAvailableBlock`. It is
 off by default, and enabling history or signature statuses turns it on.
 
+The primary setting is `serve` (`--rpc-serve`): `none`, `accounts`, `blocks`,
+`wallet` or `history`. Each level includes the ones before it and turns on what it
+needs, so `serve = "wallet"` is enough for send and confirm, and `serve = "history"`
+for `getTransaction`. The individual switches below still work and can add a
+feature to a lower level.
+
+`getHistoryCoverage` (no parameters) reports what the node holds: the retained
+block range, the recorded transaction range and size, whether the recorder is
+still running and why not, and which rooted blocks in that range have no recorded
+transactions. A lookup alone cannot tell such a hole from a transaction that does
+not exist. It checks at most the newest 65,536 slots and names at most 64 holes.
+
 History and signature statuses can be enabled independently. The corresponding
 flags are `--rpc-transaction-history`, `--rpc-transaction-history-slots`,
 `--rpc-transaction-history-max-mib`, `--rpc-transaction-history-reserve-mib` and
