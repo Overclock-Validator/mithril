@@ -590,7 +590,16 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		s, ok := w.lastFinal[k]
 		return s, ok
 	}
-	var swaps []swap
+	// Under the read lock, only copy references: which full version each new
+	// finalized version supersedes. Differences are computed after releasing
+	// it, so a pending Add never waits on compaction and, behind it, every
+	// reader (Go's RWMutex queues new readers behind a waiting writer).
+	type pair struct {
+		slot      uint64 // layer holding the superseded full version
+		key       [32]byte
+		full, cur *Account
+	}
+	var pairs []pair
 	covered := from // the highest held slot processed: finality can run ahead of the tail
 	for _, slot := range w.order {
 		if slot <= from {
@@ -608,8 +617,7 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 			if p, ok := lookupLast(k); ok {
 				if prevLayer := w.bySlot[p]; prevLayer != nil {
 					if full, ok := prevLayer.writes[k]; ok && !full.IsDummy {
-						d := history.AppendXor(nil, historyVersion(full), historyVersion(cur))
-						swaps = append(swaps, swap{slot: p, key: k, full: full, c: compactedVersion{diff: d, slot: full.Slot}})
+						pairs = append(pairs, pair{slot: p, key: k, full: full, cur: cur})
 					}
 				}
 			}
@@ -619,6 +627,12 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 	w.mu.RUnlock()
 	if covered == from {
 		return 0
+	}
+	// Account values are immutable once added, so this needs no lock.
+	swaps := make([]swap, len(pairs))
+	for i, p := range pairs {
+		d := history.AppendXor(nil, historyVersion(p.full), historyVersion(p.cur))
+		swaps[i] = swap{slot: p.slot, key: p.key, full: p.full, c: compactedVersion{diff: d, slot: p.full.Slot}}
 	}
 
 	w.mu.Lock()
