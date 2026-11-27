@@ -606,15 +606,18 @@ type historyBankStager interface {
 	StageHistoryBank(*history.BankData)
 }
 
-func decode32(s string) (out [32]byte) {
-	if b, err := base58.Decode(s); err == nil {
-		copy(out[:], b)
+func decode32(s string) (out [32]byte, ok bool) {
+	b, err := base58.Decode(s)
+	if err != nil || len(b) != 32 {
+		return out, false
 	}
-	return out
+	copy(out[:], b)
+	return out, true
 }
 
 // foldHistoryBank turns the chunk's per-slot resume contexts into history bank
-// records, with the chunk top's heavier context.
+// records, with the chunk top's heavier context. A context that does not
+// decode is left out rather than recorded with zero hashes.
 func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, through uint64) *history.BankData {
 	b := &history.BankData{}
 	for _, sd := range chunk {
@@ -624,23 +627,41 @@ func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.Resu
 		}
 		r := history.SlotBank{Slot: sd.Slot, BlockHeight: ctx.BlockHeight, LamportsPerSignature: ctx.LamportsPerSignature,
 			PrevLamportsPerSignature: ctx.PrevLamportsPerSig, NumSignatures: ctx.NumSignatures}
-		r.Bankhash = decode32(ctx.Bankhash)
-		r.Blockhash = decode32(ctx.Blockhash)
-		b.Slots = append(b.Slots, r)
+		var ok1, ok2 bool
+		r.Bankhash, ok1 = decode32(ctx.Bankhash)
+		r.Blockhash, ok2 = decode32(ctx.Blockhash)
+		if ok1 && ok2 {
+			b.Slots = append(b.Slots, r)
+		}
 	}
 	if ctx := contexts[through]; ctx != nil {
-		top := &history.ChunkBank{Slot: through}
-		top.AccountsLtHash, _ = base64.StdEncoding.DecodeString(ctx.AcctsLtHash)
-		for _, e := range ctx.RecentBlockhashes {
-			var f history.BlockhashFee
-			f.Blockhash = decode32(e.Blockhash)
-			f.LamportsPerSignature = e.LamportsPerSignature
-			top.RecentBlockhashes = append(top.RecentBlockhashes, f)
-		}
-		top.EvictedBlockhash = decode32(ctx.EvictedBlockhash)
-		b.Top = top
+		b.Top = foldChunkBank(ctx, through)
 	}
 	return b
+}
+
+func foldChunkBank(ctx *state.ResumeContext, through uint64) *history.ChunkBank {
+	top := &history.ChunkBank{Slot: through}
+	var err error
+	if top.AccountsLtHash, err = base64.StdEncoding.DecodeString(ctx.AcctsLtHash); err != nil || len(top.AccountsLtHash) == 0 {
+		return nil
+	}
+	for _, e := range ctx.RecentBlockhashes {
+		var f history.BlockhashFee
+		var ok bool
+		if f.Blockhash, ok = decode32(e.Blockhash); !ok {
+			return nil
+		}
+		f.LamportsPerSignature = e.LamportsPerSignature
+		top.RecentBlockhashes = append(top.RecentBlockhashes, f)
+	}
+	if ctx.EvictedBlockhash != "" {
+		var ok bool
+		if top.EvictedBlockhash, ok = decode32(ctx.EvictedBlockhash); !ok {
+			return nil
+		}
+	}
+	return top
 }
 
 type foldResult struct {

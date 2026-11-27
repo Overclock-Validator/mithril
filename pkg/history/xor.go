@@ -62,6 +62,10 @@ const (
 // about as much as a few bytes.
 const gapMerge = 8
 
+// MaxDataLen bounds an account's data length when decoding (Solana's limit is
+// 10 MiB), so corrupt input can never ask for a huge or negative length.
+const MaxDataLen = 10 << 20
+
 // AppendWhole appends a version's full encoding: lamports, owner, executable,
 // rent epoch, data length, data.
 func AppendWhole(dst []byte, v *Version) []byte {
@@ -87,7 +91,7 @@ func ReadWhole(b []byte) (*Version, []byte, error) {
 	v.Executable = b[40] == 1
 	v.RentEpoch = binary.LittleEndian.Uint64(b[41:])
 	n, k := binary.Uvarint(b[49:])
-	if k <= 0 || uint64(len(b)-49-k) < n {
+	if k <= 0 || n > MaxDataLen || uint64(len(b)-49-k) < n {
 		return nil, nil, errDiff
 	}
 	start := 49 + k
@@ -98,13 +102,24 @@ func ReadWhole(b []byte) (*Version, []byte, error) {
 // AppendXor appends the XOR difference between prev and cur. The same bytes
 // turn prev into cur (forward) and cur into prev (backward).
 func AppendXor(dst []byte, prev, cur *Version) []byte {
+	dst, changed := AppendXorChanged(dst, prev, cur)
+	if !changed {
+		dst = append(dst, 0, 0) // no flags, no ranges
+	}
+	return dst
+}
+
+// AppendXorChanged is AppendXor that also reports whether the versions differ,
+// in the same pass. When they are the same it returns dst unchanged.
+func AppendXorChanged(dst []byte, prev, cur *Version) ([]byte, bool) {
+	start0 := len(dst)
 	switch {
 	case prev.Absent && cur.Absent:
-		return append(dst, 0, 0)
+		return dst, false
 	case prev.Absent:
-		return AppendWhole(append(dst, xCreated), cur)
+		return AppendWhole(append(dst, xCreated), cur), true
 	case cur.Absent:
-		return AppendWhole(append(dst, xDeleted), prev)
+		return AppendWhole(append(dst, xDeleted), prev), true
 	}
 	var flags byte
 	var hdr [96]byte
@@ -167,9 +182,9 @@ func AppendXor(dst []byte, prev, cur *Version) []byte {
 		end := lastDiff + 1
 		dst = binary.AppendUvarint(dst, uint64(start-last))
 		dst = binary.AppendUvarint(dst, uint64(end-start))
-		for j := start; j < end; j++ {
-			dst = append(dst, p[j]^c[j])
-		}
+		at := len(dst)
+		dst = append(dst, p[start:end]...)
+		xorInto(dst[at:], c[start:end])
 		ranges++
 		last, i = end, end
 	}
@@ -185,7 +200,10 @@ func AppendXor(dst []byte, prev, cur *Version) []byte {
 	} else if len(p) > m {
 		dst = append(dst, p[m:]...)
 	}
-	return dst
+	if flags == 0 && ranges == 0 && len(p) == len(c) {
+		return dst[:start0], false
+	}
+	return dst, true
 }
 
 func uvarintLen(x uint64) int { return (bits.Len64(x|1) + 6) / 7 }
@@ -251,7 +269,7 @@ func ApplyXor(v *Version, d []byte, forward bool) error {
 		}
 		d = d[k:]
 		n, k2 := binary.Uvarint(d)
-		if k2 <= 0 {
+		if k2 <= 0 || o > MaxDataLen || n > MaxDataLen {
 			return errDiff
 		}
 		d = d[k2:]
@@ -282,10 +300,11 @@ func ApplyXor(v *Version, d []byte, forward bool) error {
 			return errDiff
 		}
 		d = d[k2:]
-		pos += int(gap)
-		if pos+int(n) > m {
+		// Unsigned bounds first: corrupt values must not wrap an int.
+		if room := uint64(m - pos); gap > room || n > room-gap {
 			return errDiff
 		}
+		pos += int(gap)
 		xorInto(v.Data[pos:pos+int(n)], d[:n])
 		d = d[n:]
 		pos += int(n)

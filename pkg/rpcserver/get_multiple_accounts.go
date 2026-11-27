@@ -59,18 +59,7 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 	var slot uint64
 	if conf.AtSlot != nil {
 		slot = *conf.AtSlot
-		accountSet, err = rpcServer.accountsAtSlot(ctx, keys, slot)
-		if err == nil {
-			total := 0
-			for _, a := range accountSet {
-				if a != nil {
-					total += len(a.Data)
-				}
-			}
-			if total > maxMultipleAccountsDataBytes {
-				err = accountsdb.ErrAccountDataLimit
-			}
-		}
+		accountSet, err = rpcServer.accountsAtSlot(ctx, keys, slot, maxMultipleAccountsDataBytes)
 	} else {
 		err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
 			var err error

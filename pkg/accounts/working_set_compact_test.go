@@ -184,3 +184,29 @@ func TestWorkingSetCompactionFinalityAhead(t *testing.T) {
 	require.True(t, ok)
 	require.EqualValues(t, 1, a.Lamports)
 }
+
+// A dummy placeholder between two real versions must end the compaction
+// chain, so rebuilding the older version never starts from the dummy.
+func TestCompactionStopsAtDummy(t *testing.T) {
+	var k [32]byte
+	k[0] = 7
+	mk := func(slot uint64, b byte) *Account {
+		a := &Account{Key: solana.PublicKey(k), Lamports: 5, Slot: slot, Data: make([]byte, 700)}
+		a.Data[3] = b
+		return a
+	}
+	w := NewWorkingSet()
+	a10 := mk(10, 1)
+	w.Add(10, []*Account{a10})
+	w.Add(11, []*Account{{Key: solana.PublicKey(k), IsDummy: true, Slot: 11}})
+	w.Add(12, []*Account{mk(12, 2)})
+	w.Add(13, []*Account{mk(13, 3)})
+	w.CompactThrough(13)
+	got, ok := w.LookupAt(k, 10)
+	require.True(t, ok)
+	require.True(t, sameAccount(got, a10))
+	got, ok = w.LookupAt(k, 12)
+	require.True(t, ok)
+	require.EqualValues(t, 2, got.Data[3])
+	w.RangeVersions(func(uint64, *Account) {})
+}

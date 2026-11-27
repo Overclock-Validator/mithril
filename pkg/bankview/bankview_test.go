@@ -359,3 +359,43 @@ func TestSlotStatuses(t *testing.T) {
 		t.Fatalf("after notarization: certified=%v statuses=%+v", certified, got)
 	}
 }
+
+func TestAccountsAtEarlierSlot(t *testing.T) {
+	ta := newTestAccounts()
+	a, b := key(20), key(21)
+	ta.durable[a] = acct(a, 1)
+	ta.through.Store(80)
+	var p Publisher
+	p.Reset(ta)
+	ta.ws.Add(85, []*accounts.Account{acct(a, 2)})
+	ta.ws.Add(90, []*accounts.Account{acct(a, 3), acct(b, 9)})
+	p.PublishProcessed(view(90))
+	err := p.Do(context.Background(), Processed, 0, func(r *Read) error {
+		if r.DurableSlot() != 80 {
+			t.Fatalf("durable slot %d", r.DurableSlot())
+		}
+		for _, tc := range []struct {
+			slot uint64
+			a, b uint64
+		}{{80, 1, 0}, {84, 1, 0}, {85, 2, 0}, {89, 2, 0}, {90, 3, 9}} {
+			out, err := r.AccountsAtSlot(context.Background(), []solana.PublicKey{a, b}, tc.slot, NoDataLimit)
+			if err != nil {
+				return err
+			}
+			var gb uint64
+			if out[1] != nil {
+				gb = out[1].Lamports
+			}
+			if out[0].Lamports != tc.a || gb != tc.b {
+				t.Fatalf("slot %d: a=%d b=%d", tc.slot, out[0].Lamports, gb)
+			}
+		}
+		if _, err := r.AccountsAtSlot(context.Background(), []solana.PublicKey{a}, 91, NoDataLimit); err == nil {
+			t.Fatal("read after the view's slot")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

@@ -206,10 +206,12 @@ func (s *Store) BankAt(slot uint64) (SlotBank, error) {
 // before slot.
 func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 	s.mu.RLock()
+	// Newest first: the first chunk record at or before slot wins. Chunks
+	// written without bank context are skipped.
 	var paths []string
-	for i := len(s.segments) - 1; i >= 0 && len(paths) < 2; i-- {
+	for i := len(s.segments) - 1; i >= 0; i-- {
 		seg := s.segments[i]
-		for j := len(seg.chunks) - 1; j >= 0 && len(paths) < 2; j-- {
+		for j := len(seg.chunks) - 1; j >= 0; j-- {
 			if seg.chunks[j].from <= slot {
 				paths = append(paths, seg.chunks[j].bankPath())
 			}

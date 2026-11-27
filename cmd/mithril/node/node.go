@@ -1458,6 +1458,9 @@ func runLive(c *cobra.Command, args []string) error {
 	if err := rpcTransactionHistory.validate(consensusMode, rpcPort); err != nil {
 		return fmt.Errorf("invalid transaction history configuration: %w", err)
 	}
+	if rpcAccountHistory && consensusMode != "verifying" {
+		return errors.New("invalid account history configuration: rpc.account_history requires verifying mode")
+	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -5027,11 +5030,34 @@ func openAccountHistory(accountsDb *accountsdb.AccountsDb, accountsPath string) 
 	if dir == "" {
 		dir = filepath.Join(accountsPath, "rpc-account-history")
 	}
-	hs, err := history.Open(dir, history.Options{KeepSegments: rpcAccountHistorySegments})
-	if err != nil {
-		klog.Fatalf("open account history: %v", err)
+	opts := history.Options{KeepSegments: rpcAccountHistorySegments}
+	hs, err := history.Open(dir, opts)
+	if err == nil {
+		err = accountsDb.SetHistory(hs)
 	}
-	accountsDb.SetHistory(hs)
+	if err != nil {
+		// History is a record for RPC, never needed to replay: start it again
+		// rather than stop the node.
+		mlog.Log.Errorf("account history: %s is unusable (%v); starting it again", dir, err)
+		if hs != nil {
+			hs.Close()
+		}
+		hs = nil
+		if rmErr := os.RemoveAll(dir); rmErr == nil {
+			if hs, err = history.Open(dir, opts); err == nil {
+				err = accountsDb.SetHistory(hs)
+			}
+		} else {
+			err = rmErr
+		}
+		if err != nil {
+			mlog.Log.Errorf("account history disabled: %v", err)
+			return
+		}
+	}
+	if note := hs.Repaired(); note != "" {
+		mlog.Log.Warnf("account history: %s", note)
+	}
 	if first, through, ok := hs.Range(); ok {
 		mlog.Log.Infof("account history: %s holds slots %d to %d", dir, first, through)
 	} else {

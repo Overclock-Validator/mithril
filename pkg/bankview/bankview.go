@@ -402,7 +402,12 @@ type Read struct {
 	accounts Accounts
 	gen      uint64
 	epoch    uint64
+	durable  uint64 // the slot the durable store reaches for this read
 }
+
+// DurableSlot returns the slot the durable store reaches for this read. Slots
+// after it are still held in the working set.
+func (r *Read) DurableSlot() uint64 { return r.durable }
 
 // Account returns the account as of the view's slot, or nil if it does not
 // exist there. Zero-lamport accounts are reported as missing.
@@ -433,12 +438,23 @@ func (r *Read) Accounts(ctx context.Context, pubkeys []solana.PublicKey) ([]*acc
 // once the budget is exceeded; durable reads are refused before their data
 // is copied.
 func (r *Read) AccountsWithDataLimit(ctx context.Context, pubkeys []solana.PublicKey, maxDataBytes uint64) ([]*accounts.Account, error) {
+	return r.AccountsAtSlot(ctx, pubkeys, r.View.Slot, maxDataBytes)
+}
+
+// AccountsAtSlot is AccountsWithDataLimit as of an earlier slot of the view's
+// chain, at or after DurableSlot: the working set still holds every version
+// written since then. Slots at or before DurableSlot read the durable store's
+// current values.
+func (r *Read) AccountsAtSlot(ctx context.Context, pubkeys []solana.PublicKey, slot uint64, maxDataBytes uint64) ([]*accounts.Account, error) {
+	if slot > r.View.Slot {
+		return nil, fmt.Errorf("slot %d is after the view's slot %d", slot, r.View.Slot)
+	}
 	out := make([]*accounts.Account, len(pubkeys))
 	var misses []solana.PublicKey
 	var missIdx []int
 	remaining := maxDataBytes
 	for i, pk := range pubkeys {
-		a, ok, err := r.lookup(pk)
+		a, ok, err := r.lookupAt(pk, slot)
 		if err != nil {
 			return nil, err
 		}
@@ -473,10 +489,14 @@ func (r *Read) AccountsWithDataLimit(ctx context.Context, pubkeys []solana.Publi
 
 // lookup finds an unrooted version at or below the view's slot.
 func (r *Read) lookup(pubkey solana.PublicKey) (*accounts.Account, bool, error) {
+	return r.lookupAt(pubkey, r.View.Slot)
+}
+
+func (r *Read) lookupAt(pubkey solana.PublicKey, slot uint64) (*accounts.Account, bool, error) {
 	if accts, ok := r.accounts.(LookupErrAccounts); ok {
-		return accts.LookupAtErr([32]byte(pubkey), r.View.Slot)
+		return accts.LookupAtErr([32]byte(pubkey), slot)
 	}
-	a, ok := r.accounts.LookupAt([32]byte(pubkey), r.View.Slot)
+	a, ok := r.accounts.LookupAt([32]byte(pubkey), slot)
 	return a, ok, nil
 }
 
@@ -514,7 +534,7 @@ func (p *Publisher) begin(level Level) (r *Read, ok bool, err error) {
 	if p.cur.Load() != snap {
 		return nil, false, nil
 	}
-	return &Read{View: view, Level: served, accounts: snap.accounts, gen: gen, epoch: epoch}, true, nil
+	return &Read{View: view, Level: served, accounts: snap.accounts, gen: gen, epoch: epoch, durable: through}, true, nil
 }
 
 func (r *Read) valid() bool {

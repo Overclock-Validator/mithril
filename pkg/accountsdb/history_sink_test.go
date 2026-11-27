@@ -30,7 +30,7 @@ func TestFoldsRecordHistory(t *testing.T) {
 
 	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 2, KeepSegments: 10})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 
 	truth := map[uint64]map[solana.PublicKey]*accounts.Account{}
 	live := map[solana.PublicKey]*accounts.Account{}
@@ -94,7 +94,7 @@ func TestCompactedFoldsRecordExactHistory(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 3})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 	rng := rand.New(rand.NewSource(9))
 	keys := make([]solana.PublicKey, 30)
 	for i := range keys {
@@ -164,7 +164,7 @@ func TestHistoryFollowsRewind(t *testing.T) {
 	require.NoError(t, err)
 	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 2})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 	fold := func(slot, lamports uint64) {
 		_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: []*accounts.Account{{Key: k, Lamports: lamports}}}}, slot, nil, nil)
 		require.NoError(t, err)
@@ -191,7 +191,7 @@ func TestHistoryReadsDuringFolds(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 3})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 	keys := []solana.PublicKey{{1}, {2}, {3}}
 	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 1, Delta: []*accounts.Account{{Key: keys[0], Lamports: 1}}}}, 1, nil, nil)
 	require.NoError(t, err)
@@ -241,7 +241,7 @@ func TestStagedBankReachesHistory(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	hs, err := history.Open(t.TempDir(), history.Options{})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 	require.True(t, db.HistoryEnabled())
 	k := solana.PublicKey{4}
 	bank := &history.BankData{Slots: []history.SlotBank{{Slot: 5, BlockHeight: 3, LamportsPerSignature: 5000}}, Top: &history.ChunkBank{Slot: 5}}
@@ -256,4 +256,30 @@ func TestStagedBankReachesHistory(t *testing.T) {
 	require.NoError(t, err)
 	_, err = hs.BankAt(6)
 	require.ErrorIs(t, err, history.ErrNoBank)
+}
+
+// Attaching history drops what it recorded past the durable store and clears
+// history that no longer reaches it.
+func TestSetHistoryReconciles(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	k := solana.PublicKey{9}
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: 100, Delta: []*accounts.Account{{Key: k, Lamports: 1}}}}, 100, nil, nil)
+	require.NoError(t, err)
+	none := func(keys [][32]byte) ([]*history.Version, error) { return make([]*history.Version, len(keys)), nil }
+
+	ahead, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	require.NoError(t, ahead.Append(91, 100, nil, none))
+	require.NoError(t, ahead.Append(101, 110, nil, none)) // a fold that never committed
+	require.NoError(t, db.SetHistory(ahead))
+	through, ok := ahead.Through()
+	require.True(t, ok)
+	require.EqualValues(t, 100, through)
+
+	behind, err := history.Open(t.TempDir(), history.Options{})
+	require.NoError(t, err)
+	require.NoError(t, behind.Append(50, 60, nil, none))
+	require.NoError(t, db.SetHistory(behind))
+	_, ok = behind.Through()
+	require.False(t, ok, "history that stops short of the durable store is cleared")
 }

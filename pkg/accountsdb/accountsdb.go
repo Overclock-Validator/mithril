@@ -232,6 +232,7 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 }
 
 func (accountsDb *AccountsDb) CloseDb() {
+	accountsDb.CloseHistory()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)

@@ -47,7 +47,7 @@ func (rpcServer *RpcServer) GetBalance(ctx context.Context, p jsonrpc.RawParams)
 		return GetBalanceResp{}, err
 	}
 	if conf.AtSlot != nil {
-		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot)
+		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot, bankview.NoDataLimit)
 		if err != nil {
 			return GetBalanceResp{}, err
 		}

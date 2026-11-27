@@ -1,8 +1,10 @@
 package accountsdb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,11 +50,49 @@ type HistoryStats struct {
 }
 
 // SetHistory attaches a history store; every later fold records its slots.
-func (db *AccountsDb) SetHistory(s *history.Store) {
+// History recorded past the durable store (a fold that failed after recording,
+// or a store rewound or rebuilt since) is dropped first, and history that no
+// longer reaches the durable store is cleared, so the two agree from the
+// start. A previously attached store is closed.
+func (db *AccountsDb) SetHistory(s *history.Store) error {
 	db.history.mu.Lock()
 	defer db.history.mu.Unlock()
-	db.history.store.Store(s)
+	if s != nil {
+		if err := reconcileHistory(s, db.DurableThrough()); err != nil {
+			return err
+		}
+	}
+	if old := db.history.store.Swap(s); old != nil && old != s {
+		old.Close()
+	}
 	db.history.failed.Store(false)
+	return nil
+}
+
+func reconcileHistory(s *history.Store, durable uint64) error {
+	through, ok := s.Through()
+	if !ok {
+		return nil
+	}
+	if through > durable {
+		if err := s.TruncateFrom(durable + 1); err != nil {
+			return err
+		}
+		through, ok = s.Through()
+	}
+	if ok && through != durable {
+		return s.Reset()
+	}
+	return nil
+}
+
+// CloseHistory detaches and closes the history store.
+func (db *AccountsDb) CloseHistory() {
+	db.history.mu.Lock()
+	defer db.history.mu.Unlock()
+	if old := db.history.store.Swap(nil); old != nil {
+		old.Close()
+	}
 }
 
 // History returns the attached history store, or nil.
@@ -90,11 +130,12 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 	if s == nil || db.history.failed.Load() {
 		return
 	}
-	if bank != nil && len(bank.Slots) > 0 && bank.Slots[len(bank.Slots)-1].Slot > throughSlot {
-		bank = nil // staged for a different batch
-	}
 	start := time.Now()
 	from := db.DurableThrough() + 1
+	if bank != nil && !bankWithin(bank, from, throughSlot) {
+		mlog.Log.Warnf("history: bank context staged for another fold; recording %d..%d without it", from, throughSlot)
+		bank = nil
+	}
 	if through, ok := s.Through(); ok && through+1 != from {
 		var err error
 		if through >= from {
@@ -143,6 +184,15 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 	st.LastThrough = throughSlot
 }
 
+func bankWithin(b *history.BankData, from, to uint64) bool {
+	for i, r := range b.Slots {
+		if r.Slot < from || r.Slot > to || (i > 0 && r.Slot <= b.Slots[i-1].Slot) {
+			return false
+		}
+	}
+	return b.Top == nil || (b.Top.Slot >= from && b.Top.Slot <= to)
+}
+
 func (db *AccountsDb) disableHistory(err error) {
 	db.history.failed.Store(true)
 	mlog.Log.Errorf("history: recording stopped: %v", err)
@@ -187,6 +237,9 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 			out.versions++
 		}
 	}
+	// Key order: the store writes records sorted, and sorted reads walk the
+	// index and files in order.
+	sort.Slice(order, func(i, j int) bool { return bytes.Compare(order[i][:], order[j][:]) < 0 })
 	// Versions before the fold, read in bounded batches.
 	t := time.Now()
 	prev := make([]*history.Version, len(order))
@@ -220,6 +273,18 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 		}
 		return v
 	}
+	// Differences go into shared slabs: one allocation per few hundred KiB
+	// instead of a few per version.
+	var slab []byte
+	appendDiff := func(old, cur *history.Version) ([]byte, bool) {
+		if need := 2*max(len(old.Data), len(cur.Data)) + 256; cap(slab)-len(slab) < need {
+			slab = make([]byte, 0, max(512<<10, need))
+		}
+		at := len(slab)
+		var changed bool
+		slab, changed = history.AppendXorChanged(slab, old, cur)
+		return slab[at:len(slab):len(slab)], changed
+	}
 	out.keys = make([]history.KeyHistory, 0, len(order))
 	for ki, k := range order {
 		es := byKey[k]
@@ -243,17 +308,17 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 				reuse = older.Lamports != 0 && cur.Lamports != 0
 			}
 			hOld, hCur := semantic(older), semantic(cur)
-			if !history.Same(hOld, hCur) {
-				d := es[i-1].diff
-				if !reuse {
-					d = history.AppendXor(nil, hOld, hCur)
+			if reuse {
+				if !history.Same(hOld, hCur) {
+					diffs = append(diffs, history.Diff{Slot: es[i].slot, Bytes: es[i-1].diff})
 				}
+			} else if d, changed := appendDiff(hOld, hCur); changed {
 				diffs = append(diffs, history.Diff{Slot: es[i].slot, Bytes: d})
 			}
 			cur = older
 		}
-		if first := semantic(cur); !history.Same(prev[ki], first) {
-			diffs = append(diffs, history.Diff{Slot: es[0].slot, Bytes: history.AppendXor(nil, prev[ki], first)})
+		if d, changed := appendDiff(prev[ki], semantic(cur)); changed {
+			diffs = append(diffs, history.Diff{Slot: es[0].slot, Bytes: d})
 		}
 		for l, r := 0, len(diffs)-1; l < r; l, r = l+1, r-1 {
 			diffs[l], diffs[r] = diffs[r], diffs[l]

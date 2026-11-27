@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -97,6 +98,9 @@ func readRecord(b []byte, from uint64) (*Record, []byte, error) {
 		return nil, nil, errChunk
 	}
 	b = b[k:]
+	if n > uint64(len(b))/2 { // each difference takes at least two bytes
+		return nil, nil, errChunk
+	}
 	r.Diffs = make([]Diff, 0, n)
 	for i := uint64(0); i < n; i++ {
 		off, k1 := binary.Uvarint(b)
@@ -118,26 +122,39 @@ func readRecord(b []byte, from uint64) (*Record, []byte, error) {
 var errChunk = errors.New("history: malformed chunk")
 
 // writeChunk writes records (sorted by key) as a chunk file covering slots
-// [from, to], through a temporary file renamed into place after fsync.
-func writeChunk(path string, from, to uint64, records []*Record) error {
+// [from, to], through a temporary file renamed into place after fsync, and
+// returns a reader for it built from what was written.
+func writeChunk(path string, from, to uint64, records []*Record) (*chunkReader, error) {
 	e, _ := codecs()
-	out := []byte(chunkMagic)
+	rawTotal := 0
+	for _, r := range records {
+		rawTotal += 48
+		if r.Full != nil {
+			rawTotal += 64 + len(r.Full.Data)
+		}
+		for _, d := range r.Diffs {
+			rawTotal += 8 + len(d.Bytes)
+		}
+	}
+	out := make([]byte, 0, len(chunkMagic)+rawTotal/3+chunkFooterLen+4096)
+	out = append(out, chunkMagic...)
+	c := &chunkReader{path: path, from: from, to: to}
 	var index []byte
-	var raw []byte
+	raw := make([]byte, 0, 2*targetBlockSize)
 	var first [32]byte
-	blocks := 0
 	flush := func() {
 		if len(raw) == 0 {
 			return
 		}
-		z := e.EncodeAll(raw, nil)
+		offset := len(out)
+		out = e.EncodeAll(raw, out)
+		b := blockRef{first: first, offset: uint64(offset), clen: uint32(len(out) - offset), rlen: uint32(len(raw))}
+		c.blocks = append(c.blocks, b)
 		index = append(index, first[:]...)
-		index = binary.LittleEndian.AppendUint64(index, uint64(len(out)))
-		index = binary.LittleEndian.AppendUint32(index, uint32(len(z)))
-		index = binary.LittleEndian.AppendUint32(index, uint32(len(raw)))
-		out = append(out, z...)
+		index = binary.LittleEndian.AppendUint64(index, b.offset)
+		index = binary.LittleEndian.AppendUint32(index, b.clen)
+		index = binary.LittleEndian.AppendUint32(index, b.rlen)
 		raw = raw[:0]
-		blocks++
 	}
 	for _, r := range records {
 		if len(raw) == 0 {
@@ -152,14 +169,32 @@ func writeChunk(path string, from, to uint64, records []*Record) error {
 	indexOffset := uint64(len(out))
 	out = append(out, index...)
 	out = binary.LittleEndian.AppendUint64(out, indexOffset)
-	out = binary.LittleEndian.AppendUint32(out, uint32(blocks))
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(c.blocks)))
 	out = binary.LittleEndian.AppendUint32(out, crc32.ChecksumIEEE(index))
 	out = binary.LittleEndian.AppendUint64(out, from)
 	out = binary.LittleEndian.AppendUint64(out, to)
 	out = append(out, chunkMagic...)
-	return writeFileSync(path, out)
+	if err := writeFileSync(path, out); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
+// syncDir makes a rename or create in dir durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// writeFileSync writes data through a temporary file, fsyncs it, renames it
+// into place and fsyncs the directory.
 func writeFileSync(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
@@ -177,7 +212,10 @@ func writeFileSync(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 type blockRef struct {
@@ -212,17 +250,22 @@ func openChunk(path string) (*chunkReader, error) {
 	if _, err := f.ReadAt(foot, size-chunkFooterLen); err != nil {
 		return nil, err
 	}
-	if string(foot[32:]) != chunkMagic {
-		return nil, fmt.Errorf("%w: %s bad footer", errChunk, path)
+	head := make([]byte, len(chunkMagic))
+	if _, err := f.ReadAt(head, 0); err != nil {
+		return nil, err
+	}
+	if string(foot[32:]) != chunkMagic || string(head) != chunkMagic {
+		return nil, fmt.Errorf("%w: %s bad magic", errChunk, path)
 	}
 	indexOffset := binary.LittleEndian.Uint64(foot)
-	n := int(binary.LittleEndian.Uint32(foot[8:]))
+	n := uint64(binary.LittleEndian.Uint32(foot[8:]))
 	sum := binary.LittleEndian.Uint32(foot[12:])
 	c := &chunkReader{path: path, from: binary.LittleEndian.Uint64(foot[16:]), to: binary.LittleEndian.Uint64(foot[24:])}
-	index := make([]byte, n*indexEntryLen)
-	if int64(indexOffset)+int64(len(index)) != size-chunkFooterLen {
+	body := uint64(size - chunkFooterLen)
+	if indexOffset < uint64(len(chunkMagic)) || indexOffset > body || n != (body-indexOffset)/indexEntryLen || (body-indexOffset)%indexEntryLen != 0 {
 		return nil, fmt.Errorf("%w: %s index bounds", errChunk, path)
 	}
+	index := make([]byte, n*indexEntryLen)
 	if _, err := f.ReadAt(index, int64(indexOffset)); err != nil {
 		return nil, err
 	}
@@ -236,6 +279,9 @@ func openChunk(path string) (*chunkReader, error) {
 		c.blocks[i].offset = binary.LittleEndian.Uint64(e[32:])
 		c.blocks[i].clen = binary.LittleEndian.Uint32(e[40:])
 		c.blocks[i].rlen = binary.LittleEndian.Uint32(e[44:])
+		if b := c.blocks[i]; b.offset < uint64(len(chunkMagic)) || b.offset+uint64(b.clen) > indexOffset {
+			return nil, fmt.Errorf("%w: %s block %d bounds", errChunk, path, i)
+		}
 	}
 	return c, nil
 }
@@ -257,7 +303,7 @@ func (c *chunkReader) block(i int) ([]byte, error) {
 		return nil, err
 	}
 	_, d := codecs()
-	raw, err := d.DecodeAll(z, make([]byte, 0, b.rlen))
+	raw, err := d.DecodeAll(z, make([]byte, 0, min(b.rlen, 16<<20)))
 	if err != nil {
 		return nil, fmt.Errorf("history: %s block %d: %w", c.path, i, err)
 	}
@@ -311,8 +357,8 @@ func (c *chunkReader) lookupCached(key [32]byte, cache blockCache) (*Record, err
 	return nil, nil
 }
 
-// keys returns every key in the chunk in order, with whether its record holds
-// a full copy. Used to rebuild the open segment's table after a restart.
+// keys calls fn with every key in the chunk, in order. Used to rebuild the
+// open segment's table after a restart or truncation.
 func (c *chunkReader) keys(fn func(key [32]byte)) error {
 	for i := range c.blocks {
 		raw, err := c.block(i)

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/history"
@@ -24,15 +25,17 @@ import (
 
 type queryKeySample struct {
 	mu   sync.Mutex
+	rng  *rand.Rand
 	keys [][32]byte
 	seen int
 }
 
 const querySampleSize = 50000
 
-func (q *queryKeySample) add(rng *rand.Rand, k [32]byte) {
+func (q *queryKeySample) add(k [32]byte) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	rng := q.rng
 	q.seen++
 	if len(q.keys) < querySampleSize {
 		q.keys = append(q.keys, k)
@@ -52,19 +55,20 @@ func (q *queryKeySample) pick(rng *rand.Rand) ([32]byte, bool) {
 	return q.keys[rng.Intn(len(q.keys))], true
 }
 
-var benchQueryKeys *queryKeySample
+var benchQueryKeys atomic.Pointer[queryKeySample]
 
 func benchHistorySample(keys []history.KeyHistory) {
-	if benchQueryKeys == nil {
+	q := benchQueryKeys.Load()
+	if q == nil {
 		return
 	}
-	rng := rand.New(rand.NewSource(int64(len(keys))))
 	for i := range keys {
-		benchQueryKeys.add(rng, keys[i].Key)
+		q.add(keys[i].Key)
 	}
 }
 
-// StartBenchHistoryQueries starts the query load if the switch is set.
+// StartBenchHistoryQueries starts the query load if the switch is set. Only
+// the first call starts it; later ones (replay restarts) are no-ops.
 func (db *AccountsDb) StartBenchHistoryQueries(ctx context.Context) {
 	v, ok := os.LookupEnv("MITHRIL_BENCH_HISTORY_QUERIES")
 	if !ok {
@@ -74,7 +78,9 @@ func (db *AccountsDb) StartBenchHistoryQueries(ctx context.Context) {
 	if v != "max" {
 		perSec, _ = strconv.Atoi(v)
 	}
-	benchQueryKeys = &queryKeySample{}
+	if !benchQueryKeys.CompareAndSwap(nil, &queryKeySample{rng: rand.New(rand.NewSource(2))}) {
+		return
+	}
 	go db.runBenchHistoryQueries(ctx, perSec)
 }
 
@@ -116,7 +122,7 @@ func (db *AccountsDb) runBenchHistoryQueries(ctx context.Context, perSec int) {
 			continue
 		}
 		first, through, ok := hs.Range()
-		key, okKey := benchQueryKeys.pick(rng)
+		key, okKey := benchQueryKeys.Load().pick(rng)
 		if !ok || !okKey {
 			time.Sleep(100 * time.Millisecond)
 			continue

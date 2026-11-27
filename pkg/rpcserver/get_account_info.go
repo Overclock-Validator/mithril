@@ -81,7 +81,7 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		return GetAccountInfoResp{}, &InvalidParamsError{Message: err.Error()}
 	}
 	if conf.AtSlot != nil {
-		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot)
+		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot, bankview.NoDataLimit)
 		if err != nil {
 			return GetAccountInfoResp{}, err
 		}

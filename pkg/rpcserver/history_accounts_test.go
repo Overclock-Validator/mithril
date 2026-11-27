@@ -23,7 +23,7 @@ func TestAccountReadsAtPastSlot(t *testing.T) {
 	require.NoError(t, err)
 	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 2})
 	require.NoError(t, err)
-	db.SetHistory(hs)
+	require.NoError(t, db.SetHistory(hs))
 	// a changes at 101 and 105; b appears at 103; quiet never changes again.
 	_, err = db.CommitBatch([]accounts.SlotDelta{
 		{Slot: 101, Delta: []*accounts.Account{{Key: a, Lamports: 11, Data: []byte{1}}}},
@@ -60,7 +60,7 @@ func TestAccountReadsAtPastSlot(t *testing.T) {
 	_, err = balanceAt(a, 100)
 	require.ErrorContains(t, err, "outside recorded account history")
 	_, err = balanceAt(a, 107)
-	require.ErrorContains(t, err, "outside recorded account history")
+	require.ErrorContains(t, err, "not finalized yet")
 
 	info, err := server.GetAccountInfo(t.Context(), mustRawParams(t, []any{a.String(), map[string]any{"slot": 104, "encoding": "base64"}}))
 	require.NoError(t, err)
@@ -89,9 +89,12 @@ func TestAccountReadsAtPastSlot(t *testing.T) {
 	require.Nil(t, multi.Result.Value[1])
 	require.EqualValues(t, 77, multi.Result.Value[2].Lamports)
 
-	// Without history the extension is refused.
-	plain := &RpcServer{acctsDb: newRPCAccountsDB(t)}
-	plain.SetRootedBankState(1, 1, 0)
-	_, err = plain.GetBalance(t.Context(), mustRawParams(t, []any{a.String(), map[string]any{"slot": 1}}))
+	// Without history, folded slots are refused.
+	plainDB := newRPCAccountsDB(t)
+	_, err = plainDB.CommitBatch([]accounts.SlotDelta{{Slot: 5, Delta: []*accounts.Account{{Key: a, Lamports: 1}}}}, 5, nil, nil)
+	require.NoError(t, err)
+	plain := &RpcServer{acctsDb: plainDB}
+	plain.SetRootedBankState(5, 5, 0)
+	_, err = plain.GetBalance(t.Context(), mustRawParams(t, []any{a.String(), map[string]any{"slot": 3}}))
 	require.ErrorContains(t, err, "account history is not enabled")
 }

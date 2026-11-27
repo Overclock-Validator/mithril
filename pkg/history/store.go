@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -63,6 +64,9 @@ type Store struct {
 	segmentChunks int
 	keepSegments  int
 	segments      []*segment // ascending; the last one is open unless empty
+	lastBank      uint64     // slot of the newest bank record, when lastBankKnown
+	lastBankKnown bool
+	repaired      string
 }
 
 // Options configure a Store.
@@ -71,7 +75,9 @@ type Options struct {
 	KeepSegments  int // closed segments retained; default 48
 }
 
-// Open opens or creates a history store in dir.
+// Open opens or creates a history store in dir. A damaged or missing chunk
+// ends the readable history: it and everything after it are deleted, since
+// later records depend on it (Repaired says what was dropped).
 func Open(dir string, o Options) (*Store, error) {
 	if o.SegmentChunks <= 0 {
 		o.SegmentChunks = DefaultSegmentChunks
@@ -97,8 +103,22 @@ func Open(dir string, o Options) (*Store, error) {
 		}
 	}
 	sort.Strings(segDirs) // names are zero-padded slots
+	cut := false
 	for i, name := range segDirs {
-		seg, err := s.loadSegment(filepath.Join(dir, name), i == len(segDirs)-1)
+		path := filepath.Join(dir, name)
+		if cut {
+			if err := os.RemoveAll(path); err != nil {
+				s.Close()
+				return nil, err
+			}
+			continue
+		}
+		var expect uint64
+		have := len(s.segments) > 0
+		if have {
+			expect = s.segments[len(s.segments)-1].to() + 1
+		}
+		seg, damaged, err := s.loadSegment(path, i == len(segDirs)-1, expect, have)
 		if err != nil {
 			s.Close()
 			return nil, err
@@ -106,19 +126,47 @@ func Open(dir string, o Options) (*Store, error) {
 		if seg != nil {
 			s.segments = append(s.segments, seg)
 		}
+		if damaged {
+			cut = true
+			s.repaired = fmt.Sprintf("a damaged or missing chunk in %s: history after slot %d was deleted", name, expect-1)
+			if seg != nil {
+				s.repaired = fmt.Sprintf("a damaged or missing chunk in %s: history after slot %d was deleted", name, seg.to())
+			}
+		}
 	}
 	return s, nil
 }
 
+// Repaired describes history Open had to delete, or is empty.
+func (s *Store) Repaired() string { return s.repaired }
+
 func segmentDirName(from uint64) string    { return fmt.Sprintf("seg-%020d", from) }
 func chunkFileName(from, to uint64) string { return fmt.Sprintf("chunk-%020d-%020d.hst", from, to) }
 
-func (s *Store) loadSegment(dir string, last bool) (*segment, error) {
+func parseRange(name, prefix, suffix string) (from, to uint64, ok bool) {
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	from, err1 := strconv.ParseUint(parts[0], 10, 64)
+	to, err2 := strconv.ParseUint(parts[1], 10, 64)
+	return from, to, err1 == nil && err2 == nil && from <= to
+}
+
+// loadSegment opens one segment directory. Chunks must continue from expect
+// (when have) and each other without a gap; at the first one that does not,
+// or that cannot be opened, the rest of the segment is deleted and damaged is
+// true.
+func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (seg *segment, damaged bool, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	seg := &segment{dir: dir}
+	var found []*chunkMeta
+	var banks []string
 	hasIndex := false
 	for _, e := range entries {
 		name := e.Name()
@@ -127,54 +175,84 @@ func (s *Store) loadSegment(dir string, last bool) (*segment, error) {
 			_ = os.Remove(filepath.Join(dir, name))
 		case name == segmentIndexName:
 			hasIndex = true
-		case strings.HasPrefix(name, "chunk-") && strings.HasSuffix(name, ".hst"):
-			parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, "chunk-"), ".hst"), "-")
-			if len(parts) != 2 {
-				continue
+		case strings.HasSuffix(name, ".hbk"):
+			banks = append(banks, name)
+		default:
+			if from, to, ok := parseRange(name, "chunk-", ".hst"); ok {
+				found = append(found, &chunkMeta{from: from, to: to, path: filepath.Join(dir, name)})
 			}
-			from, err1 := strconv.ParseUint(parts[0], 10, 64)
-			to, err2 := strconv.ParseUint(parts[1], 10, 64)
-			if err1 != nil || err2 != nil {
-				continue
+		}
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].from < found[j].from })
+	seg = &segment{dir: dir}
+	for _, c := range found {
+		if have && c.from != expect {
+			damaged = true
+			break
+		}
+		r, err := openChunk(c.path)
+		if err != nil || r.from != c.from || r.to != c.to {
+			damaged = true
+			break
+		}
+		c.reader = r
+		seg.chunks = append(seg.chunks, c)
+		expect, have = c.to+1, true
+	}
+	if damaged {
+		_ = os.Remove(filepath.Join(dir, segmentIndexName))
+		hasIndex, last = false, true
+		for _, c := range found[len(seg.chunks):] {
+			if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
+				return nil, damaged, err
 			}
-			seg.chunks = append(seg.chunks, &chunkMeta{from: from, to: to, path: filepath.Join(dir, name)})
+		}
+	}
+	// Bank files belong to a chunk; any other (a fold interrupted between the
+	// two writes, or a dropped chunk) is removed.
+	kept := make(map[string]bool, len(seg.chunks))
+	for _, c := range seg.chunks {
+		kept[bankFileName(c.from, c.to)] = true
+	}
+	for _, b := range banks {
+		if !kept[b] {
+			_ = os.Remove(filepath.Join(dir, b))
 		}
 	}
 	if len(seg.chunks) == 0 {
-		_ = os.RemoveAll(dir)
-		return nil, nil
+		return nil, damaged, os.RemoveAll(dir)
 	}
-	sort.Slice(seg.chunks, func(i, j int) bool { return seg.chunks[i].from < seg.chunks[j].from })
-	for _, c := range seg.chunks {
-		r, err := openChunk(c.path)
-		if err != nil {
-			return nil, err
+	open := last && len(seg.chunks) < s.segmentChunks
+	if hasIndex && !open {
+		idx, err := openSegmentIndex(filepath.Join(dir, segmentIndexName))
+		if err == nil {
+			seg.index = idx
+			return seg, damaged, nil
 		}
-		c.reader = r
+		// A bad or old-format index is rebuilt from the chunks.
 	}
-	if !hasIndex || last && len(seg.chunks) < s.segmentChunks {
-		// An open segment, or one whose close was interrupted: rebuild the
-		// table from the chunks themselves.
-		seg.masks = make(map[[32]byte]uint64)
-		for i, c := range seg.chunks {
-			bit := uint64(1) << i
-			if err := c.reader.keys(func(k [32]byte) { seg.masks[k] |= bit }); err != nil {
-				return nil, err
-			}
+	// An open segment, or one whose index is missing or bad: rebuild the
+	// table from the chunks themselves.
+	if err := seg.rebuildMasks(); err != nil {
+		return nil, damaged, err
+	}
+	if !open {
+		if err := closeSegment(seg); err != nil {
+			return nil, damaged, err
 		}
-		if !last || len(seg.chunks) >= s.segmentChunks {
-			if err := closeSegment(seg); err != nil {
-				return nil, err
-			}
+	}
+	return seg, damaged, nil
+}
+
+func (seg *segment) rebuildMasks() error {
+	seg.masks = make(map[[32]byte]uint64)
+	for i, c := range seg.chunks {
+		bit := uint64(1) << i
+		if err := c.reader.keys(func(k [32]byte) { seg.masks[k] |= bit }); err != nil {
+			return err
 		}
-		return seg, nil
 	}
-	idx, err := openSegmentIndex(filepath.Join(dir, segmentIndexName))
-	if err != nil {
-		return nil, err
-	}
-	seg.index = idx
-	return seg, nil
+	return nil
 }
 
 // Close releases open files.
@@ -283,7 +361,10 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 	if n := len(s.segments); n > 0 {
 		last = s.segments[n-1]
 	}
-	parent := s.lastBankSlot()
+	if !s.lastBankKnown {
+		s.lastBank, s.lastBankKnown = s.lastBankSlot(), true
+	}
+	parent := s.lastBank
 	s.mu.RUnlock()
 	if last != nil && from != last.to()+1 {
 		return fmt.Errorf("history: append %d..%d does not follow %d", from, to, last.to())
@@ -329,6 +410,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 		if err := os.MkdirAll(segDir, 0o755); err != nil {
 			return err
 		}
+		if err := syncDir(s.dir); err != nil {
+			return err
+		}
 	} else {
 		segDir = last.dir
 	}
@@ -338,10 +422,7 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			return err
 		}
 	}
-	if err := writeChunk(path, from, to, records); err != nil {
-		return err
-	}
-	reader, err := openChunk(path)
+	reader, err := writeChunk(path, from, to, records)
 	if err != nil {
 		return err
 	}
@@ -349,6 +430,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if bank != nil && len(bank.Slots) > 0 {
+		s.lastBank = bank.Slots[len(bank.Slots)-1].Slot
+	}
 	if newSegment {
 		if last != nil && last.masks != nil {
 			if err := closeSegment(last); err != nil {
@@ -412,15 +496,39 @@ func (s *Store) AccountAt(key [32]byte, slot uint64) (*Version, uint64, error) {
 // blocks between them. errs[i] is nil, ErrUnchanged, ErrBeforeHistory,
 // ErrAfterHistory or a read error, with the same meaning as AccountAt's.
 func (s *Store) AccountsAt(keys [][32]byte, slot uint64) (versions []*Version, errs []error, through uint64) {
+	versions, errs, through, _ = s.AccountsAtLimit(keys, slot, NoLimit)
+	return versions, errs, through
+}
+
+// NoLimit disables AccountsAtLimit's data budget.
+const NoLimit = ^uint64(0)
+
+// ErrDataLimit: the versions read exceed the caller's data budget.
+var ErrDataLimit = errors.New("history: account data exceeds the read budget")
+
+// AccountsAtLimit is AccountsAt that stops with ErrDataLimit once the data of
+// the versions read, duplicates included, exceeds maxDataBytes. A single
+// version can overshoot the budget by at most its own size.
+func (s *Store) AccountsAtLimit(keys [][32]byte, slot uint64, maxDataBytes uint64) (versions []*Version, errs []error, through uint64, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if n := len(s.segments); n > 0 {
+		through = s.segments[n-1].to()
+	}
 	versions = make([]*Version, len(keys))
 	errs = make([]error, len(keys))
 	cache := blockCache{}
+	remaining := maxDataBytes
 	for i, k := range keys {
-		versions[i], through, errs[i] = s.accountAtLocked(k, slot, cache)
+		versions[i], _, errs[i] = s.accountAtLocked(k, slot, cache)
+		if v := versions[i]; v != nil && maxDataBytes != NoLimit {
+			if uint64(len(v.Data)) > remaining {
+				return nil, nil, through, ErrDataLimit
+			}
+			remaining -= uint64(len(v.Data))
+		}
 	}
-	return versions, errs, through
+	return versions, errs, through, nil
 }
 
 func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*Version, uint64, error) {
@@ -445,10 +553,16 @@ func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*V
 		if mask == 0 {
 			continue
 		}
+		// Only the first record is needed when the account first changed after
+		// the slot's segment (j > i), and only chunks starting at or before the
+		// slot otherwise: later chunks hold only later differences.
 		var recs []*Record
 		for m := mask; m != 0; m &= m - 1 {
 			c := bits.TrailingZeros64(m)
 			if c >= len(seg.chunks) {
+				break
+			}
+			if len(recs) > 0 && (j > i || seg.chunks[c].from > slot) {
 				break
 			}
 			r, err := seg.chunks[c].reader.lookupCached(key, cache)
@@ -486,12 +600,14 @@ func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*V
 }
 
 // The closed-segment index maps an 8-byte key prefix to the 64-bit mask of
-// chunks holding that key: magic, count u64, then sorted (prefix u64 BE, mask
-// u64) pairs. Prefixes can collide; masks of colliding keys are merged and a
-// reader checks the full key in the chunk.
+// chunks holding that key: magic, count u64, sorted (prefix u64 BE, mask u64)
+// pairs, then a crc32 of everything before it. Prefixes can collide; masks of
+// colliding keys are merged and a reader checks the full key in the chunk.
+// Open keeps every fenceStride-th prefix in memory, so a lookup is one read.
 const (
 	segmentIndexName  = "index.hsi"
-	segmentIndexMagic = "MHSEGIX1"
+	segmentIndexMagic = "MHSEGIX2"
+	fenceStride       = 512
 )
 
 func keyPrefix(k [32]byte) uint64 { return binary.BigEndian.Uint64(k[:8]) }
@@ -511,13 +627,14 @@ func closeSegment(seg *segment) error {
 		}
 		merged = append(merged, e)
 	}
-	buf := make([]byte, 0, 16+16*len(merged))
+	buf := make([]byte, 0, 16+16*len(merged)+4)
 	buf = append(buf, segmentIndexMagic...)
 	buf = binary.BigEndian.AppendUint64(buf, uint64(len(merged)))
 	for _, e := range merged {
 		buf = binary.BigEndian.AppendUint64(buf, e.prefix)
 		buf = binary.BigEndian.AppendUint64(buf, e.mask)
 	}
+	buf = binary.BigEndian.AppendUint32(buf, crc32.ChecksumIEEE(buf))
 	path := filepath.Join(seg.dir, segmentIndexName)
 	if err := writeFileSync(path, buf); err != nil {
 		return err
@@ -532,48 +649,58 @@ func closeSegment(seg *segment) error {
 }
 
 type segmentIndex struct {
-	f *os.File
-	n int64
+	path   string
+	n      uint64
+	fences []uint64 // prefix of entry i*fenceStride
 }
 
 func openSegmentIndex(path string) (*segmentIndex, error) {
-	f, err := os.Open(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	hdr := make([]byte, 16)
-	if _, err := f.ReadAt(hdr, 0); err != nil || string(hdr[:8]) != segmentIndexMagic {
-		f.Close()
+	if len(b) < 20 || string(b[:8]) != segmentIndexMagic {
 		return nil, fmt.Errorf("history: bad segment index %s", path)
 	}
-	n := int64(binary.BigEndian.Uint64(hdr[8:]))
-	if st, err := f.Stat(); err != nil || st.Size() != 16+16*n {
-		f.Close()
+	n := binary.BigEndian.Uint64(b[8:])
+	if n > uint64(len(b)-20)/16 || 16+16*n+4 != uint64(len(b)) {
 		return nil, fmt.Errorf("history: segment index %s has the wrong size", path)
 	}
-	return &segmentIndex{f: f, n: n}, nil
+	body := b[:len(b)-4]
+	if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(b[len(b)-4:]) {
+		return nil, fmt.Errorf("history: segment index %s checksum", path)
+	}
+	x := &segmentIndex{path: path, n: n}
+	for i := uint64(0); i < n; i += fenceStride {
+		x.fences = append(x.fences, binary.BigEndian.Uint64(b[16+16*i:]))
+	}
+	return x, nil
 }
 
-func (x *segmentIndex) close() { x.f.Close() }
+func (x *segmentIndex) close() {}
 
 func (x *segmentIndex) lookup(key [32]byte) (uint64, error) {
 	want := keyPrefix(key)
-	var e [16]byte
-	lo, hi := int64(0), x.n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if _, err := x.f.ReadAt(e[:], 16+16*mid); err != nil {
-			return 0, err
-		}
-		p := binary.BigEndian.Uint64(e[:8])
-		switch {
-		case p == want:
-			return binary.BigEndian.Uint64(e[8:]), nil
-		case p < want:
-			lo = mid + 1
-		default:
-			hi = mid
-		}
+	// The last fence at or below want starts the only stride that can hold it.
+	f := sort.Search(len(x.fences), func(i int) bool { return x.fences[i] > want }) - 1
+	if f < 0 {
+		return 0, nil
+	}
+	lo := uint64(f) * fenceStride
+	cnt := min(uint64(fenceStride), x.n-lo)
+	buf := make([]byte, 16*cnt)
+	fh, err := os.Open(x.path)
+	if err != nil {
+		return 0, err
+	}
+	_, err = fh.ReadAt(buf, int64(16+16*lo))
+	fh.Close()
+	if err != nil {
+		return 0, err
+	}
+	i := sort.Search(int(cnt), func(i int) bool { return binary.BigEndian.Uint64(buf[16*i:]) >= want })
+	if i < int(cnt) && binary.BigEndian.Uint64(buf[16*i:]) == want {
+		return binary.BigEndian.Uint64(buf[16*i+8:]), nil
 	}
 	return 0, nil
 }
@@ -599,6 +726,16 @@ func (s *Store) TruncateFrom(slot uint64) error {
 		if keep == len(seg.chunks) {
 			return nil
 		}
+		s.lastBankKnown = false
+		// The index goes first: a crash part way leaves an open segment whose
+		// table is rebuilt from the chunks that remain.
+		if seg.index != nil {
+			seg.index.close()
+			seg.index = nil
+			if err := os.Remove(filepath.Join(seg.dir, segmentIndexName)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
 		for _, c := range seg.chunks[keep:] {
 			if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
 				return err
@@ -608,9 +745,6 @@ func (s *Store) TruncateFrom(slot uint64) error {
 			}
 		}
 		if keep == 0 {
-			if seg.index != nil {
-				seg.index.close()
-			}
 			if err := os.RemoveAll(seg.dir); err != nil {
 				return err
 			}
@@ -618,22 +752,8 @@ func (s *Store) TruncateFrom(slot uint64) error {
 			continue
 		}
 		// The segment is open again with fewer chunks: rebuild its table.
-		if seg.index != nil {
-			seg.index.close()
-			seg.index = nil
-			if err := os.Remove(filepath.Join(seg.dir, segmentIndexName)); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
 		seg.chunks = seg.chunks[:keep]
-		seg.masks = make(map[[32]byte]uint64)
-		for i, c := range seg.chunks {
-			bit := uint64(1) << i
-			if err := c.reader.keys(func(k [32]byte) { seg.masks[k] |= bit }); err != nil {
-				return err
-			}
-		}
-		return nil
+		return seg.rebuildMasks()
 	}
 	return nil
 }
@@ -651,5 +771,6 @@ func (s *Store) Reset() error {
 		}
 	}
 	s.segments = nil
+	s.lastBankKnown = false
 	return nil
 }

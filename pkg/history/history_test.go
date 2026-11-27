@@ -2,8 +2,11 @@ package history
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -308,4 +311,165 @@ func TestAccountsAtMatchesAccountAt(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestAppendXorChangedMatchesSame(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for i := 0; i < 3000; i++ {
+		prev := randomVersion(rng)
+		if rng.Intn(6) == 0 {
+			prev = &Version{Absent: true}
+		}
+		cur := prev.Clone()
+		if rng.Intn(2) == 0 {
+			cur = mutate(rng, prev)
+		}
+		d, changed := AppendXorChanged([]byte{9}, prev, cur)
+		require.Equal(t, !Same(prev, cur), changed, "case %d", i)
+		if !changed {
+			require.Equal(t, []byte{9}, d)
+			continue
+		}
+		f := prev.Clone()
+		require.NoError(t, ApplyXor(f, d[1:], true))
+		require.True(t, Same(f, cur))
+	}
+	// AppendXor always yields a valid encoding, a no-op when nothing changed.
+	v := &Version{Lamports: 3, Data: []byte{1, 2, 3}}
+	f := v.Clone()
+	require.NoError(t, ApplyXor(f, AppendXor(nil, v, v), true))
+	require.True(t, Same(f, v))
+}
+
+func TestApplyXorRejectsMalformed(t *testing.T) {
+	// Lengths and offsets that would wrap an int.
+	bad := [][]byte{
+		binary.AppendUvarint(binary.AppendUvarint([]byte{xLength}, ^uint64(4)), 0),
+		append(binary.AppendUvarint(binary.AppendUvarint([]byte{0, 1}, 1<<63), 1), 0xff),
+		append(binary.AppendUvarint(binary.AppendUvarint([]byte{0, 1}, 1<<62), 1<<62), 0xff),
+	}
+	bad[0] = append(bad[0], 0, 1, 2, 3, 4, 5)
+	for i, d := range bad {
+		for _, fwd := range []bool{true, false} {
+			v := &Version{Lamports: 1, Data: make([]byte, 8)}
+			require.Error(t, ApplyXor(v, d, fwd), "case %d", i)
+		}
+	}
+	rng := rand.New(rand.NewSource(6))
+	for i := 0; i < 20000; i++ {
+		d := make([]byte, rng.Intn(40))
+		rng.Read(d)
+		v := &Version{Lamports: 1, Data: make([]byte, rng.Intn(20))}
+		_ = ApplyXor(v, d, rng.Intn(2) == 0) // must not panic
+		_, _, _ = ReadWhole(d)
+		_, _, _ = readRecord(d, 0)
+	}
+}
+
+func appendRandom(t *testing.T, s *Store, rng *rand.Rand, keys [][32]byte, from, to uint64, cur map[[32]byte]*Version) {
+	t.Helper()
+	prev := func(ks [][32]byte) ([]*Version, error) {
+		out := make([]*Version, len(ks))
+		for i, k := range ks {
+			if v, ok := cur[k]; ok {
+				out[i] = v
+			} else {
+				out[i] = &Version{Absent: true}
+			}
+		}
+		return out, nil
+	}
+	w := SlotWrites{Slot: from}
+	next := map[[32]byte]*Version{}
+	for _, k := range keys {
+		v := randomVersion(rng)
+		w.Keys = append(w.Keys, k)
+		w.Versions = append(w.Versions, v)
+		next[k] = v
+	}
+	require.NoError(t, s.Append(from, to, []SlotWrites{w}, prev))
+	for k, v := range next {
+		cur[k] = v
+	}
+}
+
+func TestOpenDropsHistoryAfterMissingChunk(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentChunks: 4})
+	require.NoError(t, err)
+	keys := make([][32]byte, 30)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	cur := map[[32]byte]*Version{}
+	for f := uint64(0); f < 3; f++ {
+		appendRandom(t, s, rng, keys, 100+10*f, 109+10*f, cur)
+	}
+	require.NoError(t, s.Close())
+	segDir := filepath.Join(dir, segmentDirName(100))
+	require.NoError(t, os.Remove(filepath.Join(segDir, chunkFileName(110, 119))))
+
+	s, err = Open(dir, Options{SegmentChunks: 4})
+	require.NoError(t, err)
+	require.NotEmpty(t, s.Repaired())
+	first, through, ok := s.Range()
+	require.True(t, ok)
+	require.EqualValues(t, 100, first)
+	require.EqualValues(t, 109, through, "history ends before the missing chunk")
+	_, err = os.Stat(filepath.Join(segDir, chunkFileName(120, 129)))
+	require.True(t, os.IsNotExist(err), "the chunk after the gap is deleted")
+	// The store continues from where it now ends.
+	appendRandom(t, s, rng, keys, 110, 119, cur)
+	require.NoError(t, s.Close())
+}
+
+func TestClosedIndexWithManyKeys(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentChunks: 1})
+	require.NoError(t, err)
+	keys := make([][32]byte, 3*fenceStride+17)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	cur := map[[32]byte]*Version{}
+	appendRandom(t, s, rng, keys, 10, 10, cur)
+	first := map[[32]byte]*Version{}
+	for k, v := range cur {
+		first[k] = v
+	}
+	appendRandom(t, s, rng, keys[:5], 11, 11, cur) // closes the first segment
+	require.NoError(t, s.Close())
+	s, err = Open(dir, Options{SegmentChunks: 1})
+	require.NoError(t, err)
+	require.NotNil(t, s.segments[0].index)
+	require.Len(t, s.segments[0].index.fences, 4)
+	for _, k := range keys {
+		v, _, err := s.AccountAt(k, 10)
+		require.NoError(t, err)
+		require.True(t, Same(v, first[k]))
+	}
+	var missing [32]byte
+	_, _, err = s.AccountAt(missing, 10)
+	require.ErrorIs(t, err, ErrUnchanged)
+	require.NoError(t, s.Close())
+}
+
+func TestAccountsAtLimit(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	s, err := Open(t.TempDir(), Options{})
+	require.NoError(t, err)
+	keys := make([][32]byte, 20)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	cur := map[[32]byte]*Version{}
+	appendRandom(t, s, rng, keys, 5, 6, cur)
+	appendRandom(t, s, rng, keys, 7, 8, cur)
+	_, _, through, err := s.AccountsAtLimit(keys, 5, 10)
+	require.ErrorIs(t, err, ErrDataLimit)
+	require.EqualValues(t, 8, through)
+	_, _, _, err = s.AccountsAtLimit(keys, 5, NoLimit)
+	require.NoError(t, err)
 }

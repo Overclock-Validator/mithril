@@ -503,6 +503,9 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 	}
 	suffix := w.order[cut:]
 	if len(suffix) == 0 {
+		if slot > 0 && slot <= w.compactedThrough {
+			w.compactedThrough = slot - 1 // nothing held there; compaction resumes from slot
+		}
 		return
 	}
 	w.revision++
@@ -615,10 +618,9 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		covered = slot
 		layer := w.bySlot[slot]
 		for k, cur := range layer.writes {
-			if cur.IsDummy {
-				continue
-			}
-			if p, ok := lookupLast(k); ok {
+			// A dummy placeholder still ends the chain: no difference may span
+			// it, since rebuilding walks to the next layer holding the key.
+			if p, ok := lookupLast(k); ok && !cur.IsDummy {
 				if prevLayer := w.bySlot[p]; prevLayer != nil {
 					// Small accounts save too little to be worth a difference.
 					if full, ok := prevLayer.writes[k]; ok && !full.IsDummy && len(full.Data) >= compactMinData {
