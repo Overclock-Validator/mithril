@@ -20,18 +20,20 @@ import (
 // privately from the fold boundary before it, and compares every bank hash
 // with the one the fold recorded. The directory holds this node's spooled
 // shred files (s<slot>.shreds) for those slots. Nothing is published.
-func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState) {
+func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState) (wait func()) {
 	spec := os.Getenv("MITHRIL_BENCH_CHECKPOINT_REPLAY")
 	if spec == "" || db == nil || persisted == nil {
-		return
+		return func() {}
 	}
 	workerText, shredDir, ok := strings.Cut(spec, ":")
 	workers, err := strconv.Atoi(workerText)
 	if !ok || err != nil || workers < 1 || shredDir == "" {
 		mlog.Log.Infof("bench checkpoint replay: want <workers>:<shred directory>, got %q", spec)
-		return
+		return func() {}
 	}
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		var folds, blocks, mismatches, failures int
 		var loadTime, replayTime time.Duration
 		done := make(map[uint64]bool)
@@ -82,8 +84,12 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 			mismatches += wrong
 			loadTime += load
 			replayTime += elapsed
+			mlog.Log.Infof("bench checkpoint replay: fold after %d: %d blocks, %d mismatches, load %s, replay %s", next, replayed, wrong, load.Round(time.Microsecond), elapsed.Round(time.Millisecond))
 		}
 	}()
+	// The caller cancels ctx and then waits, so the block in flight finishes
+	// before the store closes.
+	return func() { <-finished }
 }
 
 // benchReplayFold replays the fold after boundary. It returns the blocks

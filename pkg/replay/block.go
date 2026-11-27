@@ -2833,7 +2833,12 @@ func ReplayBlocks(
 	benchLoadCtx, stopBenchLoad := context.WithCancel(context.Background())
 	defer stopBenchLoad()
 	startBenchCheckpointLoad(benchLoadCtx, acctsDb)
-	startBenchCheckpointReplay(benchLoadCtx, acctsDb, mithrilState)
+	waitBenchReplay := startBenchCheckpointReplay(benchLoadCtx, acctsDb, mithrilState)
+	defer func() {
+		// Deferred calls run last first: stop, then wait.
+		stopBenchLoad()
+		waitBenchReplay()
+	}()
 	var prefetcher *accountPrefetcher
 	if accountPrefetchEnabled {
 		var src blockAccountSource = acctsDb
