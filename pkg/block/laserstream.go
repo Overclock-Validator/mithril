@@ -7,16 +7,16 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
+	"github.com/Overclock-Validator/mithril/pkg/yellowstone/geyserpb"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
 )
 
 // FromLaserStream converts Laserstream's legacy/V0-only protobuf block into
 // Mithril's native representation. Laserstream is an optional ingestion path;
 // malformed or schema-incompatible input must fail closed rather than reach
 // replay's panic-oriented invariant checks.
-func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc *rpcclient.RpcClient) (*Block, error) {
+func FromLaserStream(lsBlock *geyserpb.SubscribeUpdateBlock, rpcc *rpcclient.RpcClient) (*Block, error) {
 	if lsBlock == nil {
 		return nil, fmt.Errorf("Laserstream returned a nil block")
 	}
@@ -100,7 +100,7 @@ func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc *rpcclient.RpcCli
 	return block, nil
 }
 
-func lsBlockRewardToBlockReward(reward *proto.Reward) (rpc.BlockReward, error) {
+func lsBlockRewardToBlockReward(reward *geyserpb.Reward) (rpc.BlockReward, error) {
 	if reward == nil {
 		return rpc.BlockReward{}, fmt.Errorf("nil reward")
 	}
@@ -116,7 +116,7 @@ func lsBlockRewardToBlockReward(reward *proto.Reward) (rpc.BlockReward, error) {
 	return r, nil
 }
 
-func lsTxMetaToTxMeta(lsMeta *proto.TransactionStatusMeta) (*rpc.TransactionMeta, error) {
+func lsTxMetaToTxMeta(lsMeta *geyserpb.TransactionStatusMeta) (*rpc.TransactionMeta, error) {
 	if lsMeta == nil {
 		return nil, fmt.Errorf("nil transaction metadata")
 	}
@@ -145,7 +145,7 @@ func lsTxMetaToTxMeta(lsMeta *proto.TransactionStatusMeta) (*rpc.TransactionMeta
 	return meta, nil
 }
 
-func lsTransactionToTransaction(lsTx *proto.Transaction) (*solana.Transaction, error) {
+func lsTransactionToTransaction(lsTx *geyserpb.Transaction) (*solana.Transaction, error) {
 	if lsTx == nil {
 		return nil, fmt.Errorf("nil transaction")
 	}
@@ -224,7 +224,7 @@ func lsTransactionToTransaction(lsTx *proto.Transaction) (*solana.Transaction, e
 	return tx, nil
 }
 
-func lsInstrToInstr(instr *proto.CompiledInstruction) (solana.CompiledInstruction, error) {
+func lsInstrToInstr(instr *geyserpb.CompiledInstruction) (solana.CompiledInstruction, error) {
 	if instr == nil {
 		return solana.CompiledInstruction{}, fmt.Errorf("nil instruction")
 	}
@@ -242,7 +242,7 @@ func lsInstrToInstr(instr *proto.CompiledInstruction) (solana.CompiledInstructio
 	return compiledInstr, nil
 }
 
-func lsAddrTableLookupToAddrTableLookup(atl *proto.MessageAddressTableLookup) (solana.MessageAddressTableLookup, error) {
+func lsAddrTableLookupToAddrTableLookup(atl *geyserpb.MessageAddressTableLookup) (solana.MessageAddressTableLookup, error) {
 	if atl == nil {
 		return solana.MessageAddressTableLookup{}, fmt.Errorf("nil address table lookup")
 	}
