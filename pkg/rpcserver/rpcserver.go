@@ -69,6 +69,20 @@ type rpcMethods interface {
 	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
 	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
 	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
+	GetEpochSchedule(context.Context, jsonrpc.RawParams) (GetEpochScheduleResp, error)
+	GetTransactionCount(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetSlotLeader(context.Context, jsonrpc.RawParams) (string, error)
+	GetSlotLeaders(context.Context, jsonrpc.RawParams) ([]string, error)
+	GetBlockTime(context.Context, jsonrpc.RawParams) (*int64, error)
+	GetBlocksWithLimit(context.Context, jsonrpc.RawParams) ([]uint64, error)
+	GetStakeMinimumDelegation(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
+	GetInflationGovernor(context.Context, jsonrpc.RawParams) (GetInflationGovernorResp, error)
+	GetInflationRate(context.Context, jsonrpc.RawParams) (GetInflationRateResp, error)
+	GetBlockCommitment(context.Context, jsonrpc.RawParams) (GetBlockCommitmentResp, error)
+	GetMaxShredInsertSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetMaxRetransmitSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetHighestSnapshotSlot(context.Context, jsonrpc.RawParams) (struct{}, error)
+	GetRecentPerformanceSamples(context.Context, jsonrpc.RawParams) ([]PerfSample, error)
 	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
@@ -87,6 +101,10 @@ type RpcServer struct {
 	enumerator *rpcindex.Enumerator
 	// priorityFees records recent blocks' prioritization fees.
 	priorityFees prioritizationFees
+	// inflation is replay's inflation configuration; perfSamples the
+	// per-minute rooted-bank samples.
+	inflation   atomic.Pointer[inflationState]
+	perfSamples perfSampler
 
 	isReady              bool
 	rpcService           *jsonrpc.RPCServer
@@ -151,6 +169,20 @@ type rootedBankState struct {
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
+	"getEpochSchedule":                  {},
+	"getTransactionCount":               {},
+	"getSlotLeader":                     {},
+	"getSlotLeaders":                    {},
+	"getBlockTime":                      {},
+	"getBlocksWithLimit":                {},
+	"getStakeMinimumDelegation":         {},
+	"getInflationGovernor":              {},
+	"getInflationRate":                  {},
+	"getBlockCommitment":                {},
+	"getMaxShredInsertSlot":             {},
+	"getMaxRetransmitSlot":              {},
+	"getHighestSnapshotSlot":            {},
+	"getRecentPerformanceSamples":       {},
 	"getAccountInfo":                    {},
 	"getBalance":                        {},
 	"getBankHash":                       {},
@@ -359,6 +391,7 @@ func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
 }
 
 func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	rpcServer.perfSamples.observe(time.Now(), slot, transactionCount)
 	rpcServer.rootedBank.Store(&rootedBankState{
 		Slot:             slot,
 		BlockHeight:      blockHeight,

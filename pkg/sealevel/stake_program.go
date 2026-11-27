@@ -1123,6 +1123,9 @@ func StakeProgramInitialize(stakeAcct *BorrowedAccount, authorized Authorized, l
 	}
 }
 
+// MinimumDelegation is the stake program's minimum delegation under f.
+func MinimumDelegation(f features.Features) uint64 { return determineMinimumDelegation(f) }
+
 func determineMinimumDelegation(f features.Features) uint64 {
 	if f.IsActive(features.StakeRaiseMinimumDelegationTo1Sol) {
 		minimumDelegationSol := 1

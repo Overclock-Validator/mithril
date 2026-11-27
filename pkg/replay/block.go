@@ -57,6 +57,11 @@ type SlotCtxSetter interface {
 	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
 
+// inflationSetter receives the inflation settings replay uses.
+type inflationSetter interface {
+	SetInflation(inflation rewards.Inflation, slotsPerYear float64)
+}
+
 type rootedExecutionBankSetter interface {
 	SetRootedExecutionBank(*ChainTipSnapshot)
 }
@@ -3969,6 +3974,9 @@ func ReplayBlocks(
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
+			if setter, ok := rpcServer.(inflationSetter); ok {
+				setter.SetInflation(replayCtx.Inflation, replayCtx.SlotsPerYear)
+			}
 			if unrootedTailState == nil {
 				rpcServer.SetRootedBankState(block.Slot, global.BlockHeight(), global.TransactionCount())
 				if publisher, ok := rpcServer.(rootedExecutionBankSetter); ok {
