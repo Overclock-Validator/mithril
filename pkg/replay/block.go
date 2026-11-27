@@ -2824,6 +2824,9 @@ func ReplayBlocks(
 	if len(opts.RepairPeerSeeds) > 0 {
 		mlog.Log.Infof("repair: seeding %d peers remembered from the previous run", len(opts.RepairPeerSeeds))
 	}
+	benchLoadCtx, stopBenchLoad := context.WithCancel(context.Background())
+	defer stopBenchLoad()
+	startBenchCheckpointLoad(benchLoadCtx, acctsDb)
 	var prefetcher *accountPrefetcher
 	if accountPrefetchEnabled {
 		var src blockAccountSource = acctsDb
