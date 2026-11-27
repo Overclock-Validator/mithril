@@ -111,7 +111,7 @@ func TestCompactedFoldsRecordExactHistory(t *testing.T) {
 				if rng.Intn(2) != 0 {
 					continue
 				}
-				a := &accounts.Account{Key: k, Lamports: uint64(1 + rng.Intn(5)), Data: make([]byte, 40)}
+				a := &accounts.Account{Key: k, Lamports: uint64(rng.Intn(5)), Data: make([]byte, 40)}
 				if prev := live[k]; prev != nil {
 					copy(a.Data, prev.Data)
 				}

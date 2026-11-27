@@ -212,25 +212,20 @@ type SlotWrites struct {
 	Versions []*Version
 }
 
+// KeyHistory is one account's changes in a fold: its version before the fold
+// and one difference per slot that changed it (AppendXor of consecutive
+// versions, starting from Prev), ascending by slot.
+type KeyHistory struct {
+	Key   [32]byte
+	Prev  *Version
+	Diffs []Diff
+}
+
 // Append records one fold covering slots [from, to]. slots must be ascending
 // within the range. prev returns each key's version before from (Absent when
 // the account did not exist); it is called once with every key the fold wrote.
 // Append must follow the previous call's range without a gap.
 func (s *Store) Append(from, to uint64, slots []SlotWrites, prev func(keys [][32]byte) ([]*Version, error)) error {
-	if from > to {
-		return fmt.Errorf("history: empty range %d..%d", from, to)
-	}
-	s.mu.RLock()
-	var last *segment
-	if n := len(s.segments); n > 0 {
-		last = s.segments[n-1]
-	}
-	s.mu.RUnlock()
-	if last != nil && from != last.to()+1 {
-		return fmt.Errorf("history: append %d..%d does not follow %d", from, to, last.to())
-	}
-
-	// Per key, the versions in slot order.
 	type change struct {
 		slot uint64
 		v    *Version
@@ -248,7 +243,6 @@ func (s *Store) Append(from, to uint64, slots []SlotWrites, prev func(keys [][32
 			byKey[k] = append(byKey[k], change{sw.Slot, sw.Versions[i]})
 		}
 	}
-	sort.Slice(order, func(i, j int) bool { return lessKey(order[i], order[j]) })
 	before, err := prev(order)
 	if err != nil {
 		return err
@@ -256,6 +250,43 @@ func (s *Store) Append(from, to uint64, slots []SlotWrites, prev func(keys [][32
 	if len(before) != len(order) {
 		return fmt.Errorf("history: prev returned %d versions for %d keys", len(before), len(order))
 	}
+	keys := make([]KeyHistory, 0, len(order))
+	for i, k := range order {
+		start := before[i]
+		if start == nil {
+			start = &Version{Absent: true}
+		}
+		cur := start
+		kh := KeyHistory{Key: k, Prev: start}
+		for _, c := range byKey[k] {
+			if Same(cur, c.v) {
+				continue
+			}
+			kh.Diffs = append(kh.Diffs, Diff{Slot: c.slot, Bytes: AppendXor(nil, cur, c.v)})
+			cur = c.v
+		}
+		keys = append(keys, kh)
+	}
+	return s.AppendKeys(from, to, keys)
+}
+
+// AppendKeys records one fold covering slots [from, to] from per-key changes
+// the caller has already turned into differences. Keys without differences
+// are skipped. It must follow the previous call's range without a gap.
+func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory) error {
+	if from > to {
+		return fmt.Errorf("history: empty range %d..%d", from, to)
+	}
+	s.mu.RLock()
+	var last *segment
+	if n := len(s.segments); n > 0 {
+		last = s.segments[n-1]
+	}
+	s.mu.RUnlock()
+	if last != nil && from != last.to()+1 {
+		return fmt.Errorf("history: append %d..%d does not follow %d", from, to, last.to())
+	}
+	sort.Slice(keys, func(i, j int) bool { return lessKey(keys[i].Key, keys[j].Key) })
 
 	// A new segment starts when the open one is full.
 	newSegment := last == nil || last.masks == nil || len(last.chunks) >= s.segmentChunks
@@ -263,27 +294,19 @@ func (s *Store) Append(from, to uint64, slots []SlotWrites, prev func(keys [][32
 	if !newSegment {
 		seen = last.masks
 	}
-	records := make([]*Record, 0, len(order))
-	for i, k := range order {
-		cur := before[i]
-		if cur == nil {
-			cur = &Version{Absent: true}
-		}
-		start := cur
-		var diffs []Diff
-		for _, c := range byKey[k] {
-			if Same(cur, c.v) {
-				continue
-			}
-			diffs = append(diffs, Diff{Slot: c.slot, Bytes: AppendXor(nil, cur, c.v)})
-			cur = c.v
-		}
-		if len(diffs) == 0 {
+	records := make([]*Record, 0, len(keys))
+	for _, kh := range keys {
+		if len(kh.Diffs) == 0 {
 			continue
 		}
-		r := &Record{Key: k, Diffs: diffs}
-		if seen[k] == 0 && !start.Absent {
-			r.Full = start
+		for _, d := range kh.Diffs {
+			if d.Slot < from || d.Slot > to {
+				return fmt.Errorf("history: difference at slot %d outside %d..%d", d.Slot, from, to)
+			}
+		}
+		r := &Record{Key: kh.Key, Diffs: kh.Diffs}
+		if seen[kh.Key] == 0 && kh.Prev != nil && !kh.Prev.Absent {
+			r.Full = kh.Prev
 		}
 		records = append(records, r)
 	}

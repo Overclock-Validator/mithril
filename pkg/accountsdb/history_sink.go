@@ -2,6 +2,7 @@ package accountsdb
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,53 +99,21 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 			return
 		}
 	}
-	slots := make([]history.SlotWrites, 0, len(deltas))
-	index := make(map[uint64]int, len(deltas))
-	accounts.ResolveVersions(deltas, func(slot uint64, a *accounts.Account) {
-		if a == nil || a.IsDummy {
-			return
-		}
-		i, ok := index[slot]
-		if !ok {
-			i = len(slots)
-			index[slot] = i
-			slots = append(slots, history.SlotWrites{Slot: slot})
-		}
-		slots[i].Keys = append(slots[i].Keys, [32]byte(a.Key))
-		slots[i].Versions = append(slots[i].Versions, HistoryVersion(a))
-	})
-	var prevNanos time.Duration
-	prev := func(keys [][32]byte) ([]*history.Version, error) {
-		t := time.Now()
-		defer func() { prevNanos = time.Since(t) }()
-		pks := make([]solana.PublicKey, len(keys))
-		for i, k := range keys {
-			pks[i] = solana.PublicKey(k)
-		}
-		accts, err := db.GetAccountsBatch(context.Background(), from-1, pks)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]*history.Version, len(keys))
-		for i := range keys {
-			var a *accounts.Account
-			if i < len(accts) {
-				a = accts[i]
-			}
-			out[i] = HistoryVersion(a)
-		}
-		return out, nil
-	}
-	if err := s.Append(from, throughSlot, slots, prev); err != nil {
+	keys, err := db.historyKeys(deltas, from)
+	if err != nil {
 		db.disableHistory(err)
 		return
 	}
+	if err := s.AppendKeys(from, throughSlot, keys.keys); err != nil {
+		db.disableHistory(err)
+		return
+	}
+	prevNanos := keys.prevNanos
+	accountsWritten := keys.versions
 	st := &db.history.stats
 	st.Chunks++
 	st.Slots += throughSlot - from + 1
-	for _, sw := range slots {
-		st.Accounts += uint64(len(sw.Keys))
-	}
+	st.Accounts += uint64(accountsWritten)
 	st.AppendNanos += uint64(time.Since(start))
 	st.PrevNanos += uint64(prevNanos)
 	st.LastThrough = throughSlot
@@ -153,4 +122,119 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 func (db *AccountsDb) disableHistory(err error) {
 	db.history.failed.Store(true)
 	mlog.Log.Errorf("history: recording stopped: %v", err)
+}
+
+type historyBatch struct {
+	keys      []history.KeyHistory
+	versions  int
+	prevNanos time.Duration
+}
+
+// historyKeys turns a fold batch into per-key differences one key at a time,
+// so a batch is never materialized whole. Compacted versions (differences
+// already) are rebuilt by walking each key newest to oldest; where both sides
+// of a change exist, the working set's difference is exactly the one history
+// stores and is reused.
+func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (historyBatch, error) {
+	type entry struct {
+		slot uint64
+		full *accounts.Account
+		diff []byte
+	}
+	byKey := make(map[[32]byte][]entry)
+	var order [][32]byte
+	add := func(k [32]byte, e entry) {
+		if _, ok := byKey[k]; !ok {
+			order = append(order, k)
+		}
+		byKey[k] = append(byKey[k], e)
+	}
+	var out historyBatch
+	for _, sd := range deltas {
+		for _, a := range sd.Delta {
+			if a == nil || a.IsDummy {
+				continue
+			}
+			add([32]byte(a.Key), entry{slot: sd.Slot, full: a})
+			out.versions++
+		}
+		for _, c := range sd.Compacted {
+			add(c.Key, entry{slot: sd.Slot, diff: c.Diff})
+			out.versions++
+		}
+	}
+	// Versions before the fold, read in bounded batches.
+	t := time.Now()
+	prev := make([]*history.Version, len(order))
+	const readBatch = 8192
+	for lo := 0; lo < len(order); lo += readBatch {
+		hi := min(lo+readBatch, len(order))
+		pks := make([]solana.PublicKey, hi-lo)
+		for i, k := range order[lo:hi] {
+			pks[i] = solana.PublicKey(k)
+		}
+		accts, err := db.GetAccountsBatch(context.Background(), from-1, pks)
+		if err != nil {
+			return out, err
+		}
+		for i := range pks {
+			var a *accounts.Account
+			if i < len(accts) {
+				a = accts[i]
+			}
+			prev[lo+i] = HistoryVersion(a)
+		}
+	}
+	out.prevNanos = time.Since(t)
+
+	raw := func(a *accounts.Account) *history.Version {
+		return &history.Version{Lamports: a.Lamports, Owner: a.Owner, Executable: a.Executable, RentEpoch: a.RentEpoch, Data: a.Data}
+	}
+	semantic := func(v *history.Version) *history.Version {
+		if v.Lamports == 0 {
+			return &history.Version{Absent: true}
+		}
+		return v
+	}
+	out.keys = make([]history.KeyHistory, 0, len(order))
+	for ki, k := range order {
+		es := byKey[k]
+		n := len(es)
+		if es[n-1].full == nil {
+			return out, fmt.Errorf("history: newest version of %x in the batch is not full", k[:4])
+		}
+		// Walk newest to oldest. cur is the raw version at es[i].
+		cur := raw(es[n-1].full)
+		var diffs []history.Diff // newest first
+		for i := n - 1; i >= 1; i-- {
+			var older *history.Version
+			reuse := false
+			if es[i-1].full != nil {
+				older = raw(es[i-1].full)
+			} else {
+				older = cur.Clone()
+				if err := history.ApplyXor(older, es[i-1].diff, false); err != nil {
+					return out, fmt.Errorf("history: rebuild %x at slot %d: %w", k[:4], es[i-1].slot, err)
+				}
+				reuse = older.Lamports != 0 && cur.Lamports != 0
+			}
+			hOld, hCur := semantic(older), semantic(cur)
+			if !history.Same(hOld, hCur) {
+				d := es[i-1].diff
+				if !reuse {
+					d = history.AppendXor(nil, hOld, hCur)
+				}
+				diffs = append(diffs, history.Diff{Slot: es[i].slot, Bytes: d})
+			}
+			cur = older
+		}
+		if first := semantic(cur); !history.Same(prev[ki], first) {
+			diffs = append(diffs, history.Diff{Slot: es[0].slot, Bytes: history.AppendXor(nil, prev[ki], first)})
+		}
+		for l, r := 0, len(diffs)-1; l < r; l, r = l+1, r-1 {
+			diffs[l], diffs[r] = diffs[r], diffs[l]
+		}
+		out.keys = append(out.keys, history.KeyHistory{Key: k, Prev: prev[ki], Diffs: diffs})
+	}
+	return out, nil
 }
