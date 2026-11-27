@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -423,7 +423,7 @@ func TestStorePruneProgressBoundsAndCorruption(t *testing.T) {
 func TestStoreForeignDirectoryRejected(t *testing.T) {
 	fs := vfs.NewMem()
 	require.NoError(t, fs.MkdirAll("foreign", 0o700))
-	file, err := fs.Create("foreign/important")
+	file, err := fs.Create("foreign/important", vfs.WriteCategoryUnspecified)
 	require.NoError(t, err)
 	_, err = file.Write([]byte("not a history database"))
 	require.NoError(t, err)
@@ -511,8 +511,8 @@ type blockedSyncFile struct {
 	beforeSync func()
 }
 
-func (fs blockedSyncFS) Create(name string) (vfs.File, error) {
-	file, err := fs.FS.Create(name)
+func (fs blockedSyncFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	file, err := fs.FS.Create(name, category)
 	if err == nil && strings.HasSuffix(name, ".log") {
 		return blockedSyncFile{file, fs.beforeSync}, nil
 	}

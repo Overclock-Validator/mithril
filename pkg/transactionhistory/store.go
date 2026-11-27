@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 var (
@@ -101,7 +101,7 @@ func openLocked(dir string, genesis [32]byte, fs vfs.FS, lock *pebble.Lock) (*pe
 	namespace = append(namespace, genesis[:]...)
 	cache := pebble.NewCache(8 << 20)
 	defer cache.Unref()
-	opts := &pebble.Options{FS: fs, Lock: lock, Cache: cache, MemTableSize: 4 << 20, MemTableStopWritesThreshold: 2, MaxConcurrentCompactions: func() int { return 1 }, DisableWAL: false}
+	opts := &pebble.Options{FS: fs, Lock: lock, Cache: cache, MemTableSize: 4 << 20, MemTableStopWritesThreshold: 2, CompactionConcurrencyRange: func() (int, int) { return 1, 1 }, DisableWAL: false}
 	if !empty {
 		// A read-only probe rejects foreign or uninitialized nonempty stores
 		// without adding our namespace to them.
@@ -288,6 +288,16 @@ func (r *ReadSnapshot) BlockHeader(id BlockID) (BlockHeader, error) {
 		ParentBankhash: c.block.ParentBankhash, CaptureVersion: c.block.CaptureVersion,
 		TransactionCount: c.count,
 	}, nil
+}
+
+// HasBlock reports whether this view holds a completed record of the block. A
+// record of another block at the same slot does not count.
+func (r *ReadSnapshot) HasBlock(id BlockID) (bool, error) {
+	_, err := r.BlockHeader(id)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Block returns owned records only after validating the complete ordered block.

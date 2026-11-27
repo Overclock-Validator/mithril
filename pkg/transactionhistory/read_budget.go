@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // ReadBudget is a request-owned sequential work allowance, not an engine-memory,
