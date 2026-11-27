@@ -108,19 +108,42 @@ func TestWorkingSetCompactionPreservesVersions(t *testing.T) {
 	require.Positive(t, w.CompactedThrough())
 	require.Less(t, w.RetainedBytes(), ref.RetainedBytes(), "compaction must save memory")
 
-	// The fold sees every per-slot version exactly.
-	got := w.PromotionPrefix(slot)
-	want := ref.PromotionPrefix(slot)
+	// The fold sees every per-slot version exactly, and each key's newest
+	// batch version in full.
+	resolved := func(batch []SlotDelta) map[uint64][]*Account {
+		out := map[uint64][]*Account{}
+		ResolveVersions(batch, func(s uint64, a *Account) { out[s] = append(out[s], a) })
+		return out
+	}
+	gotBatch := w.PromotionPrefix(slot)
+	want := resolved(ref.PromotionPrefix(slot))
+	got := resolved(gotBatch)
 	require.Equal(t, len(want), len(got))
-	for i := range want {
-		require.Equal(t, want[i].Slot, got[i].Slot)
-		sortDelta(want[i].Delta)
-		sortDelta(got[i].Delta)
-		require.Equal(t, len(want[i].Delta), len(got[i].Delta), "slot %d", want[i].Slot)
-		for j := range want[i].Delta {
-			require.True(t, sameAccount(want[i].Delta[j], got[i].Delta[j]), "slot %d", want[i].Slot)
+	for s, wv := range want {
+		gv := got[s]
+		sortDelta(wv)
+		sortDelta(gv)
+		require.Equal(t, len(wv), len(gv), "slot %d", s)
+		for j := range wv {
+			require.True(t, sameAccount(wv[j], gv[j]), "slot %d", s)
 		}
 	}
+	seen := map[[32]byte]bool{}
+	for i := len(gotBatch) - 1; i >= 0; i-- {
+		for _, a := range gotBatch[i].Delta {
+			seen[[32]byte(a.Key)] = true
+		}
+		for _, c := range gotBatch[i].Compacted {
+			require.True(t, seen[c.Key], "a compacted version must have a newer full one in the batch")
+		}
+	}
+	// A partial batch (the oldest few slots) also resolves exactly.
+	part := w.PromotionChunk(slot, 7, true)
+	refPart := resolved(ref.PromotionChunk(slot, 7, true))
+	for s, gv := range resolved(part) {
+		require.Equal(t, len(refPart[s]), len(gv), "partial slot %d", s)
+	}
+
 	// RangeVersions visits the same versions.
 	count := func(ws *WorkingSet) int {
 		n := 0

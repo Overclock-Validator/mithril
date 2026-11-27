@@ -313,6 +313,59 @@ func (w *WorkingSet) LookupBatch(pubkeys []solana.PublicKey, out []*Account) {
 type SlotDelta struct {
 	Slot  uint64
 	Delta []*Account
+	// Compacted holds this slot's versions that the working set keeps as
+	// differences. Each one turns the next newer version of the same key in
+	// the same promotion batch back into this version; the newest version of
+	// every key in a batch is always in Delta, so a newest-wins fold can ignore
+	// Compacted entirely. History rebuilds them (ResolveVersions).
+	Compacted []CompactedAccount
+}
+
+// CompactedAccount is one version stored as an XOR difference (history.AppendXor
+// of this version and the next newer one).
+type CompactedAccount struct {
+	Key  [32]byte
+	Diff []byte
+	Slot uint64 // the account's Slot field
+}
+
+// ResolveVersions calls fn for every version in a promotion batch, slot by
+// slot ascending, rebuilding compacted versions from the batch itself. Within
+// a slot the order is unspecified. fn must not retain the account's data past
+// the call for rebuilt versions; full versions are the stored values.
+func ResolveVersions(batch []SlotDelta, fn func(slot uint64, a *Account)) {
+	rebuilt := make([]map[[32]byte]*Account, len(batch))
+	// Newest to oldest: a compacted version is rebuilt from the next newer one.
+	next := make(map[[32]byte]*history.Version)
+	for i := len(batch) - 1; i >= 0; i-- {
+		for _, a := range batch[i].Delta {
+			next[[32]byte(a.Key)] = historyVersion(a)
+		}
+		if len(batch[i].Compacted) == 0 {
+			continue
+		}
+		rebuilt[i] = make(map[[32]byte]*Account, len(batch[i].Compacted))
+		for _, c := range batch[i].Compacted {
+			newer, ok := next[c.Key]
+			if !ok {
+				panic("working set: compacted version without a newer version in its batch")
+			}
+			v := newer.Clone()
+			if err := history.ApplyXor(v, c.Diff, false); err != nil {
+				panic("working set: corrupt compacted version: " + err.Error())
+			}
+			next[c.Key] = v
+			rebuilt[i][c.Key] = &Account{Key: solana.PublicKey(c.Key), Lamports: v.Lamports, Data: v.Data, Owner: v.Owner, Executable: v.Executable, RentEpoch: v.RentEpoch, Slot: c.Slot}
+		}
+	}
+	for i, sd := range batch {
+		for _, a := range sd.Delta {
+			fn(sd.Slot, a)
+		}
+		for _, a := range rebuilt[i] {
+			fn(sd.Slot, a)
+		}
+	}
 }
 
 // PromotionPrefix returns held slots <= through (ascending) with their writes,
@@ -358,9 +411,28 @@ func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, maxBytes
 	if count == 0 || (!allowPartial && count < maxSlots && (maxBytes == 0 || bytes < maxBytes)) {
 		return nil
 	}
+	// Full versions are handed over as stored; compacted ones stay differences
+	// (cheap under the read lock). A key whose newest version in the batch is
+	// compacted (its next version lies beyond the batch) is rebuilt here, so
+	// every key's newest batch version is full.
 	batch := make([]SlotDelta, count)
-	for i, versions := range w.layerVersionsLocked(0, count) {
-		batch[i] = SlotDelta{Slot: w.order[i], Delta: versions}
+	newest := make(map[[32]byte]bool)
+	for i := count - 1; i >= 0; i-- {
+		layer := w.bySlot[w.order[i]]
+		sd := SlotDelta{Slot: w.order[i], Delta: make([]*Account, 0, len(layer.writes))}
+		for k, a := range layer.writes {
+			sd.Delta = append(sd.Delta, a)
+			newest[k] = true
+		}
+		for k, c := range layer.compacted {
+			if newest[k] {
+				sd.Compacted = append(sd.Compacted, CompactedAccount{Key: k, Diff: c.diff, Slot: c.slot})
+				continue
+			}
+			sd.Delta = append(sd.Delta, w.rebuildLocked(i, k))
+			newest[k] = true
+		}
+		batch[i] = sd
 	}
 	return batch
 }

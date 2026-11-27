@@ -87,3 +87,70 @@ func TestFoldsRecordHistory(t *testing.T) {
 	}
 	check(slot - 1)
 }
+
+// With working-set compaction, folds commit the same store state and record
+// the same history as without it.
+func TestCompactedFoldsRecordExactHistory(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 3})
+	require.NoError(t, err)
+	db.SetHistory(hs)
+	rng := rand.New(rand.NewSource(9))
+	keys := make([]solana.PublicKey, 30)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	ws := accounts.NewWorkingSet()
+	truth := map[uint64]map[solana.PublicKey]*accounts.Account{}
+	live := map[solana.PublicKey]*accounts.Account{}
+	slot := uint64(101)
+	for round := 0; round < 6; round++ {
+		for i := 0; i < 10; i++ {
+			var delta []*accounts.Account
+			for _, k := range keys {
+				if rng.Intn(2) != 0 {
+					continue
+				}
+				a := &accounts.Account{Key: k, Lamports: uint64(1 + rng.Intn(5)), Data: make([]byte, 40)}
+				if prev := live[k]; prev != nil {
+					copy(a.Data, prev.Data)
+				}
+				a.Data[rng.Intn(40)] = byte(rng.Intn(256))
+				delta = append(delta, a)
+				live[k] = a
+			}
+			ws.Add(slot, delta)
+			m := map[solana.PublicKey]*accounts.Account{}
+			for k, v := range live {
+				m[k] = v
+			}
+			truth[slot] = m
+			slot++
+		}
+		ws.CompactThrough(slot - 2) // everything but the newest slot is final
+		chunk := ws.PromotionChunk(slot-3, 8, true)
+		through := chunk[len(chunk)-1].Slot
+		_, err := db.CommitBatch(chunk, through, nil, nil)
+		require.NoError(t, err)
+		ws.PromotePrefix(through)
+	}
+	first, last, ok := hs.Range()
+	require.True(t, ok)
+	for s := first; s <= last; s++ {
+		for _, k := range keys {
+			want := HistoryVersion(truth[s][k])
+			got, _, err := hs.AccountAt([32]byte(k), s)
+			if errors.Is(err, history.ErrUnchanged) {
+				continue
+			}
+			require.NoError(t, err)
+			require.True(t, history.Same(got, want), "slot %d", s)
+		}
+	}
+	// The durable store holds each key's version as of the last fold.
+	for _, k := range keys {
+		accts, err := db.GetAccountsBatch(t.Context(), last, []solana.PublicKey{k})
+		require.NoError(t, err)
+		require.True(t, history.Same(HistoryVersion(accts[0]), HistoryVersion(truth[last][k])), "durable %s", k)
+	}
+}

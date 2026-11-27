@@ -2441,9 +2441,9 @@ postBootstrap:
 	replay.TrailingVerifierCfg = vcfg
 
 	if foldBatch := config.GetInt("storage.fold_batch_slots"); foldBatch > 0 {
-		replay.FoldBatchSlots = min(max(foldBatch, 32), 2048)
+		replay.FoldBatchSlots = min(max(foldBatch, 32), 1024)
 		if replay.FoldBatchSlots != foldBatch {
-			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..2048)", foldBatch, replay.FoldBatchSlots)
+			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..1024)", foldBatch, replay.FoldBatchSlots)
 		}
 	}
 	replay.WorkingSetCompaction = config.GetBool("storage.working_set_compaction")

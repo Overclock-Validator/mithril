@@ -99,17 +99,20 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 		}
 	}
 	slots := make([]history.SlotWrites, 0, len(deltas))
-	for _, sd := range deltas {
-		sw := history.SlotWrites{Slot: sd.Slot}
-		for _, a := range sd.Delta {
-			if a == nil || a.IsDummy {
-				continue
-			}
-			sw.Keys = append(sw.Keys, [32]byte(a.Key))
-			sw.Versions = append(sw.Versions, HistoryVersion(a))
+	index := make(map[uint64]int, len(deltas))
+	accounts.ResolveVersions(deltas, func(slot uint64, a *accounts.Account) {
+		if a == nil || a.IsDummy {
+			return
 		}
-		slots = append(slots, sw)
-	}
+		i, ok := index[slot]
+		if !ok {
+			i = len(slots)
+			index[slot] = i
+			slots = append(slots, history.SlotWrites{Slot: slot})
+		}
+		slots[i].Keys = append(slots[i].Keys, [32]byte(a.Key))
+		slots[i].Versions = append(slots[i].Versions, HistoryVersion(a))
+	})
 	var prevNanos time.Duration
 	prev := func(keys [][32]byte) ([]*history.Version, error) {
 		t := time.Now()
