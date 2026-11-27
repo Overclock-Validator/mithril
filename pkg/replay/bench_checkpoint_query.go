@@ -41,6 +41,10 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 	}
 	shredDir := parts[2]
 	querier := &CheckpointQuerier{DB: db, Persisted: persisted, ShredDir: shredDir, Workers: workers, NoHints: os.Getenv("MITHRIL_BENCH_CHECKPOINT_QUERY_NOHINTS") == "1"}
+	// MITHRIL_BENCH_CHECKPOINT_QUERY_KEEP=<n> keeps the n most recently
+	// queried folds replayed in memory.
+	querier.KeepFolds, _ = strconv.Atoi(os.Getenv("MITHRIL_BENCH_CHECKPOINT_QUERY_KEEP"))
+	var keptBytes uint64
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -48,6 +52,7 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 		type answer struct {
 			blocks               int
 			total, setup, replay time.Duration
+			kept, built          bool
 		}
 		var answers []answer
 		var failures, wrong, checked, fellBack, failedTargets int
@@ -77,6 +82,27 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 				at(func(a answer) float64 { return float64(a.setup) / 1e6 }, 0.5),
 				at(func(a answer) float64 { return float64(a.blocks) }, 0.5),
 				float64(replay)/1e6/float64(max(1, blocks)))
+			if querier.KeepFolds > 0 {
+				all := answers
+				for _, group := range []struct {
+					name  string
+					built bool
+				}{{"answered from a fold already kept", false}, {"had to replay and keep their fold first", true}} {
+					answers = nil
+					for _, a := range all {
+						if a.kept && a.built == group.built {
+							answers = append(answers, a)
+						}
+					}
+					if len(answers) > 0 {
+						mlog.Log.Infof("bench checkpoint query: %d queries %s: wait ms median %.1f p90 %.1f max %.1f min %.1f",
+							len(answers), group.name, at(total, 0.5), at(total, 0.9), at(total, 1), at(total, 0))
+					}
+				}
+				answers = all
+				mlog.Log.Infof("bench checkpoint query: keeping %d folds, about %.2f GiB each", querier.KeepFolds, float64(keptBytes)/(1<<30))
+				return
+			}
 			// By how deep into its fold the target was.
 			for _, band := range [][2]int{{1, 16}, {17, 64}, {65, 128}} {
 				var inBand []answer
@@ -157,7 +183,8 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 				}
 				continue
 			}
-			answers = append(answers, answer{result.BlocksReplayed, result.Total, result.Setup, result.Replay})
+			answers = append(answers, answer{result.BlocksReplayed, result.Total, result.Setup, result.Replay, result.FromKeptFold, result.BuiltFold})
+			keptBytes = max(keptBytes, result.KeptFoldBytes)
 			if result.FellBack {
 				fellBack++
 			}

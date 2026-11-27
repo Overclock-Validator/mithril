@@ -46,6 +46,12 @@ type CheckpointQuerier struct {
 	Workers int
 	// NoHints replays every block as declared (measurement and fallback).
 	NoHints bool
+	// KeepFolds, when above zero, keeps that many most recently queried
+	// folds replayed in memory (FoldReplay). The first query in a fold then
+	// replays the whole fold; later ones execute only their own block.
+	KeepFolds int
+
+	kept keptFolds
 }
 
 // TransactionReplay is what a transaction did, as replayed.
@@ -67,6 +73,11 @@ type TransactionReplay struct {
 	InnerInstructions    []InnerInstructionsList
 	ReturnData           *TransactionReturnData
 
+	// FromKeptFold is set when the answer came from a fold kept in memory;
+	// BuiltFold when this query was the one that replayed and kept it.
+	FromKeptFold, BuiltFold bool
+	// KeptFoldBytes estimates the memory the kept fold holds.
+	KeptFoldBytes uint64
 	// UsedHints reports whether stored hints sped the replay up; FellBack is
 	// set when a hinted attempt disagreed and the query ran again without.
 	UsedHints, FellBack bool
@@ -82,8 +93,13 @@ func (q *CheckpointQuerier) ReplayTransaction(ctx context.Context, slot uint64, 
 		return nil, errors.New("checkpoint query needs a store, the node's persisted state, a shred directory and workers")
 	}
 	start := time.Now()
-	result, err := q.attempt(ctx, slot, signature, !q.NoHints)
+	attempt := q.attempt
+	if q.KeepFolds > 0 {
+		attempt = q.attemptKept
+	}
+	result, err := attempt(ctx, slot, signature, !q.NoHints)
 	if err != nil && !q.NoHints && ctx.Err() == nil && (errors.Is(err, ErrReplayHintsDisagree) || errors.Is(err, errBankHashDiffers)) {
+		// Without hints, and without a kept fold a hinted replay built.
 		result, err = q.attempt(ctx, slot, signature, false)
 		if result != nil {
 			result.FellBack = true
@@ -97,18 +113,64 @@ func (q *CheckpointQuerier) ReplayTransaction(ctx context.Context, slot uint64, 
 
 var errBankHashDiffers = errors.New("a replayed block's bank hash differs from the recorded one")
 
-func (q *CheckpointQuerier) attempt(ctx context.Context, slot uint64, signature solana.Signature, hints bool) (*TransactionReplay, error) {
-	start := time.Now()
+// boundaryBefore returns the latest fold boundary before slot.
+func (q *CheckpointQuerier) boundaryBefore(slot uint64) (uint64, error) {
 	boundaries, err := q.DB.CheckpointBoundaries()
+	if err != nil {
+		return 0, err
+	}
+	at := sort.Search(len(boundaries), func(i int) bool { return boundaries[i] >= slot })
+	if at == 0 {
+		return 0, ErrSlotNotCheckpointed
+	}
+	return boundaries[at-1], nil
+}
+
+// attemptKept answers from the kept replay of the slot's fold, building it
+// first if this is the fold's first query.
+func (q *CheckpointQuerier) attemptKept(ctx context.Context, slot uint64, signature solana.Signature, hints bool) (*TransactionReplay, error) {
+	boundary, err := q.boundaryBefore(slot)
 	if err != nil {
 		return nil, err
 	}
-	// The latest boundary before the slot.
-	at := sort.Search(len(boundaries), func(i int) bool { return boundaries[i] >= slot })
-	if at == 0 {
+	fold, built, err := q.kept.get(boundary, q.KeepFolds, func() (*FoldReplay, error) { return q.buildFold(ctx, boundary, hints) })
+	if err != nil {
+		return nil, err
+	}
+	if len(fold.slots) == 0 || fold.slots[len(fold.slots)-1] < slot {
 		return nil, ErrSlotNotCheckpointed
 	}
-	boundary := boundaries[at-1]
+	result, err := fold.transaction(ctx, q, slot, signature, hints)
+	if result != nil {
+		result.BuiltFold, result.KeptFoldBytes = built, fold.Bytes
+	}
+	return result, err
+}
+
+// take copies the captured transaction into the result.
+func (result *TransactionReplay) take(capture *blockMetadataCapture) error {
+	if capture.Err != nil {
+		return fmt.Errorf("capture the transaction: %w", capture.Err)
+	}
+	if capture.Record == nil || len(capture.Record.Transactions) == 0 {
+		return ErrTransactionNotInBlock
+	}
+	record := capture.Record.Transactions[0]
+	result.Fee, result.ComputeUnitsConsumed = record.Fee, record.ComputeUnitsConsumed
+	if len(record.Error) > 0 && string(record.Error) != "null" {
+		result.Error = record.Error
+	}
+	result.AccountKeys, result.PreBalances, result.PostBalances = record.AccountKeys, record.PreBalances, record.PostBalances
+	result.LogMessages, result.InnerInstructions, result.ReturnData = record.LogMessages, record.InnerInstructions, record.ReturnData
+	return nil
+}
+
+func (q *CheckpointQuerier) attempt(ctx context.Context, slot uint64, signature solana.Signature, hints bool) (*TransactionReplay, error) {
+	start := time.Now()
+	boundary, err := q.boundaryBefore(slot)
+	if err != nil {
+		return nil, err
+	}
 	view, err := q.DB.OpenCheckpointView(boundary)
 	if err != nil {
 		return nil, err
@@ -189,19 +251,9 @@ func (q *CheckpointQuerier) attempt(ctx context.Context, slot uint64, signature 
 		if capture == nil {
 			continue
 		}
-		if capture.Err != nil {
-			return nil, fmt.Errorf("slot %d: capture the transaction: %w", slot, capture.Err)
+		if err := result.take(capture); err != nil {
+			return nil, fmt.Errorf("slot %d: %w", slot, err)
 		}
-		if capture.Record == nil || len(capture.Record.Transactions) == 0 {
-			return nil, ErrTransactionNotInBlock
-		}
-		record := capture.Record.Transactions[0]
-		result.Fee, result.ComputeUnitsConsumed = record.Fee, record.ComputeUnitsConsumed
-		if len(record.Error) > 0 && string(record.Error) != "null" {
-			result.Error = record.Error
-		}
-		result.AccountKeys, result.PreBalances, result.PostBalances = record.AccountKeys, record.PreBalances, record.PostBalances
-		result.LogMessages, result.InnerInstructions, result.ReturnData = record.LogMessages, record.InnerInstructions, record.ReturnData
 	}
 	result.Replay = time.Since(replayStart)
 	result.UsedHints = replay.HintedBlocks > 0

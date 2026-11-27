@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -41,6 +42,41 @@ type checkpointTail struct {
 	fetched sync.Map
 	// deltas, when set, sizes each block's changes (bench).
 	deltas *deltaStats
+
+	// versions, when kept, lists every version each account got during the
+	// replay, oldest first, so the state after any replayed slot can be read
+	// back later (see FoldReplay). Written only by the replay that owns the
+	// tail; read only after that replay has finished.
+	versions map[solana.PublicKey][]accountVersion
+	// asOf, when set, makes this tail a view of another tail's finished
+	// replay as it stood after slot through: reads fall to asOf's versions
+	// up to that slot, then to asOf's boundary accounts. This tail's own
+	// writes stay in its own overlay.
+	asOf    *checkpointTail
+	through uint64
+}
+
+type accountVersion struct {
+	slot uint64
+	acct *accounts.Account
+}
+
+// versionAt returns the account as the kept replay left it after slot
+// through, if any replayed block up to then changed it.
+func (t *checkpointTail) versionAt(key solana.PublicKey, through uint64) (*accounts.Account, bool) {
+	versions := t.versions[key]
+	// the first version after through; the one before it is the answer
+	i := sort.Search(len(versions), func(i int) bool { return versions[i].slot > through })
+	if i == 0 {
+		return nil, false
+	}
+	return versions[i-1].acct, true
+}
+
+// viewAfter returns a tail that reads this finished replay's state as of the
+// end of slot through.
+func (t *checkpointTail) viewAfter(through uint64) *checkpointTail {
+	return &checkpointTail{view: t.view, overlay: accounts.NewWorkingSet(), asOf: t, through: through}
 }
 
 func newCheckpointTail(view *accountsdb.CheckpointView) *checkpointTail {
@@ -57,6 +93,10 @@ func (t *checkpointTail) preload(keys []solana.PublicKey, loaded []*accounts.Acc
 
 // boundary returns the account as of the boundary: shared, or nil if absent.
 func (t *checkpointTail) boundary(ctx context.Context, keys []solana.PublicKey, out []*accounts.Account, missing []int) error {
+	if t.asOf != nil {
+		// Boundary accounts are the kept replay's: one cache for every query.
+		return t.asOf.boundary(ctx, keys, out, missing)
+	}
 	var lookups []solana.PublicKey
 	var positions []int
 	for _, i := range missing {
@@ -108,6 +148,11 @@ func (t *checkpointTail) warm(ctx context.Context, keys []solana.PublicKey, chun
 func (t *checkpointTail) GetAccountShared(_ uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	if acct, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
 		return acct, nil
+	}
+	if t.asOf != nil {
+		if acct, ok := t.asOf.versionAt(pubkey, t.through); ok {
+			return acct, nil
+		}
 	}
 	out := make([]*accounts.Account, 1)
 	if err := t.boundary(context.Background(), []solana.PublicKey{pubkey}, out, []int{0}); err != nil {
@@ -167,6 +212,11 @@ func (t *checkpointTail) GetAccountsBatchShared(ctx context.Context, _ uint64, p
 	t.overlay.LookupBatch(pks, out)
 	var missing []int
 	for i, acct := range out {
+		if acct == nil && t.asOf != nil {
+			// A version from the kept replay counts as this bank's own.
+			acct, _ = t.asOf.versionAt(pks[i], t.through)
+			out[i] = acct
+		}
 		if acct == nil {
 			missing = append(missing, i)
 		}
@@ -184,6 +234,13 @@ func (t *checkpointTail) GetAccountsBatchShared(ctx context.Context, _ uint64, p
 
 func (t *checkpointTail) Add(slot uint64, delta []*accounts.Account, _ []byte) {
 	t.overlay.Add(slot, delta)
+	if t.versions != nil {
+		for _, acct := range delta {
+			if acct != nil {
+				t.versions[acct.Key] = append(t.versions[acct.Key], accountVersion{slot, acct})
+			}
+		}
+	}
 	if t.deltas != nil {
 		t.deltas.add(delta)
 	}
