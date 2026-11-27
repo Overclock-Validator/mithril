@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 )
@@ -44,23 +43,15 @@ func (db *AccountsDb) SeedVoteAccountPubkeys(pubkeys []solana.PublicKey) error {
 	return nil
 }
 
-// VoteAccountPubkeys returns every known vote-account candidate. Existing
-// stores built before this index was added are migrated once, on first use.
+// VoteAccountPubkeys returns every indexed vote-account candidate. A snapshot
+// build seeds the index and every fold adds to it. A store built before the
+// index existed is not scanned to fill it, because that would read every
+// account while replay runs: it lists only vote accounts written since, and
+// its callers add the staked ones from epoch stakes.
 func (db *AccountsDb) VoteAccountPubkeys(ctx context.Context) ([]solana.PublicKey, error) {
-	db.voteIndexMu.Lock()
-	defer db.voteIndexMu.Unlock()
-	if _, closer, err := db.Index.Get(voteIndexReadyKey); err == nil {
-		if err := closer.Close(); err != nil {
-			return nil, err
-		}
-	} else if err == pebble.ErrNotFound {
-		if err := db.migrateVoteIndex(ctx); err != nil {
-			return nil, err
-		}
-	} else {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
 	iter, err := db.Index.NewIter(&pebble.IterOptions{
 		LowerBound: []byte(voteIndexPrefix),
 		UpperBound: []byte("\x00mithril.vote/"),
@@ -87,67 +78,4 @@ func (db *AccountsDb) VoteAccountPubkeys(ctx context.Context) ([]solana.PublicKe
 		return nil, iterErr
 	}
 	return pubkeys, closeErr
-}
-
-// migrateVoteIndex scans an older store once. Finalized folds can run during
-// the scan: they add their new vote candidates to the same append-only index.
-func (db *AccountsDb) migrateVoteIndex(ctx context.Context) error {
-	iter, err := db.Index.NewIter(nil)
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	batch := db.Index.NewBatch()
-	defer batch.Close()
-	keys := make([]solana.PublicKey, 0, 512)
-	flush := func() error {
-		if len(keys) == 0 {
-			return nil
-		}
-		accounts, err := db.GetAccountsBatch(ctx, db.DurableThrough(), keys)
-		if err != nil {
-			return err
-		}
-		for i, account := range accounts {
-			if account != nil && account.Lamports > 0 && account.Owner == addresses.VoteProgramAddr {
-				if err := batch.Set(voteIndexKey(keys[i]), nil, nil); err != nil {
-					return err
-				}
-			}
-		}
-		keys = keys[:0]
-		return nil
-	}
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if key := iter.Key(); len(key) == 32 {
-			keys = append(keys, solana.PublicKeyFromBytes(key))
-			if len(keys) == cap(keys) {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	if err := flush(); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := batch.Set(voteIndexReadyKey, nil, nil); err != nil {
-		return err
-	}
-	if err := batch.Commit(pebble.Sync); err != nil {
-		return err
-	}
-	if db.IndexWALDisabled {
-		return db.Index.Flush()
-	}
-	return nil
 }

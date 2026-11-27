@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -107,15 +109,36 @@ func (view *simulationAccounts) GetAccountWithDataLimit(slot uint64, key solana.
 	return view.GetAccount(slot, key)
 }
 
+// simulationAdmissionWait is how long a request queues for an execution slot
+// before it is refused. A burst of a few calls then waits its turn; sustained
+// overload is still refused quickly.
+const simulationAdmissionWait = 250 * time.Millisecond
+
+// simulationCapacity bounds concurrent simulated executions, which compete
+// with replay for cores: a quarter of them, and at least two.
+func simulationCapacity() int {
+	return max(2, runtime.GOMAXPROCS(0)/4)
+}
+
 func (server *RpcServer) acquireSimulation(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	server.simulationOnce.Do(func() { server.simulationCalls = make(chan struct{}, 2) })
+	server.simulationOnce.Do(func() { server.simulationCalls = make(chan struct{}, simulationCapacity()) })
+	release := func() { <-server.simulationCalls }
 	select {
 	case server.simulationCalls <- struct{}{}:
-		return func() { <-server.simulationCalls }, nil
+		return release, nil
 	default:
+	}
+	wait := time.NewTimer(simulationAdmissionWait)
+	defer wait.Stop()
+	select {
+	case server.simulationCalls <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-wait.C:
 		return nil, fmt.Errorf("transaction simulation capacity is exhausted")
 	}
 }

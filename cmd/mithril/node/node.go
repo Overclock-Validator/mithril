@@ -155,6 +155,7 @@ var (
 	rpcBindAddress        string
 	rpcTransactionHistory transactionHistoryConfig
 	rpcSignatureStatuses  bool
+	rpcBlockHistory       bool
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -551,6 +552,7 @@ func init() {
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
 	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
 	Run.Flags().BoolVar(&rpcTransactionHistory.Enabled, "rpc-transaction-history", false, "Retain full transaction history on an Alpenglow verifying node; RPC becomes HTTP-only")
+	Run.Flags().BoolVar(&rpcBlockHistory, "rpc-block-history", false, "Retain two epochs of rooted block summaries for getBlock, getBlocks and getFirstAvailableBlock; implied by transaction history and signature statuses")
 	Run.Flags().BoolVar(&rpcSignatureStatuses, "rpc-signature-statuses", false, "Serve bounded recent signature outcomes on an Alpenglow verifying node; RPC becomes HTTP-only")
 	Run.Flags().Int64Var(&rpcTransactionHistory.RetentionSlots, "rpc-transaction-history-slots", 16384, "Maximum transaction history age in slots")
 	Run.Flags().Int64Var(&rpcTransactionHistory.MaxMiB, "rpc-transaction-history-max-mib", 1024, "Logical transaction history budget in MiB (not a physical disk quota)")
@@ -942,6 +944,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		ReserveMiB:     getInt64("rpc-transaction-history-reserve-mib", "rpc.transaction_history_reserve_mib"),
 	}
 	rpcSignatureStatuses = getBool("rpc-signature-statuses", "rpc.signature_statuses")
+	rpcBlockHistory = getBool("rpc-block-history", "rpc.block_history")
 	if err := validateSignatureStatuses(rpcSignatureStatuses, cluster, consensusMode, rpcPort); err != nil {
 		return err
 	}
@@ -2667,9 +2670,14 @@ postBootstrap:
 		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
-		retentionSlots := schedule.SlotsPerEpoch * 2
-		if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
-			klog.Fatalf("enable RPC block history: %v", err)
+		// Block history adds a synced file write to every fold and keeps its
+		// records in memory, so a node that serves no history does not carry it.
+		// Transaction history and signature statuses select their block by it.
+		if rpcBlockHistory || rpcTransactionHistory.Enabled || rpcSignatureStatuses {
+			retentionSlots := schedule.SlotsPerEpoch * 2
+			if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+				klog.Fatalf("enable RPC block history: %v", err)
+			}
 		}
 		publishRPCBankState(rpcServer, mithrilState)
 		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, resumeState)

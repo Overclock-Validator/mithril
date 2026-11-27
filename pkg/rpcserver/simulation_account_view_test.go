@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -218,14 +219,32 @@ func TestSimulationCaptureBoundsAndAdmission(t *testing.T) {
 	view := &simulationAccounts{bank: bank, source: reader, accounts: make(map[solana.PublicKey]*accounts.Account), remaining: 8}
 	view.capture(t.Context(), tx.Message.AccountKeys[0])
 	require.ErrorIs(t, view.err, accountsdb.ErrAccountDataLimit)
-	first, err := server.acquireSimulation(t.Context())
-	require.NoError(t, err)
-	defer first()
-	second, err := server.acquireSimulation(t.Context())
-	require.NoError(t, err)
-	defer second()
-	_, err = server.acquireSimulation(t.Context())
+	// Fill every slot. A further caller queues briefly and is then refused,
+	// and one queued when a slot frees is admitted.
+	held := make([]func(), simulationCapacity())
+	for i := range held {
+		release, err := server.acquireSimulation(t.Context())
+		require.NoError(t, err)
+		held[i] = release
+	}
+	began := time.Now()
+	_, err := server.acquireSimulation(t.Context())
 	require.ErrorContains(t, err, "capacity")
+	require.GreaterOrEqual(t, time.Since(began), simulationAdmissionWait)
+	admitted := make(chan error, 1)
+	go func() {
+		release, err := server.acquireSimulation(context.Background())
+		if err == nil {
+			release()
+		}
+		admitted <- err
+	}()
+	time.Sleep(simulationAdmissionWait / 5)
+	held[0]()
+	require.NoError(t, <-admitted)
+	for _, release := range held[1:] {
+		release()
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err = server.acquireSimulation(ctx)

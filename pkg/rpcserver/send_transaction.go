@@ -100,11 +100,15 @@ func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawPa
 	if err := validateSendTransactionSanitize(tx, nil); err != nil {
 		return "", err
 	}
-	release, err := rpcServer.acquireSimulation(ctx)
-	if err != nil {
-		return "", err
+	// Only a preflight executes the transaction. Forwarding without one reads
+	// its address tables and takes no execution slot.
+	if !conf.skipPreflight {
+		release, err := rpcServer.acquireSimulation(ctx)
+		if err != nil {
+			return "", err
+		}
+		defer release()
 	}
-	defer release()
 	commitment := conf.preflightCommitment
 	if conf.skipPreflight {
 		commitment = "processed"

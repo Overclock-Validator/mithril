@@ -11,26 +11,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestVoteIndexMigratesExistingStoreAndPersists(t *testing.T) {
-	db, dir := newFoldTestDb(t)
-	vote := &accounts.Account{Key: solana.PublicKey{1}, Owner: addresses.VoteProgramAddr, Lamports: 1}
-	ordinary := &accounts.Account{Key: solana.PublicKey{2}, Lamports: 1}
-	_, err := db.CommitBatch(foldDeltas(accounts.SlotDelta{Slot: 10, Delta: []*accounts.Account{vote, ordinary}}), 10, nil, nil)
+// A store written before the vote index existed is never scanned to fill it:
+// the index lists only what a snapshot build seeded or a fold has added.
+func TestVoteIndexDoesNotScanAnOlderStore(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	old := &accounts.Account{Key: solana.PublicKey{1}, Owner: addresses.VoteProgramAddr, Lamports: 1}
+	_, err := db.CommitBatch(foldDeltas(accounts.SlotDelta{Slot: 10, Delta: []*accounts.Account{old}}), 10, nil, nil)
 	require.NoError(t, err)
-	// Mimic a database written before the vote index existed.
-	require.NoError(t, db.Index.Delete(voteIndexKey(vote.Key), pebble.Sync))
-	db.VoteAcctCache.Clear()
+	require.NoError(t, db.Index.Delete(voteIndexKey(old.Key), pebble.Sync))
 	got, err := db.VoteAccountPubkeys(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, []solana.PublicKey{vote.Key}, got)
+	require.Empty(t, got)
 
-	db = reopenFoldTestDb(t, db, dir)
-	defer db.CloseDb()
-	_, err = db.RecoverFoldState()
+	written := &accounts.Account{Key: solana.PublicKey{2}, Owner: addresses.VoteProgramAddr, Lamports: 1}
+	_, err = db.CommitBatch(foldDeltas(accounts.SlotDelta{Slot: 11, Delta: []*accounts.Account{written}}), 11, nil, nil)
 	require.NoError(t, err)
 	got, err = db.VoteAccountPubkeys(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, []solana.PublicKey{vote.Key}, got)
+	require.Equal(t, []solana.PublicKey{written.Key}, got)
 }
 
 func TestVoteIndexSnapshotSeedAndFoldRecovery(t *testing.T) {
@@ -55,16 +54,4 @@ func TestVoteIndexSnapshotSeedAndFoldRecovery(t *testing.T) {
 	got, err = db.VoteAccountPubkeys(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, []solana.PublicKey{seedVote, foldVote.Key}, got)
-}
-
-func TestVoteIndexMigrationCanRetryAfterCancellation(t *testing.T) {
-	db, _ := newFoldTestDb(t)
-	defer db.CloseDb()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := db.VoteAccountPubkeys(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-	got, err := db.VoteAccountPubkeys(context.Background())
-	require.NoError(t, err)
-	require.Empty(t, got)
 }

@@ -32,7 +32,6 @@ type AccountsDb struct {
 	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
-	voteIndexMu      sync.Mutex
 	CommonAcctsCache *commonAccountCache
 	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes

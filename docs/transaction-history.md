@@ -21,6 +21,10 @@ transaction_history_reserve_mib = 2048
 signature_statuses = true
 ```
 
+Block history (`block_history = true`, `--rpc-block-history`) retains two epochs of
+rooted block summaries for `getBlock`, `getBlocks` and `getFirstAvailableBlock`. It is
+off by default, and enabling history or signature statuses turns it on.
+
 History and signature statuses can be enabled independently. The corresponding
 flags are `--rpc-transaction-history`, `--rpc-transaction-history-slots`,
 `--rpc-transaction-history-max-mib`, `--rpc-transaction-history-reserve-mib` and
