@@ -156,6 +156,8 @@ var (
 	rpcTransactionHistory transactionHistoryConfig
 	rpcSignatureStatuses  bool
 	rpcBlockHistory       bool
+	rpcServeName          string
+	rpcServe              rpcServePlan
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -552,6 +554,7 @@ func init() {
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
 	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
 	Run.Flags().BoolVar(&rpcTransactionHistory.Enabled, "rpc-transaction-history", false, "Retain full transaction history on an Alpenglow verifying node; RPC becomes HTTP-only")
+	Run.Flags().StringVar(&rpcServeName, "rpc-serve", "", "What the RPC answers: none, accounts (default with an RPC port), blocks, wallet (adds signature outcomes) or history (adds full transaction history). Each level includes the ones before it")
 	Run.Flags().BoolVar(&rpcBlockHistory, "rpc-block-history", false, "Retain two epochs of rooted block summaries for getBlock, getBlocks and getFirstAvailableBlock; implied by transaction history and signature statuses")
 	Run.Flags().BoolVar(&rpcSignatureStatuses, "rpc-signature-statuses", false, "Serve bounded recent signature outcomes on an Alpenglow verifying node; RPC becomes HTTP-only")
 	Run.Flags().Int64Var(&rpcTransactionHistory.RetentionSlots, "rpc-transaction-history-slots", 16384, "Maximum transaction history age in slots")
@@ -945,10 +948,18 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	rpcSignatureStatuses = getBool("rpc-signature-statuses", "rpc.signature_statuses")
 	rpcBlockHistory = getBool("rpc-block-history", "rpc.block_history")
-	if err := validateSignatureStatuses(rpcSignatureStatuses, cluster, consensusMode, rpcPort); err != nil {
-		return err
+	rpcServeName = getString("rpc-serve", "rpc.serve")
+	var serveErr error
+	rpcServe, serveErr = resolveRPCServe(rpcServeName, rpcBlockHistory, rpcSignatureStatuses, rpcTransactionHistory.Enabled, consensusMode, rpcPort)
+	if serveErr != nil {
+		return serveErr
 	}
-	if err := rpcTransactionHistory.validate(cluster, consensusMode, rpcPort); err != nil {
+	// From here the plan is the single source of what is enabled.
+	rpcBlockHistory, rpcSignatureStatuses, rpcTransactionHistory.Enabled = rpcServe.BlockHistory, rpcServe.SignatureStatuses, rpcServe.TransactionHistory
+	if rpcServe.Level == rpcServeNone {
+		rpcPort = 0
+	}
+	if err := rpcTransactionHistory.validate(consensusMode, rpcPort); err != nil {
 		return err
 	}
 	resolvedTxParallelism := txParallelismForMode(consensusMode, txParallelism, txParallelismExplicit, runtime.NumCPU())
@@ -1418,10 +1429,10 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) error {
-	if err := validateSignatureStatuses(rpcSignatureStatuses, cluster, consensusMode, rpcPort); err != nil {
+	if err := validateSignatureStatuses(rpcSignatureStatuses, consensusMode, rpcPort); err != nil {
 		return fmt.Errorf("invalid signature status configuration: %w", err)
 	}
-	if err := rpcTransactionHistory.validate(cluster, consensusMode, rpcPort); err != nil {
+	if err := rpcTransactionHistory.validate(consensusMode, rpcPort); err != nil {
 		return fmt.Errorf("invalid transaction history configuration: %w", err)
 	}
 	if pprofPort != -1 {
@@ -2642,12 +2653,12 @@ postBootstrap:
 	}
 
 	resultCache, resultSession, resultErr := newNodeTransactionResults(rpcSignatureStatuses,
-		cluster, consensusMode, rpcPort, mithrilState, resumeState)
+		consensusMode, rpcPort, mithrilState, resumeState)
 	if resultErr != nil {
 		klog.Fatalf("unable to initialize signature statuses: %v", resultErr)
 	}
 	historyStore, historySession, historyErr := openNodeTransactionHistory(rpcTransactionHistory,
-		cluster, consensusMode, rpcPort, accountsPath, networkGenesisHash)
+		consensusMode, rpcPort, accountsPath, networkGenesisHash)
 	if historyErr != nil {
 		klog.Fatalf("unable to open transaction history: %v", historyErr)
 	}
@@ -2673,7 +2684,7 @@ postBootstrap:
 		// Block history adds a synced file write to every fold and keeps its
 		// records in memory, so a node that serves no history does not carry it.
 		// Transaction history and signature statuses select their block by it.
-		if rpcBlockHistory || rpcTransactionHistory.Enabled || rpcSignatureStatuses {
+		if rpcServe.BlockHistory {
 			retentionSlots := schedule.SlotsPerEpoch * 2
 			if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
 				klog.Fatalf("enable RPC block history: %v", err)
@@ -2686,13 +2697,7 @@ postBootstrap:
 			klog.Fatalf("start RPC server: %v", err)
 		}
 		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
-		if resultCache != nil {
-			mlog.Log.Infof("Signature statuses enabled: HTTP only, bounded recent outcomes; retained gaps may return unavailable")
-		}
-		if historyStore != nil {
-			mlog.Log.Infof("Transaction history enabled: HTTP only, retention_slots=%d logical_budget_mib=%d free_reserve_mib=%d",
-				rpcTransactionHistory.RetentionSlots, rpcTransactionHistory.MaxMiB, rpcTransactionHistory.ReserveMiB)
-		}
+		mlog.Log.Infof("%s", rpcServe.summary(rpcTransactionHistory))
 	}
 
 	// The Alpenglow observer is forkchoice authority in both consensus modes.

@@ -19,30 +19,29 @@ import (
 func TestSignatureStatusesNodeConfig(t *testing.T) {
 	require.Equal(t, "false", Run.Flags().Lookup("rpc-signature-statuses").DefValue)
 	for _, test := range []struct {
-		cluster, mode string
-		port          int
-		valid         bool
+		mode  string
+		port  int
+		valid bool
 	}{
-		{"alpenglow", "verifying", 8899, true},
-		{"alpenglow", "validator", 8899, false},
-		{"mainnet-beta", "verifying", 8899, false},
-		{"alpenglow", "", 8899, false},
-		{"alpenglow", "verifying", 0, false},
-		{"alpenglow", "verifying", -1, false},
-		{"alpenglow", "verifying", 65536, false},
+		{"verifying", 8899, true},
+		{"validator", 8899, false},
+		{"", 8899, false},
+		{"verifying", 0, false},
+		{"verifying", -1, false},
+		{"verifying", 65536, false},
 	} {
-		err := validateSignatureStatuses(true, test.cluster, test.mode, test.port)
+		err := validateSignatureStatuses(true, test.mode, test.port)
 		require.Equal(t, test.valid, err == nil)
-		require.NoError(t, validateSignatureStatuses(false, test.cluster, test.mode, test.port))
+		require.NoError(t, validateSignatureStatuses(false, test.mode, test.port))
 	}
-	cache, session, err := newNodeTransactionResults(false, "mainnet-beta", "validator", 0, nil, nil)
+	cache, session, err := newNodeTransactionResults(false, "validator", 0, nil, nil)
 	require.NoError(t, err, "disabled initialization must not parse state")
 	require.Nil(t, cache)
 	require.Nil(t, session)
-	_, _, err = newNodeTransactionResults(true, "alpenglow", "verifying", 8899, nil, nil)
+	_, _, err = newNodeTransactionResults(true, "verifying", 8899, nil, nil)
 	require.Error(t, err, "enabled status cannot start with an invented parent")
 	s := &state.MithrilState{ManifestParentSlot: 8, ManifestRecentBlockhashes: []state.BlockhashEntry{{Blockhash: (solana.Hash{8}).String()}}}
-	cache, session, err = newNodeTransactionResults(true, "alpenglow", "verifying", 8899, s,
+	cache, session, err = newNodeTransactionResults(true, "verifying", 8899, s,
 		&replay.ResumeState{ParentSlot: 20, LastBlockhash: [32]byte{20}})
 	require.NoError(t, err)
 	view, err := cache.Lookup(nil)
@@ -60,14 +59,14 @@ func TestSignatureStatusesNodeShutdown(t *testing.T) {
 	require.NoError(t, err, "default profile must preserve its existing shutdown path")
 	for _, history := range []bool{false, true} {
 		t.Run(map[bool]string{false: "status_only", true: "history_and_status"}[history], func(t *testing.T) {
-			cache, session, err := newNodeTransactionResults(true, "alpenglow", "verifying", 8899, nil,
+			cache, session, err := newNodeTransactionResults(true, "verifying", 8899, nil,
 				&replay.ResumeState{ParentSlot: 20, LastBlockhash: [32]byte{20}})
 			require.NoError(t, err)
 			joined, err := stopNodeOptionalRPC(nil, nil, nil, session)
 			require.False(t, joined)
 			require.Error(t, err)
 			store, writer, err := openNodeTransactionHistory(transactionHistoryConfig{Enabled: history,
-				RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}, "alpenglow", "verifying", 8899, t.TempDir(), (solana.Hash{1}).String())
+				RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}, "verifying", 8899, t.TempDir(), (solana.Hash{1}).String())
 			require.NoError(t, err)
 			server := rpcserver.NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32}, solana.Hash{1})
 			server.InitTransactionHistory(store)

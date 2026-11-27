@@ -17,21 +17,20 @@ import (
 func TestTransactionHistoryConfig(t *testing.T) {
 	valid := transactionHistoryConfig{Enabled: true, RetentionSlots: 16384, MaxMiB: 1024, ReserveMiB: 2048}
 	for _, test := range []struct {
-		name, cluster, mode string
-		port                int
-		cfg                 transactionHistoryConfig
-		wantError           bool
+		name, mode string
+		port       int
+		cfg        transactionHistoryConfig
+		wantError  bool
 	}{
-		{"observer", "alpenglow", "verifying", 8899, valid, false},
-		{"disabled", "mainnet-beta", "validator", 0, transactionHistoryConfig{}, false},
-		{"voting", "alpenglow", "validator", 8899, valid, true},
-		{"classic", "mainnet-beta", "verifying", 8899, valid, true},
-		{"unknown_mode", "alpenglow", "", 8899, valid, true},
-		{"rpc_off", "alpenglow", "verifying", 0, valid, true},
-		{"invalid_port", "alpenglow", "verifying", 65536, valid, true},
+		{"observer", "verifying", 8899, valid, false},
+		{"disabled", "validator", 0, transactionHistoryConfig{}, false},
+		{"voting", "validator", 8899, valid, true},
+		{"unknown_mode", "", 8899, valid, true},
+		{"rpc_off", "verifying", 0, valid, true},
+		{"invalid_port", "verifying", 65536, valid, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := test.cfg.validate(test.cluster, test.mode, test.port)
+			err := test.cfg.validate(test.mode, test.port)
 			if (err != nil) != test.wantError {
 				t.Fatalf("validation error = %v, want error %v", err, test.wantError)
 			}
@@ -51,7 +50,7 @@ func TestTransactionHistoryConfig(t *testing.T) {
 			if field == "slots" && value == math.MaxInt64 {
 				continue // Slots are compared and subtracted without byte conversion.
 			}
-			if err := cfg.validate("alpenglow", "verifying", 8899); err == nil {
+			if err := cfg.validate("verifying", 8899); err == nil {
 				t.Fatalf("accepted %s = %d", field, value)
 			}
 		}
@@ -62,18 +61,18 @@ func TestTransactionHistoryNodeOwnership(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "accounts")
 	cfg := transactionHistoryConfig{Enabled: true, RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}
 	genesis := solana.Hash{1}
-	store, session, err := openNodeTransactionHistory(transactionHistoryConfig{}, "mainnet-beta", "validator", 0, dir, "invalid")
+	store, session, err := openNodeTransactionHistory(transactionHistoryConfig{}, "validator", 0, dir, "invalid")
 	require.NoError(t, err)
 	require.Nil(t, store)
 	require.Nil(t, session)
-	_, _, err = openNodeTransactionHistory(cfg, "alpenglow", "validator", 8899, dir, genesis.String())
+	_, _, err = openNodeTransactionHistory(cfg, "validator", 8899, dir, genesis.String())
 	require.Error(t, err)
-	_, _, err = openNodeTransactionHistory(cfg, "alpenglow", "verifying", 8899, dir, "invalid")
+	_, _, err = openNodeTransactionHistory(cfg, "verifying", 8899, dir, "invalid")
 	require.Error(t, err)
 	_, err = os.Stat(dir)
 	require.ErrorIs(t, err, os.ErrNotExist, "disabled or rejected history must not create files")
 
-	store, session, err = openNodeTransactionHistory(cfg, "alpenglow", "verifying", 8899, dir, genesis.String())
+	store, session, err = openNodeTransactionHistory(cfg, "verifying", 8899, dir, genesis.String())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		joined, err := session.Stop(context.Background())

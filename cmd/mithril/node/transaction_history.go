@@ -22,12 +22,12 @@ type transactionHistoryConfig struct {
 	ReserveMiB     int64
 }
 
-func (cfg transactionHistoryConfig) validate(cluster, mode string, port int) error {
+func (cfg transactionHistoryConfig) validate(mode string, port int) error {
 	if !cfg.Enabled {
 		return nil
 	}
-	if cluster != "alpenglow" || mode != "verifying" {
-		return errors.New("RPC transaction history requires Alpenglow verifying mode")
+	if mode != "verifying" {
+		return errors.New("RPC transaction history requires verifying mode")
 	}
 	if port < 1 || port > 65535 {
 		return errors.New("RPC transaction history requires an RPC port between 1 and 65535")
@@ -44,8 +44,8 @@ func (cfg transactionHistoryConfig) validate(cluster, mode string, port int) err
 	return nil
 }
 
-func openNodeTransactionHistory(cfg transactionHistoryConfig, cluster, mode string, port int, accountsDir, genesisText string) (*transactionhistory.Store, *replay.TransactionHistorySession, error) {
-	if err := cfg.validate(cluster, mode, port); err != nil {
+func openNodeTransactionHistory(cfg transactionHistoryConfig, mode string, port int, accountsDir, genesisText string) (*transactionhistory.Store, *replay.TransactionHistorySession, error) {
+	if err := cfg.validate(mode, port); err != nil {
 		return nil, nil, err
 	}
 	if !cfg.Enabled {
