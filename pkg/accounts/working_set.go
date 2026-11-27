@@ -639,13 +639,14 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 	// Differences share slabs: one allocation per 256 KiB instead of one per
 	// version, which keeps garbage collection work down.
 	swaps := make([]swap, len(pairs))
-	var slab []byte
+	var scratch, slab []byte
 	for i, p := range pairs {
-		if cap(slab)-len(slab) < len(p.cur.Data)+128 {
-			slab = make([]byte, 0, max(256<<10, len(p.cur.Data)+128))
+		scratch = history.AppendXor(scratch[:0], historyVersion(p.full), historyVersion(p.cur))
+		if cap(slab)-len(slab) < len(scratch) {
+			slab = make([]byte, 0, max(256<<10, len(scratch)))
 		}
 		start := len(slab)
-		slab = history.AppendXor(slab, historyVersion(p.full), historyVersion(p.cur))
+		slab = append(slab, scratch...)
 		d := slab[start:len(slab):len(slab)]
 		swaps[i] = swap{slot: p.slot, key: p.key, full: p.full, c: compactedVersion{diff: d, slot: p.full.Slot}}
 	}

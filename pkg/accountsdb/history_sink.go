@@ -264,27 +264,34 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 	}
 	out.prevNanos = time.Since(t)
 
-	raw := func(a *accounts.Account) *history.Version {
-		return &history.Version{Lamports: a.Lamports, Owner: a.Owner, Executable: a.Executable, RentEpoch: a.RentEpoch, Data: a.Data}
+	setRaw := func(v *history.Version, a *accounts.Account) {
+		*v = history.Version{Lamports: a.Lamports, Owner: a.Owner, Executable: a.Executable, RentEpoch: a.RentEpoch, Data: a.Data}
 	}
+	absent := &history.Version{Absent: true} // shared, never modified
 	semantic := func(v *history.Version) *history.Version {
 		if v.Lamports == 0 {
-			return &history.Version{Absent: true}
+			return absent
 		}
 		return v
 	}
-	// Differences go into shared slabs: one allocation per few hundred KiB
-	// instead of a few per version.
-	var slab []byte
+	// Each difference is computed into one reused scratch buffer, then its
+	// exact bytes are copied into a shared slab: one allocation per 512 KiB of
+	// differences, and no space reserved for the worst case.
+	var scratch, slab []byte
 	appendDiff := func(old, cur *history.Version) ([]byte, bool) {
-		if need := 2*max(len(old.Data), len(cur.Data)) + 256; cap(slab)-len(slab) < need {
-			slab = make([]byte, 0, max(512<<10, need))
+		var changed bool
+		scratch, changed = history.AppendXorChanged(scratch[:0], old, cur)
+		if !changed {
+			return nil, false
+		}
+		if cap(slab)-len(slab) < len(scratch) {
+			slab = make([]byte, 0, max(512<<10, len(scratch)))
 		}
 		at := len(slab)
-		var changed bool
-		slab, changed = history.AppendXorChanged(slab, old, cur)
-		return slab[at:len(slab):len(slab)], changed
+		slab = append(slab, scratch...)
+		return slab[at:len(slab):len(slab)], true
 	}
+	var bufA, bufB history.Version // the two versions compared, reused per key
 	out.keys = make([]history.KeyHistory, 0, len(order))
 	for ki, k := range order {
 		es := byKey[k]
@@ -293,15 +300,16 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 			return out, fmt.Errorf("history: newest version of %x in the batch is not full", k[:4])
 		}
 		// Walk newest to oldest. cur is the raw version at es[i].
-		cur := raw(es[n-1].full)
+		cur, older := &bufA, &bufB
+		setRaw(cur, es[n-1].full)
 		var diffs []history.Diff // newest first
 		for i := n - 1; i >= 1; i-- {
-			var older *history.Version
 			reuse := false
 			if es[i-1].full != nil {
-				older = raw(es[i-1].full)
+				setRaw(older, es[i-1].full)
 			} else {
-				older = cur.Clone()
+				*older = *cur
+				older.Data = bytes.Clone(cur.Data) // cur's data may be a stored account's
 				if err := history.ApplyXor(older, es[i-1].diff, false); err != nil {
 					return out, fmt.Errorf("history: rebuild %x at slot %d: %w", k[:4], es[i-1].slot, err)
 				}
@@ -315,7 +323,7 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 			} else if d, changed := appendDiff(hOld, hCur); changed {
 				diffs = append(diffs, history.Diff{Slot: es[i].slot, Bytes: d})
 			}
-			cur = older
+			cur, older = older, cur
 		}
 		if d, changed := appendDiff(prev[ki], semantic(cur)); changed {
 			diffs = append(diffs, history.Diff{Slot: es[0].slot, Bytes: d})
