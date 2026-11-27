@@ -196,7 +196,10 @@ func (q *CheckpointQuerier) attempt(ctx context.Context, slot uint64, signature 
 			return nil, ErrTransactionNotInBlock
 		}
 		record := capture.Record.Transactions[0]
-		result.Fee, result.Error, result.ComputeUnitsConsumed = record.Fee, record.Error, record.ComputeUnitsConsumed
+		result.Fee, result.ComputeUnitsConsumed = record.Fee, record.ComputeUnitsConsumed
+		if len(record.Error) > 0 && string(record.Error) != "null" {
+			result.Error = record.Error
+		}
 		result.AccountKeys, result.PreBalances, result.PostBalances = record.AccountKeys, record.PreBalances, record.PostBalances
 		result.LogMessages, result.InnerInstructions, result.ReturnData = record.LogMessages, record.InnerInstructions, record.ReturnData
 	}
