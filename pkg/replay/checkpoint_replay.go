@@ -397,7 +397,18 @@ func (r *CheckpointReplay) next(block *b.Block, capture *blockMetadataCapture, e
 			block.ReplayHints = use
 		}
 	}
+	var arenas *privateArenas
+	if !privateArenasOff {
+		arenas = acquirePrivateArenas(r.workers)
+		block.PrivateArenas = arenas
+	}
 	slotCtx, err := processBlock(r.db, block, r.epochSchedule, r.workers, nil, r.hashes, r.tail, r.statuses, true, r.parentSysvars, capture)
+	// The block is finished: its bank, changed accounts and captured
+	// metadata hold copies, not arena memory.
+	if arenas != nil {
+		block.PrivateArenas = nil
+		arenas.release()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint replay of slot %d: %w", block.Slot, err)
 	}

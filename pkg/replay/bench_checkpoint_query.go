@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +58,17 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 		var answers []answer
 		var failures, wrong, checked, fellBack, failedTargets int
 		defer func() {
+			// Where the memory is once the run is over: what the heap holds
+			// before and after a forced collection, and what the process has
+			// taken from and returned to the system.
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			gib := func(v uint64) float64 { return float64(v) / (1 << 30) }
+			mlog.Log.Infof("bench checkpoint query memory: heap in use %.2f GiB before a forced collection, %.2f after; idle heap not returned to the system %.2f GiB; taken from the system %.2f GiB; kept folds hold about %.2f GiB of account versions each; private parameter arena peak %.1f MiB in one block, %.1f MiB ever spilled to the heap",
+				gib(before.HeapAlloc), gib(after.HeapAlloc), gib(after.HeapIdle-after.HeapReleased), gib(after.Sys), gib(keptBytes),
+				float64(privateParameterPeak.Load())/(1<<20), float64(privateParameterOverflow.Load())/(1<<20))
 			if len(answers) == 0 {
 				mlog.Log.Infof("bench checkpoint query: no answers, %d failures", failures)
 				return

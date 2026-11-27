@@ -113,7 +113,10 @@ type Block struct {
 	// ReplayHints, for a private replay, are this node's stored hints for
 	// the block (package replay); nil replays it as declared.
 	ReplayHints any
-	IsSkipped   bool // True for slots that were skipped by the leader
+	// PrivateArenas, for a private replay, are the arenas this one block
+	// uses (package replay); nil puts those buffers on the heap.
+	PrivateArenas any
+	IsSkipped     bool // True for slots that were skipped by the leader
 	// transactionDerivedState contains only trusted, nonserialized data derived
 	// from this exact in-memory block (and is shared by its shallow copies).
 	transactionDerivedState *transactionDerivedState

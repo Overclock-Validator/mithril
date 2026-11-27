@@ -4676,9 +4676,12 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 		SerializedParameterArena: SerializedParameterArena,
 	}
 	if block.PrivateReplay {
-		// No shared arena (parameters go to the heap), and vote cache and stake
-		// index changes stay in the bank; nothing ever publishes them.
+		// Never the shared arena: this replay's own, or the heap. Vote cache
+		// and stake index changes stay in the bank; nothing publishes them.
 		slotCtx.SerializedParameterArena = nil
+		if arenas := blockPrivateArenas(block); arenas != nil {
+			slotCtx.SerializedParameterArena = arenas.params
+		}
 		slotCtx.PrivateReplay = true
 		slotCtx.DeferVoteCachePublication = true
 		if use := blockHintUse(block); use != nil {
@@ -5441,7 +5444,13 @@ func recordFullToReplayed(block *b.Block) time.Time {
 // The arenas belong to the node's own replay workers, so a private replay,
 // whose workers run at the same time, takes none and allocates on the heap.
 func borrowedAccountArena(block *b.Block, worker int) *arena.Arena[sealevel.BorrowedAccount] {
-	if (block != nil && block.PrivateReplay) || worker < 0 || worker >= len(sealevel.BorrowedAccountArenas) {
+	if block != nil && block.PrivateReplay {
+		if arenas := blockPrivateArenas(block); arenas != nil && worker >= 0 && worker < len(arenas.borrowed) {
+			return arenas.borrowed[worker]
+		}
+		return nil
+	}
+	if worker < 0 || worker >= len(sealevel.BorrowedAccountArenas) {
 		return nil
 	}
 	return sealevel.BorrowedAccountArenas[worker]
