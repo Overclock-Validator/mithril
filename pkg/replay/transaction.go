@@ -757,6 +757,13 @@ func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.W
 	if capture != nil {
 		*capture = transactionMetadataCapture{budget: capture.budget}
 	}
+	// A watched transaction is also captured for the personal RPC index. That
+	// capture reads post-state once every other step below has finished, so its
+	// deferred finish is registered first and runs last.
+	rpcCap := startRPCCapture(tx)
+	if rpcCap != nil {
+		defer func() { rpcCap.finish(slotCtx, tx, feeInfo, computeUnits, executionErr) }()
+	}
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -814,7 +821,7 @@ func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.W
 
 	// Execute via pure function
 	var output LoadAndExecuteTransactionOutput
-	if executed != nil && metadata == nil {
+	if executed != nil && metadata == nil && rpcCap == nil {
 		output = *executed
 	} else {
 		input := transactionExecutionInput(slotCtx, tx, txMeta, arena, debugTx, captureTx)
@@ -824,7 +831,18 @@ func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.W
 			input.boundedMetadata = true
 			input.RecordInnerInstructions = true
 		}
+		if rpcCap != nil {
+			// An early execution records no logs, inner instructions or
+			// pre-fee account images, so a watched transaction runs here.
+			input.CapturePreBalances = true
+			input.CapturePreAccounts = true
+			input.RecordLogs = true
+			input.RecordInnerInstructions = true
+		}
 		output = LoadAndExecuteTransaction(input)
+	}
+	if rpcCap != nil {
+		rpcCap.observe(&output)
 	}
 	if result != nil {
 		defer func() {

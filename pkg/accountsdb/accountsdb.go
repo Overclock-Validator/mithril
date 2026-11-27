@@ -46,6 +46,9 @@ type AccountsDb struct {
 	accountObserversMu    sync.Mutex
 	accountObservers      map[AccountStateObserver]struct{}
 
+	// keySidecars is set by EnableKeySidecars; nil writes none.
+	keySidecars atomic.Pointer[keySidecar]
+
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
 	// Pebble index commit. Readers use that view for changed keys while the
@@ -53,6 +56,10 @@ type AccountsDb struct {
 	// this mutex and old snapshot reads still cannot publish stale cache bytes.
 	readCacheEpochMu metrics.TimedRWMutex
 	readCacheEpoch   uint64
+	// publishedThrough is the slot the visible durable state reaches. It moves
+	// with readCacheEpoch: forward when a fold installs pendingFold, backward on
+	// rewind. It can be ahead of durableThrough while the index commits.
+	publishedThrough uint64
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
 	batchHooks       batchReadTestHooks
@@ -507,6 +514,15 @@ func (accountsDb *AccountsDb) getCachedAccountAndEpoch(pubkey solana.PublicKey) 
 	defer accountsDb.readCacheEpochMu.RUnlock()
 	acct, ok, _ := accountsDb.getCachedAccountLocked(pubkey)
 	return acct, ok, accountsDb.readCacheEpoch
+}
+
+// ReadPublication returns the durable read epoch and the slot visible durable
+// state reaches. A reader that sees the same epoch before and after a read
+// observed one publication; through tells it which slots that state covers.
+func (accountsDb *AccountsDb) ReadPublication() (epoch, through uint64) {
+	accountsDb.readCacheEpochMu.RLock()
+	defer accountsDb.readCacheEpochMu.RUnlock()
+	return accountsDb.readCacheEpoch, accountsDb.publishedThrough
 }
 
 // getCachedAccountLocked requires readCacheEpochMu to be held for reading or

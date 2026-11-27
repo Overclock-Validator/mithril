@@ -72,7 +72,7 @@ func TestGetBalanceDoesNotMixNewAccountsWithOldRoot(t *testing.T) {
 	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
 	defer cancel()
 	_, err = server.GetBalance(deadline, mustRawParams(t, []interface{}{address.String()}))
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	requireRefusedRead(t, err, "a store folded past the published root must not answer for it")
 
 	server.SetRootedBankState(43, 41, 11)
 	got, err := server.GetBalance(t.Context(), mustRawParams(t, []interface{}{address.String()}))

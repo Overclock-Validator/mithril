@@ -47,6 +47,7 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 			global.SetLatestBlockHash(tc.hash)
 			global.SetBlockHeight(800)
 			replay.UpdateChainTipFromSlotCtxWithBankMetadata(bank, bank.Features, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{BlockHeight: 90})
+			server.SetSlotCtx(bank) // publishes the processed bank with its tip
 			response, err := server.SimulateTransaction(t.Context(), params)
 			require.NoError(t, err)
 			require.Equal(t, bank.Slot, response.Context.Slot)
@@ -83,6 +84,7 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 	})
 
 	replay.ResetChainTip()
+	server.SetSlotCtx(bank)
 	_, err = server.SimulateTransaction(t.Context(), params)
 	require.Error(t, err, "missing bank metadata must not fall back to unrelated process globals")
 
@@ -90,6 +92,7 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 	require.NoError(t, err)
 	other.UnrootedRead = nil
 	replay.UpdateChainTipFromSlotCtxWithBankMetadata(other, bank.Features, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{BlockHeight: 90})
+	server.SetSlotCtx(bank)
 	_, err = server.SimulateTransaction(t.Context(), params)
 	require.Error(t, err, "the same slot number does not establish the same bank generation")
 

@@ -192,6 +192,7 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 		// WAL-less commit succeeded but its explicit Flush reported an error.
 		db.readCacheEpochMu.LockAs("rewind")
 		db.readCacheEpoch++
+		db.publishedThrough = meta.ThroughSlot
 		db.resetReadCachesLocked()
 		db.readCacheEpochMu.Unlock()
 		if db.IndexWALDisabled {
@@ -329,6 +330,7 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	commitErr := batch.Commit(writeOpts)
 	if commitErr == nil {
 		db.readCacheEpoch++
+		db.publishedThrough = target.manifest.ThroughSlot
 		db.resetReadCachesLocked()
 	}
 	db.readCacheEpochMu.Unlock()

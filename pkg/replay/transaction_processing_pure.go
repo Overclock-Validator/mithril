@@ -74,6 +74,10 @@ type LoadAndExecuteTransactionInput struct {
 	// CapturePreBalances retains pre-fee balances in lean mode. Rich mode
 	// always captures them for RPC compatibility.
 	CapturePreBalances bool
+	// CapturePreAccounts snapshots every transaction account before fee
+	// deduction, as simulation does, for RPC capture of token balances.
+	CapturePreAccounts bool
+
 	// RecordLogs retains execution logs in lean mode. Rich mode always records
 	// them for RPC compatibility.
 	RecordLogs      bool
@@ -399,7 +403,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	// transactionAccts in place. Only the simulate handler reads this;
 	// block-replay callers leave it nil and ignore.
 	var preAccountSnapshots []*accounts.Account
-	if input.IsSimulation {
+	if input.IsSimulation || input.CapturePreAccounts {
 		preAccountSnapshots = make([]*accounts.Account, len(execCtx.TransactionContext.Accounts.Accounts))
 		for i, acct := range execCtx.TransactionContext.Accounts.Accounts {
 			if acct == nil {

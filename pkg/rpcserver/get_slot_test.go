@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
@@ -22,6 +23,16 @@ func TestGetSlotHTTP(t *testing.T) {
 	server := NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 512}, solana.Hash{})
 	t.Cleanup(func() { require.NoError(t, server.listener.Close()) })
 	server.SetRootedBankState(100, 90, 0)
+	// The processed bank at slot 150, published the way replay publishes its
+	// chain tip.
+	sysvars, err := sealevel.NewBankSysvars(150)
+	require.NoError(t, err)
+	tip := &sealevel.SlotCtx{Slot: 150, Blockhash: [32]byte{2}}
+	require.NoError(t, tip.PublishBankSysvars(sysvars))
+	replay.ResetChainTip()
+	t.Cleanup(replay.ResetChainTip)
+	replay.UpdateChainTipFromSlotCtxWithBankMetadata(tip, nil, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{BlockHeight: 120})
+	server.SetSlotCtx(tip)
 	httpServer := httptest.NewServer(server)
 	t.Cleanup(httpServer.Close)
 
@@ -105,8 +116,10 @@ func TestGetSlotHTTP(t *testing.T) {
 	})
 	t.Run("no rooted bank", func(t *testing.T) {
 		server.rootedBank.Store(nil)
-		check(t, `[]`, 0, 1)
-		check(t, `[{"commitment":"processed"}]`, 150, 0)
+		server.publishFallbackViews()
+		// Without a root the node serves no bank, processed included.
+		check(t, `[]`, 0, -32005)
+		check(t, `[{"commitment":"processed"}]`, 0, -32005)
 	})
 	t.Run("zero slot", func(t *testing.T) {
 		server.SetRootedBankState(0, 0, 0)

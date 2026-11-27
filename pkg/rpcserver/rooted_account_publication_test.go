@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +61,9 @@ func TestGetBalanceHTTPWaitsForFailedRewindRepair(t *testing.T) {
 	result, rpcError := call()
 	require.Nil(t, result, "partial rewind must not publish an account under the previous bank")
 	require.NotNil(t, rpcError)
-	require.Contains(t, rpcError.Message, context.DeadlineExceeded.Error())
+	if !strings.Contains(rpcError.Message, context.DeadlineExceeded.Error()) {
+		require.Equal(t, -32005, rpcError.Code, "refused as unhealthy: %s", rpcError.Message)
+	}
 
 	require.NoError(t, os.Remove(rewoundPath))
 	_, err = db.RewindToBatchBoundary(10)
@@ -109,7 +113,7 @@ func TestRootedAccountRPCsWaitForFailedRewindRepair(t *testing.T) {
 			require.Equal(t, uint64(20), db.DurableThrough())
 			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 			defer cancel()
-			require.ErrorIs(t, test.read(ctx, server), context.DeadlineExceeded,
+			requireRefusedRead(t, test.read(ctx, server),
 				"partial rewind must not publish account values under the previous bank")
 
 			require.NoError(t, os.Remove(rewoundPath))
@@ -121,5 +125,16 @@ func TestRootedAccountRPCsWaitForFailedRewindRepair(t *testing.T) {
 			require.Equal(t, uint64(10), rooted.Slot)
 			require.Equal(t, uint64(10), account.Lamports)
 		})
+	}
+}
+
+// requireRefusedRead accepts either way a read refuses inconsistent state:
+// waiting until the request deadline, or reporting the node unhealthy after
+// bounded retries.
+func requireRefusedRead(t *testing.T, err error, msg string) {
+	t.Helper()
+	var unhealthy *NodeUnhealthyError
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &unhealthy) {
+		t.Fatalf("%s: got %v", msg, err)
 	}
 }

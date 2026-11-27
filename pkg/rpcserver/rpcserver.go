@@ -17,11 +17,13 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/rpcindex"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
@@ -47,6 +49,7 @@ type rpcMethods interface {
 	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
 	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
 	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetFeeForMessage(context.Context, jsonrpc.RawParams) (GetFeeForMessageResp, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
 	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
@@ -54,19 +57,36 @@ type rpcMethods interface {
 	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetMinimumBalanceForRentExemption(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetRecentPrioritizationFees(context.Context, jsonrpc.RawParams) ([]RecentPrioritizationFee, error)
 	GetSignatureStatuses(context.Context, jsonrpc.RawParams) (GetSignatureStatusesResp, error)
+	GetSignaturesForAddress(context.Context, jsonrpc.RawParams) ([]SignatureForAddress, error)
 	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetSlotStatus(context.Context, jsonrpc.RawParams) (GetSlotStatusResp, error)
+	GetTokenAccountBalance(context.Context, jsonrpc.RawParams) (GetTokenAmountResp, error)
+	GetTokenAccountsByOwner(context.Context, jsonrpc.RawParams) (GetTokenAccountsByOwnerResp, error)
+	GetTokenSupply(context.Context, jsonrpc.RawParams) (GetTokenAmountResp, error)
 	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
 	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
 	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+	IsBlockhashValid(context.Context, jsonrpc.RawParams) (IsBlockhashValidResp, error)
 }
 
 type RpcServer struct {
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
+
+	// bankViews holds the completed banks replay publishes for reads.
+	bankViews bankview.Publisher
+	// history serves address history and transaction records; nil when off.
+	history *rpcindex.Indexer
+	// enumerator finds watched wallets' pre-existing token accounts.
+	enumerator *rpcindex.Enumerator
+	// priorityFees records recent blocks' prioritization fees.
+	priorityFees prioritizationFees
 
 	isReady              bool
 	rpcService           *jsonrpc.RPCServer
@@ -131,31 +151,40 @@ type rootedBankState struct {
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
-	"getAccountInfo":         {},
-	"getMultipleAccounts":    {},
-	"getBalance":             {},
-	"getBankHash":            {},
-	"getBlock":               {},
-	"getBlocks":              {},
-	"getBlockHeight":         {},
-	"getBlockProduction":     {},
-	"getEpochInfo":           {},
-	"getFirstAvailableBlock": {},
-	"getGenesisHash":         {},
-	"getHistoryCoverage":     {},
-	"getInflationReward":     {},
-	"getHealth":              {},
-	"getIdentity":            {},
-	"getLatestBlockhash":     {},
-	"getLeaderSchedule":      {},
-	"getSignatureStatuses":   {},
-	"getSlot":                {},
-	"getTransaction":         {},
-	"getVoteAccounts":        {},
-	"getVersion":             {},
-	"minimumLedgerSlot":      {},
-	"sendTransaction":        {},
-	"simulateTransaction":    {},
+	"getAccountInfo":                    {},
+	"getBalance":                        {},
+	"getBankHash":                       {},
+	"getBlock":                          {},
+	"getBlockHeight":                    {},
+	"getBlockProduction":                {},
+	"getBlocks":                         {},
+	"getEpochInfo":                      {},
+	"getFeeForMessage":                  {},
+	"getFirstAvailableBlock":            {},
+	"getGenesisHash":                    {},
+	"getHealth":                         {},
+	"getHistoryCoverage":                {},
+	"getIdentity":                       {},
+	"getInflationReward":                {},
+	"getLatestBlockhash":                {},
+	"getLeaderSchedule":                 {},
+	"getMinimumBalanceForRentExemption": {},
+	"getMultipleAccounts":               {},
+	"getRecentPrioritizationFees":       {},
+	"getSignatureStatuses":              {},
+	"getSignaturesForAddress":           {},
+	"getSlot":                           {},
+	"getSlotStatus":                     {},
+	"getTokenAccountBalance":            {},
+	"getTokenAccountsByOwner":           {},
+	"getTokenSupply":                    {},
+	"getTransaction":                    {},
+	"getVersion":                        {},
+	"getVoteAccounts":                   {},
+	"isBlockhashValid":                  {},
+	"minimumLedgerSlot":                 {},
+	"sendTransaction":                   {},
+	"simulateTransaction":               {},
 }
 
 func (rpcServer *RpcServer) EnableBlockHistory(dir string, retentionSlots, rootedSlot uint64) error {
@@ -335,6 +364,7 @@ func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCou
 		BlockHeight:      blockHeight,
 		TransactionCount: transactionCount,
 	})
+	rpcServer.publishFallbackViews()
 }
 
 // SetRootedExecutionBank completes the matching durable publication. An old or
@@ -359,6 +389,7 @@ func (rpcServer *RpcServer) SetRootedExecutionBank(bank *replay.ChainTipSnapshot
 			rpcServer.executionGeneration++
 			rpcServer.executionInvalidated = false
 			rpcServer.slotCtxMu.Unlock()
+			rpcServer.publishFallbackViews()
 			return
 		}
 	}
@@ -515,6 +546,7 @@ func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.executionGeneration++
 	rpcServer.executionInvalidated = slotCtx == nil
 	rpcServer.slotCtxMu.Unlock()
+	rpcServer.publishFallbackViews()
 }
 
 func (rpcServer *RpcServer) SetIdentity(identity string) {

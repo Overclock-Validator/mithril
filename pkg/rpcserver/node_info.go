@@ -57,6 +57,7 @@ func (rpcServer *RpcServer) InvalidateHealth() {
 	rpcServer.executionGeneration++
 	rpcServer.executionInvalidated = true
 	rpcServer.slotCtxMu.Unlock()
+	rpcServer.publishFallbackViews()
 }
 
 func nodeHealth(ready bool, localSlot, clusterSlot uint64) (string, error) {

@@ -74,7 +74,7 @@ func TestGetMultipleAccountsParsedVoteConsumer(t *testing.T) {
 	require.NotContains(t, empty, "error")
 	for _, config := range []string{
 		`{"encoding":"jsonParsed","dataSlice":{"offset":0,"length":1}}`,
-		`{"encoding":"jsonParsed","commitment":"processed"}`,
+		`{"encoding":"jsonParsed","commitment":"latest"}`,
 	} {
 		bad := getBlockHistoryHTTPCall(t, endpoint, "getMultipleAccounts", fmt.Sprintf(`[[%q],%s]`, vote, config))
 		require.Contains(t, bad, "error")

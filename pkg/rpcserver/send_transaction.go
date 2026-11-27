@@ -109,11 +109,9 @@ func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawPa
 		}
 		defer release()
 	}
-	commitment := conf.preflightCommitment
-	if conf.skipPreflight {
-		commitment = "processed"
-	}
-	slotCtx, resolved, view, _, lookupErr, err := rpcServer.prepareSimulation(ctx, tx, commitment, conf.minContextSlot, nil, !conf.skipPreflight)
+	// As in Agave, the preflight-commitment bank sanitizes the transaction and
+	// resolves its lookup tables even when preflight is skipped.
+	slotCtx, resolved, view, _, lookupErr, err := rpcServer.prepareSimulation(ctx, tx, conf.preflightCommitment, conf.minContextSlot, nil, !conf.skipPreflight)
 	if err != nil {
 		return "", err
 	}

@@ -87,6 +87,7 @@ func TestBlockHeightBankContract(t *testing.T) {
 	})
 	t.Run("no root", func(t *testing.T) {
 		server.rootedBank.Store(nil)
+		server.publishFallbackViews()
 		defer server.SetRootedBankState(100, 70, 0)
 		_, err := server.GetBlockHeight(t.Context(), jsonrpc.RawParams(`[]`))
 		require.Error(t, err)
@@ -113,6 +114,7 @@ func TestBlockHeightBankContract(t *testing.T) {
 	t.Run("reset and replacement generation", func(t *testing.T) {
 		params := jsonrpc.RawParams(`[{"commitment":"processed"}]`)
 		replay.ResetChainTip()
+		server.SetSlotCtx(nil) // replay withdraws its tip together with the chain tip
 		_, err := server.GetBlockHeight(t.Context(), params)
 		require.Error(t, err)
 		publish(140, 85)

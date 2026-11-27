@@ -227,3 +227,29 @@ func WriteSlotHistorySysvar(accts *accounts.Accounts, slotHistory SysvarSlotHist
 		panic(err)
 	}
 }
+
+// SlotHistoryCheck is the result of SysvarSlotHistory.Check.
+type SlotHistoryCheck uint8
+
+const (
+	SlotHistoryFound SlotHistoryCheck = iota
+	SlotHistoryNotFound
+	SlotHistoryTooOld
+	SlotHistoryFuture
+)
+
+// Check reports whether slot was a block in this history, like Agave's
+// SlotHistory::check.
+func (sr *SysvarSlotHistory) Check(slot uint64) SlotHistoryCheck {
+	if slot >= sr.NextSlot {
+		return SlotHistoryFuture
+	}
+	if sr.NextSlot-slot > slotHistoryMaxEntries || sr.Bits.Bits.BlocksLen == 0 {
+		return SlotHistoryTooOld
+	}
+	blockIdx := (slot / bitsPerBlock) % sr.Bits.Bits.BlocksLen
+	if sr.Bits.Bits.Blocks[blockIdx]&(uint64(1)<<(slot%bitsPerBlock)) != 0 {
+		return SlotHistoryFound
+	}
+	return SlotHistoryNotFound
+}

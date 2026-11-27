@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
@@ -63,15 +64,20 @@ func (server *RpcServer) GetSignatureStatuses(ctx context.Context, p jsonrpc.Raw
 	}
 	response := GetSignatureStatusesResp{Context: GetBalanceRespContext{APIVersion: "mithril 0.1", Slot: view.Tip.Slot},
 		Value: make([]*SignatureStatusValue, len(signatures))}
+	levels := server.unrootedResultLevels(view)
 	for i, result := range view.Results {
 		if !result.Found {
 			continue
 		}
 		value := &SignatureStatusValue{Slot: result.Slot, Err: json.RawMessage("null"),
 			Status: map[string]json.RawMessage{"Ok": json.RawMessage("null")}, ConfirmationStatus: "processed"}
-		if result.Finalized {
+		switch {
+		case result.Finalized || levels[result.Slot] >= bankview.Finalized:
 			value.ConfirmationStatus = "finalized"
-		} else {
+		case levels[result.Slot] == bankview.Notarized:
+			value.ConfirmationStatus = "confirmed"
+			value.Confirmations = new(uint64)
+		default:
 			value.Confirmations = new(uint64)
 		}
 		if len(result.Error) > 0 {
@@ -81,6 +87,40 @@ func (server *RpcServer) GetSignatureStatuses(ctx context.Context, p jsonrpc.Raw
 		response.Value[i] = value
 	}
 	return response, nil
+}
+
+// unrootedResultLevels reports, for each slot of a found but not yet rooted
+// result, the highest bank-view level that slot has reached on the chain
+// replay follows. The result cache only distinguishes rooted from processed;
+// the views add notarization ("confirmed") and finality that the root has not
+// caught up with. A slot the views do not hold stays processed.
+func (server *RpcServer) unrootedResultLevels(view txstatus.ResultView) map[uint64]bankview.Level {
+	var slots []uint64
+	for _, result := range view.Results {
+		if result.Found && !result.Finalized {
+			slots = append(slots, result.Slot)
+		}
+	}
+	levels := make(map[uint64]bankview.Level, len(slots))
+	if len(slots) == 0 {
+		return levels
+	}
+	_, _, statuses, err := server.bankViews.SlotStatuses(slots)
+	if err != nil {
+		return levels
+	}
+	for _, status := range statuses {
+		if status.FromHistory {
+			continue
+		}
+		switch status.Status {
+		case bankview.Notarized.String():
+			levels[status.Slot] = bankview.Notarized
+		case bankview.Finalized.String(), bankview.Durable.String():
+			levels[status.Slot] = bankview.Finalized
+		}
+	}
+	return levels
 }
 
 func decodeSignatureStatusParams(p jsonrpc.RawParams) ([]solana.Signature, bool, error) {

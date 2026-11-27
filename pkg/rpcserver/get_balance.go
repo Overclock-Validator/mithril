@@ -2,19 +2,20 @@ package rpcserver
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 
-	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
 )
 
 type GetBalanceResp struct {
-	Context GetBalanceRespContext `json:"context"`
-	Value   uint64                `json:"value"`
+	Context GetAccountInfoRespContext `json:"context"`
+	Value   uint64                    `json:"value"`
 }
 
+// GetBalanceRespContext is the context of responses that report only a slot.
 type GetBalanceRespContext struct {
 	APIVersion string `json:"apiVersion"`
 	Slot       uint64 `json:"slot"`
@@ -24,64 +25,46 @@ func (rpcServer *RpcServer) GetBalance(ctx context.Context, p jsonrpc.RawParams)
 	if err := ctx.Err(); err != nil {
 		return GetBalanceResp{}, err
 	}
-
-	params, err := decodeOptionalParams(p)
-	if err != nil {
-		return GetBalanceResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
+	var params []json.RawMessage
+	if len(p) != 0 {
+		if err := json.Unmarshal(p, &params); err != nil {
+			return GetBalanceResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
+		}
 	}
 	if len(params) < 1 || len(params) > 2 {
 		return GetBalanceResp{}, &InvalidParamsError{Message: "getBalance requires an address and optional config"}
 	}
-	address, ok := params[0].(string)
-	if !ok {
+	var address string
+	if err := json.Unmarshal(params[0], &address); err != nil {
 		return GetBalanceResp{}, &InvalidParamsError{Message: "getBalance requires an address as first parameter"}
 	}
-	pubkey, err := solana.PublicKeyFromBase58(address)
+	pk, err := solana.PublicKeyFromBase58(address)
 	if err != nil {
 		return GetBalanceResp{}, &InvalidParamsError{Message: "Invalid param: Invalid"}
 	}
-
-	minContextSlot, err := parseBalanceConfig(params)
+	conf, err := parseAccountConfig(params, nil)
 	if err != nil {
 		return GetBalanceResp{}, err
 	}
-	rooted, account, err := rpcServer.readRootedAccount(ctx, pubkey)
-	if err != nil && !errors.Is(err, accountsdb.ErrNoAccount) {
-		return GetBalanceResp{}, fmt.Errorf("read balance at rooted slot %d: %w", rooted.Slot, err)
-	}
-	if minContextSlot != nil && rooted.Slot < *minContextSlot {
-		return GetBalanceResp{}, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
-	}
-
-	var lamports uint64
-	if account != nil {
-		lamports = account.Lamports
-	}
-
-	return GetBalanceResp{
-		Context: GetBalanceRespContext{APIVersion: "mithril 0.1", Slot: rooted.Slot},
-		Value:   lamports,
-	}, nil
+	var resp GetBalanceResp
+	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
+		acct, err := r.Account(pk)
+		if err != nil {
+			return err
+		}
+		resp = GetBalanceResp{Context: accountContext(r.View.Slot)}
+		if acct != nil {
+			resp.Value = acct.Lamports
+		}
+		return nil
+	})
+	return resp, err
 }
 
-func parseBalanceConfig(params []interface{}) (*uint64, error) {
-	if len(params) == 1 || params[1] == nil {
-		return nil, nil
+func firstString(params []interface{}) (string, bool) {
+	if len(params) < 1 {
+		return "", false
 	}
-	config, ok := params[1].(map[string]interface{})
-	if !ok {
-		return nil, &InvalidParamsError{Message: "invalid getBalance config"}
-	}
-	if err := validateRootedCommitment(config["commitment"]); err != nil {
-		return nil, err
-	}
-	value, exists := config["minContextSlot"]
-	if !exists || value == nil {
-		return nil, nil
-	}
-	minContextSlot, err := rpcUint64(value, "minContextSlot")
-	if err != nil {
-		return nil, err
-	}
-	return &minContextSlot, nil
+	s, ok := params[0].(string)
+	return s, ok
 }

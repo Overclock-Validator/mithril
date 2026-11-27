@@ -12,6 +12,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
@@ -21,8 +22,6 @@ const (
 	maxSimulationAccountBytes = 80 << 20
 	maxSimulationAccountKeys  = 2048
 )
-
-var errSimulationViewChanged = errors.New("simulation account view changed")
 
 type simulationAccountSource interface {
 	GetAccountWithDataLimit(uint64, solana.PublicKey, uint64) (*accounts.Account, error)
@@ -152,120 +151,108 @@ func validateTransactionCommitment(commitment string) error {
 	}
 }
 
-// selectSimulationBank returns a short-lived validation fence, not a lock held
-// through account I/O or VM execution. Confirmed and finalized share our durable
-// root; neither may silently use the newer processed account overlay.
-func (server *RpcServer) selectSimulationBank(commitment string, minimum *uint64) (*replay.ChainTipSnapshot, simulationAccountSource, func() bool, error) {
-	if server.acctsDb == nil {
-		return nil, nil, nil, fmt.Errorf("node has no simulation accounts database")
+// viewSimulationSource reads simulation accounts at one bank view's slot.
+// The view read's validation, not this source, decides whether the captured
+// set is coherent.
+type viewSimulationSource struct{ r *bankview.Read }
+
+func (source viewSimulationSource) GetAccountWithDataLimit(_ uint64, key solana.PublicKey, limit uint64) (*accounts.Account, error) {
+	acct, err := source.r.Account(key)
+	if err != nil {
+		return nil, err
 	}
-	server.slotCtxMu.RLock()
-	generation, invalidated := server.executionGeneration, server.executionInvalidated
-	completed, ready := server.slotCtx, server.healthReady
-	server.slotCtxMu.RUnlock()
-	if invalidated {
-		return nil, nil, nil, fmt.Errorf("node is recovering its execution state")
+	if acct == nil {
+		return nil, accountsdb.ErrNoAccount
 	}
-	readyGeneration := func() bool {
-		server.historyRecoveryMu.RLock()
-		pending := server.historyRecoveryPending
-		server.historyRecoveryMu.RUnlock()
-		server.slotCtxMu.RLock()
-		defer server.slotCtxMu.RUnlock()
-		return !pending && !server.executionInvalidated && generation == server.executionGeneration
+	if uint64(len(acct.Data)) > limit {
+		return nil, accountsdb.ErrAccountDataLimit
 	}
-	root := server.rootedBank.Load()
-	var bank *replay.ChainTipSnapshot
-	var source simulationAccountSource = server.acctsDb
-	var version uint64
-	var valid func() bool
-	if commitment == "processed" {
-		tip := replay.ChainTipParentContext()
-		if !ready || completed == nil || tip.Generation == 0 || tip.BankSysvars == nil || tip.Slot != completed.Slot || tip.BankSysvars != completed.BankSysvars() || tip.LastBlockhash != solana.Hash(completed.Blockhash) {
-			return nil, nil, nil, fmt.Errorf("node has no processed execution bank")
-		}
-		bank = &tip
-		// Promotion can prune the overlay after publishing this tip. The exact
-		// same completed bank remains usable through its now-durable root.
-		if root != nil && root.executionBank != nil && root.Slot == tip.Slot && root.executionBank.LastBlockhash == tip.LastBlockhash && root.executionBank.Bankhash == tip.Bankhash {
-			bank = root.executionBank
-		} else {
-			if !tip.AccountVersionsReady {
-				return nil, nil, nil, errSimulationViewChanged
-			}
-			version = tip.AccountVersion
-			if tip.UnrootedRead != nil {
-				var ok bool
-				source, ok = tip.UnrootedRead.(simulationAccountSource)
-				if !ok {
-					return nil, nil, nil, fmt.Errorf("processed account reader does not support bounded reads")
-				}
-			}
-			valid = func() bool {
-				latest, stable := server.acctsDb.CommittedAccountVersion()
-				current := replay.ChainTipParentContext()
-				if !readyGeneration() || !stable || latest != version || current.Generation != tip.Generation {
-					return false
-				}
-				if reader, ok := tip.UnrootedRead.(interface{ AccountReadVersion() uint64 }); ok {
-					return reader.AccountReadVersion() == tip.UnrootedVersion
-				}
-				return tip.UnrootedRead == nil
-			}
-		}
-	} else if root != nil {
-		bank = root.executionBank
-	}
-	if bank == nil {
-		return nil, nil, nil, fmt.Errorf("node has no rooted execution bank")
-	}
-	if minimum != nil && bank.Slot < *minimum {
-		return nil, nil, nil, &MinContextSlotNotReachedError{ContextSlot: bank.Slot}
-	}
-	if valid == nil {
-		version = root.executionVersion
-		if !root.executionReady {
-			return nil, nil, nil, errSimulationViewChanged
-		}
-		if server.rootedPublicationPending(bank.Slot) {
-			return nil, nil, nil, errSimulationViewChanged
-		}
-		valid = func() bool {
-			latest, stable := server.acctsDb.CommittedAccountVersion()
-			if !root.executionReady {
-				stable = false
-			}
-			return readyGeneration() && stable && latest == version && server.rootedBank.Load() == root && !server.rootedPublicationPending(bank.Slot)
-		}
-	}
-	if !valid() {
-		return nil, nil, nil, errSimulationViewChanged
-	}
-	return bank, source, valid, nil
+	out := acct.Clone()
+	out.Key = key
+	return out, nil
 }
 
+// viewExecutionBank builds the execution parameters of the bank r selects, as
+// Agave simulates against a frozen bank: its sysvars, features, fee governor,
+// blockhash queue and epoch stakes. Sysvars are read as accounts at the view's
+// slot, so views retain no sysvar snapshot.
+func viewExecutionBank(ctx context.Context, r *bankview.Read) (*replay.ChainTipSnapshot, error) {
+	view := r.View
+	if view.Features == nil {
+		return nil, fmt.Errorf("bank %d has no feature set", view.Slot)
+	}
+	var keys []solana.PublicKey
+	_ = sealevel.RangeBankSysvarAddresses(func(key solana.PublicKey) error {
+		keys = append(keys, key)
+		return nil
+	})
+	found, err := r.Accounts(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	present := make([]*accounts.Account, 0, len(found))
+	for i, acct := range found {
+		if acct == nil {
+			continue // for example the deprecated Fees sysvar
+		}
+		owned := acct.Clone()
+		owned.Key = keys[i]
+		present = append(present, owned)
+	}
+	sysvars, err := sealevel.NewBankSysvarsOwned(view.Slot, present...)
+	if err != nil {
+		return nil, fmt.Errorf("bank %d sysvars: %w", view.Slot, err)
+	}
+	governor := view.FeeRateGovernor
+	return &replay.ChainTipSnapshot{
+		Slot: view.Slot, Bankhash: view.Bankhash, BlockHeight: view.BlockHeight,
+		Features: view.Features, PrevFeeGovernor: &governor,
+		LastBlockhash: view.Blockhash, LatestEvictedBlockhash: [32]byte(view.LatestEvictedBlockhash),
+		BankSysvars: sysvars, EpochStakes: view.EpochStakes, TotalEpochStake: view.TotalEpochStake,
+	}, nil
+}
+
+// prepareSimulation captures, inside one validated bank-view read at the
+// requested commitment, every account the transaction can load, then seals the
+// capture so execution never reads live state. A fork switch or fold that
+// overlaps the capture invalidates the read and bankview.Publisher.Do runs
+// the capture again.
 func (server *RpcServer) prepareSimulation(ctx context.Context, tx *solana.Transaction, commitment string, minimum *uint64, responseKeys []solana.PublicKey, captureExecution bool) (*sealevel.SlotCtx, *solana.Transaction, *simulationAccounts, *replay.ChainTipSnapshot, *replay.TransactionError, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, nil, nil, err
-		}
-		bank, source, valid, err := server.selectSimulationBank(commitment, minimum)
-		if err == errSimulationViewChanged {
-			continue
-		}
+	if server.acctsDb == nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("node has no simulation accounts database")
+	}
+	conf := commitmentConfig{level: bankview.Finalized}
+	if commitment != "" {
+		level, err := bankview.ParseCommitment(commitment)
 		if err != nil {
-			return nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, &InvalidParamsError{Message: "invalid commitment"}
 		}
-		view := &simulationAccounts{bank: bank, source: source, accounts: make(map[solana.PublicKey]*accounts.Account), remaining: maxSimulationAccountBytes}
-		slotCtx, err := newSimulationBankContext(bank, server.acctsDb, view)
-		if err != nil {
-			return nil, nil, nil, nil, nil, err
+		conf.level = level
+	}
+	if minimum != nil {
+		conf.minContextSlot = *minimum
+	}
+	var (
+		slotCtx  *sealevel.SlotCtx
+		resolved *solana.Transaction
+		view     *simulationAccounts
+		bank     *replay.ChainTipSnapshot
+		txErr    *replay.TransactionError
+	)
+	err := server.readView(ctx, conf, func(r *bankview.Read) error {
+		var err error
+		if bank, err = viewExecutionBank(ctx, r); err != nil {
+			return err
+		}
+		view = &simulationAccounts{bank: bank, source: viewSimulationSource{r: r}, accounts: make(map[solana.PublicKey]*accounts.Account), remaining: maxSimulationAccountBytes}
+		if slotCtx, err = newSimulationBankContext(bank, server.acctsDb, view); err != nil {
+			return err
 		}
 		slotCtx.TraceCtx = ctx
 		for _, lookup := range tx.Message.AddressTableLookups {
 			view.capture(ctx, lookup.AccountKey)
 		}
-		resolved, txErr := replay.ResolveAddressTableLookups(slotCtx, tx)
+		resolved, txErr = replay.ResolveAddressTableLookups(slotCtx, tx)
 		if txErr == nil && captureExecution {
 			for _, key := range append(append([]solana.PublicKey(nil), resolved.Message.AccountKeys...), responseKeys...) {
 				view.capture(ctx, key)
@@ -289,33 +276,30 @@ func (server *RpcServer) prepareSimulation(ctx context.Context, tx *solana.Trans
 				}
 			}
 		}
-		if !valid() {
-			continue
-		}
-		if view.err != nil {
-			return nil, nil, nil, nil, nil, view.err
-		}
-		if txErr == nil && captureExecution {
-			// Legacy account loading reads the slot's preloaded account set.
-			// Match replay's absent-account representation without consulting live
-			// state again; the reader still retains absence for response lookups.
-			for key, acct := range view.accounts {
-				if acct == nil {
-					acct = &accounts.Account{Key: key, RentEpoch: math.MaxUint64}
-				}
-				if err := slotCtx.SetAccount(key, acct); err != nil {
-					return nil, nil, nil, nil, nil, err
-				}
+		return view.err
+	})
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if txErr == nil && captureExecution {
+		// Legacy account loading reads the slot's preloaded account set.
+		// Match replay's absent-account representation without consulting live
+		// state again; the reader still retains absence for response lookups.
+		for key, acct := range view.accounts {
+			if acct == nil {
+				acct = &accounts.Account{Key: key, RentEpoch: math.MaxUint64}
+			}
+			if err := slotCtx.SetAccount(key, acct); err != nil {
+				return nil, nil, nil, nil, nil, err
 			}
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, nil, nil, err
-		}
-		view.sealed = true
-		view.source = nil
-		return slotCtx, resolved, view, bank, txErr, nil
 	}
-	return nil, nil, nil, nil, nil, errSimulationViewChanged
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	view.sealed = true
+	view.source = nil
+	return slotCtx, resolved, view, bank, txErr, nil
 }
 
 // newSimulationBankContext uses completed-bank parameters with request-local

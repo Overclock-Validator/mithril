@@ -113,6 +113,26 @@ func PayerCanFund(slotCtx *sealevel.SlotCtx, tx *solana.Transaction) error {
 	return ValidateFeePayerWithFeatures(payer, feeInfo.TotalFee, RentForSlot(slotCtx), feats)
 }
 
+// FeeForTransaction computes the fee replay would charge tx, without loading
+// the fee payer. It serves fee quotes such as getFeeForMessage.
+func FeeForTransaction(tx *solana.Transaction, feats *features.Features) (*TxFeeInfo, error) {
+	if tx == nil {
+		return nil, ErrFeePayerNotFound
+	}
+	if feats == nil {
+		feats = features.NewFeaturesDefault()
+	}
+	instrs, err := feeInstructions(tx)
+	if err != nil {
+		return nil, err
+	}
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, feats)
+	if err != nil {
+		return nil, err
+	}
+	return CalculateTxFees(tx, instrs, limits, feats), nil
+}
+
 // ValidateTransactionFeePayer performs the fee-payer phase of Agave's
 // transaction loader without mutating bank state. It deliberately runs before
 // loading the remaining transaction accounts so fee-payer errors take

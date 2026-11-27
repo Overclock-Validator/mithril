@@ -275,3 +275,54 @@ func TestWorkingSetModelAgainstShadow(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkingSetLookupAtReturnsVersionAsOfSlot(t *testing.T) {
+	w := NewWorkingSet()
+	w.Add(10, []*Account{wsAcct(1, 10)})
+	w.Add(12, []*Account{wsAcct(1, 12), wsAcct(2, 12)})
+	w.Add(13, []*Account{wsAcct(1, 13)})
+
+	for _, tc := range []struct {
+		slot     uint64
+		key      byte
+		lamports uint64
+		found    bool
+	}{
+		{slot: 9, key: 1},
+		{slot: 10, key: 1, lamports: 10, found: true},
+		{slot: 11, key: 1, lamports: 10, found: true},
+		{slot: 12, key: 1, lamports: 12, found: true},
+		{slot: 99, key: 1, lamports: 13, found: true},
+		{slot: 11, key: 2},
+		{slot: 12, key: 2, lamports: 12, found: true},
+		{slot: 99, key: 3},
+	} {
+		a, ok := w.LookupAt(wsKey(tc.key), tc.slot)
+		require.Equal(t, tc.found, ok, "key %d at slot %d", tc.key, tc.slot)
+		if ok {
+			assert.Equal(t, tc.lamports, a.Lamports, "key %d at slot %d", tc.key, tc.slot)
+		}
+	}
+
+	w.PromotePrefix(12)
+	a, ok := w.LookupAt(wsKey(1), 99)
+	require.True(t, ok)
+	assert.Equal(t, uint64(13), a.Lamports)
+	_, ok = w.LookupAt(wsKey(1), 12)
+	assert.False(t, ok, "promoted versions belong to the durable store")
+}
+
+func TestWorkingSetGenerationChangesOnlyOnEviction(t *testing.T) {
+	w := NewWorkingSet()
+	start := w.Generation()
+	w.Add(1, []*Account{wsAcct(1, 1)})
+	w.Add(2, []*Account{wsAcct(1, 2)})
+	w.PromotePrefix(1)
+	w.EvictFrom(5) // nothing held at or above slot 5
+	assert.Equal(t, start, w.Generation())
+
+	w.EvictFrom(2)
+	after := w.Generation()
+	assert.Equal(t, start+2, after)
+	assert.Zero(t, after%2, "generation must be even once eviction completes")
+}

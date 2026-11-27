@@ -397,6 +397,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 	if err := exec.loadTransactionAccounts(view); err != nil {
 		return err
 	}
+	recordFeeTransactions(exec.slotCtx, txs)
 
 	exec.setReplayStage("tx_loop")
 	start := time.Now()
@@ -786,6 +787,7 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	// when empty, so the bankhash is recorded). Nothing reaches disk here: rooted
 	// slots become durable only when promotion folds them.
 	recordSlotStakeChange(tail, slotCtx, modifiedAccts)
+	discoverTokenAccounts(slotCtx, modifiedAccts)
 	tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
 	persistedHashes.Set(block.Slot, persistedBankhash)
 	metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(blockUpdateStart)

@@ -160,6 +160,7 @@ var (
 	rpcWatchAddresses     []string
 	rpcWatch              *replay.TransactionWatchSet
 	rpcServe              rpcServePlan
+	rpcWalletIndexDir     string
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -563,6 +564,7 @@ func init() {
 	Run.Flags().Int64Var(&rpcTransactionHistory.RetentionSlots, "rpc-transaction-history-slots", 16384, "Maximum transaction history age in slots")
 	Run.Flags().Int64Var(&rpcTransactionHistory.MaxMiB, "rpc-transaction-history-max-mib", 1024, "Logical transaction history budget in MiB (not a physical disk quota)")
 	Run.Flags().Int64Var(&rpcTransactionHistory.ReserveMiB, "rpc-transaction-history-reserve-mib", 2048, "Minimum free disk space for transaction history writes in MiB")
+	Run.Flags().StringVar(&rpcWalletIndexDir, "rpc-wallet-index-dir", "", "Directory of the watched-wallet index (address history and token accounts) at rpc.serve wallet or above with rpc.watch set (default <accounts>/rpc-wallet-index)")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -970,9 +972,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if rpcWatch, watchErr = replay.NewTransactionWatchSet(rpcWatchAddresses); watchErr != nil {
 		return fmt.Errorf("rpc.watch: %w", watchErr)
 	}
-	if rpcWatch != nil && !rpcServe.TransactionHistory {
-		return errors.New("rpc.watch selects what transaction history records; set rpc.serve to history")
+	if rpcWatch != nil && rpcServe.Level < rpcServeWallet {
+		return errors.New("rpc.watch selects the wallets this node indexes and what transaction history records; set rpc.serve to wallet or history")
 	}
+	rpcWalletIndexDir = getString("rpc-wallet-index-dir", "rpc.wallet_index_dir")
 	resolvedTxParallelism := txParallelismForMode(consensusMode, txParallelism, txParallelismExplicit, runtime.NumCPU())
 	if resolvedTxParallelism != txParallelism {
 		txParallelism = resolvedTxParallelism
@@ -2708,12 +2711,46 @@ postBootstrap:
 		}
 		publishRPCBankState(rpcServer, mithrilState)
 		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, resumeState)
+		if rpcServe.Level >= rpcServeWallet {
+			rpcServer.EnablePrioritizationFees()
+		}
+		// The watched-wallet index serves getSignaturesForAddress and token
+		// account methods for the rpc.watch wallets, including token accounts
+		// they owned before the node started.
+		if rpcServe.Level >= rpcServeWallet && rpcWatch != nil {
+			wallets := make([]solana.PublicKey, 0, len(rpcWatchAddresses))
+			for _, s := range rpcWatchAddresses {
+				wallets = append(wallets, solana.MustPublicKeyFromBase58(s))
+			}
+			indexDir := rpcWalletIndexDir
+			if indexDir == "" {
+				indexDir = filepath.Join(accountsPath, "rpc-wallet-index")
+			}
+			if err := rpcServer.EnableHistory(indexDir, solana.MustHashFromBase58(networkGenesisHash), wallets, mithrilState.LastRootedSlot); err != nil {
+				klog.Fatalf("unable to open the RPC wallet index: %v", err)
+			}
+		}
 		rpcServer.SetIdentitySource(func() string { return validatorIdentity.PublicKey().String() })
 		if err := rpcServer.Start(); err != nil {
 			klog.Fatalf("start RPC server: %v", err)
 		}
 		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
 		mlog.Log.Infof("%s", rpcServe.summary(rpcTransactionHistory, rpcWatch.Len()))
+		// Solana subscriptions listen on the next port, as Agave's do.
+		if rpcPort < 65535 {
+			wsAddr := net.JoinHostPort(rpcBindAddress, rpcserver.PubSubPort(uint16(rpcPort)))
+			if wsListener, err := net.Listen("tcp", wsAddr); err != nil {
+				mlog.Log.Warnf("RPC subscriptions disabled: listen on %s: %v", wsAddr, err)
+			} else {
+				pubsub := rpcserver.NewPubSub(rpcServer)
+				go func() {
+					if err := pubsub.Serve(context.Background(), wsListener); err != nil {
+						mlog.Log.Warnf("RPC subscriptions stopped: %v", err)
+					}
+				}()
+				mlog.Log.Infof("Started RPC subscriptions on %s", wsAddr)
+			}
+		}
 	}
 
 	// The Alpenglow observer is forkchoice authority in both consensus modes.

@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -17,20 +16,6 @@ import (
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
-
-type blockhashReadContext struct {
-	context.Context
-	checks int
-	action func()
-}
-
-func (ctx *blockhashReadContext) Err() error {
-	ctx.checks++
-	if ctx.checks == 2 {
-		ctx.action()
-	}
-	return ctx.Context.Err()
-}
 
 func TestLatestBlockhashBankHTTP(t *testing.T) {
 	oldSlot, oldHeight, oldHash := global.Slot(), global.BlockHeight(), global.LatestBlockHash()
@@ -165,42 +150,36 @@ func TestLatestBlockhashUnavailableBankData(t *testing.T) {
 	})
 }
 
-func TestLatestBlockhashReselectsPublishedAccountBank(t *testing.T) {
-	for _, publish := range []bool{true, false} {
-		t.Run(map[bool]string{true: "published", false: "unpublished"}[publish], func(t *testing.T) {
-			db := newRPCAccountsDB(t)
-			commit := func(slot uint64, hash byte) {
-				recent := sealevel.SysvarRecentBlockhashes{{Blockhash: [32]byte{hash}}}
-				acct := &accounts.Account{Key: solana.PublicKey(sealevel.SysvarRecentBlockHashesAddr), Lamports: 1, Data: recent.MustMarshal()}
-				_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: []*accounts.Account{acct}}}, slot, nil, nil)
-				require.NoError(t, err)
-			}
-			commit(10, 1)
-			server := &RpcServer{acctsDb: db}
-			server.SetRootedBankState(10, 7, 0)
-			timeout := 100 * time.Millisecond
-			if publish {
-				timeout = 2 * time.Second
-			}
-			deadline, cancel := context.WithTimeout(t.Context(), timeout)
-			defer cancel()
-			ctx := &blockhashReadContext{Context: deadline, action: func() {
-				commit(20, 2)
-				if publish {
-					server.SetRootedBankState(20, 8, 0)
-				}
-			}}
-			got, err := server.GetLatestBlockhash(ctx, nil)
-			require.GreaterOrEqual(t, ctx.checks, 2, "publication change must occur during the request")
-			if !publish {
-				require.ErrorIs(t, err, context.DeadlineExceeded)
-				require.Nil(t, got.Value)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, uint64(20), got.Context.Slot)
-			require.Equal(t, solana.Hash{2}.String(), got.Value.Blockhash)
-			require.Equal(t, uint64(158), got.Value.LastValidBlockHeight)
-		})
+// A fold the node has not published as its root does not change the answer;
+// publishing the new root does. Blockhash, height and slot always come from
+// one bank.
+func TestLatestBlockhashFollowsPublishedRoot(t *testing.T) {
+	db := newRPCAccountsDB(t)
+	commit := func(slot uint64, hash byte) {
+		recent := sealevel.SysvarRecentBlockhashes{{Blockhash: [32]byte{hash}}}
+		acct := &accounts.Account{Key: solana.PublicKey(sealevel.SysvarRecentBlockHashesAddr), Lamports: 1, Data: recent.MustMarshal()}
+		_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: []*accounts.Account{acct}}}, slot, nil, nil)
+		require.NoError(t, err)
 	}
+	commit(10, 1)
+	server := &RpcServer{acctsDb: db}
+	server.SetRootedBankState(10, 7, 0)
+	got, err := server.GetLatestBlockhash(t.Context(), nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got.Context.Slot)
+	require.Equal(t, solana.Hash{1}.String(), got.Value.Blockhash)
+	require.Equal(t, uint64(7+150), got.Value.LastValidBlockHeight)
+
+	commit(20, 2)
+	got, err = server.GetLatestBlockhash(t.Context(), nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got.Context.Slot, "an unpublished fold does not change the answer")
+	require.Equal(t, solana.Hash{1}.String(), got.Value.Blockhash)
+
+	server.SetRootedBankState(20, 8, 0)
+	got, err = server.GetLatestBlockhash(t.Context(), nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(20), got.Context.Slot)
+	require.Equal(t, solana.Hash{2}.String(), got.Value.Blockhash)
+	require.Equal(t, uint64(8+150), got.Value.LastValidBlockHeight)
 }

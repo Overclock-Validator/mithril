@@ -569,6 +569,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 			return false, 0, err
 		}
 		db.trackRemovedLocked(srcPath, c.manifestPath)
+		db.keySidecars.Load().remove(c.slot, c.fileId)
 		return true, 0, nil
 	}
 
@@ -630,6 +631,15 @@ func (db *AccountsDb) publishCompactOutput(c compactCandidate, data []byte, reco
 		return 0, err
 	}
 	db.trackDataFileLocked(outName)
+	if sidecars := db.keySidecars.Load(); sidecars != nil {
+		sidecar := sidecars.builder()
+		for _, rec := range records {
+			if recLen := recordLenAt(data, rec.Offset); recLen >= hdrLen {
+				sidecar.addRecord(rec.Offset, data[rec.Offset:int64(rec.Offset)+recLen])
+			}
+		}
+		sidecar.write(c.slot, newFileId, uint64(len(data)))
+	}
 
 	// The compact manifest's only durable job is marking the output non-orphan;
 	// recovery never replays it (a crash before the index move leaves the
@@ -688,6 +698,7 @@ func (db *AccountsDb) publishCompactOutput(c compactCandidate, data []byte, reco
 			return 0, err
 		}
 		db.trackRemovedLocked(c.path, c.manifestPath)
+		db.keySidecars.Load().remove(c.slot, c.fileId)
 	}
 	info, err := os.Stat(outPath)
 	if err != nil {

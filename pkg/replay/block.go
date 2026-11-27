@@ -24,6 +24,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
@@ -38,6 +39,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
+	"github.com/Overclock-Validator/mithril/pkg/rpcindex"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
@@ -81,6 +83,48 @@ type blockHistoryPublisher interface {
 
 type rpcHealthInvalidator interface {
 	InvalidateHealth()
+}
+
+// bankViewSource is implemented by an RPC server that serves bank views.
+type bankViewSource interface {
+	BankViews() *bankview.Publisher
+}
+
+// rpcIndexSource is implemented by an RPC server with history enabled.
+type rpcIndexSource interface {
+	RPCIndexer() *rpcindex.Indexer
+}
+
+// prioritizationFeeRecorder is implemented by an RPC server that serves
+// recent prioritization fees.
+type prioritizationFeeRecorder interface {
+	PrioritizationFeesEnabled() bool
+	RecordPrioritizationFees(slot uint64, f *features.Features, txs []*solana.Transaction)
+}
+
+type alpenglowCertifiedTip interface {
+	AlpenglowCertifiedTip() (slot uint64, at time.Time, ok bool)
+}
+
+// healthTipMaxAge is how old the latest certificate may be and still count as
+// the network tip, matching the block source's RPC tip freshness.
+const healthTipMaxAge = 30 * time.Second
+
+// networkHealthSlot is the highest recently observed network tip: the latest
+// verified Votor certificate and the configured RPCs' confirmed slot. Either
+// source alone is enough, so health does not depend on an outside RPC.
+func networkHealthSlot(certs alpenglowCertifiedTip, rpcTip func() (uint64, bool)) (uint64, bool) {
+	var tip uint64
+	fresh := false
+	if certs != nil {
+		if slot, at, ok := certs.AlpenglowCertifiedTip(); ok && time.Since(at) <= healthTipMaxAge {
+			tip, fresh = slot, true
+		}
+	}
+	if slot, ok := rpcTip(); ok {
+		tip, fresh = max(tip, slot), true
+	}
+	return tip, fresh
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -1980,6 +2024,40 @@ func ReplayBlocks(
 	rewardStatusPublisher, _ := rpcServer.(interface {
 		RecordEpochRewardStatus(*b.Block, *sealevel.BankSysvars, bool)
 	})
+	// Bank views exist only while an RPC server is attached; without one,
+	// replay builds and publishes nothing.
+	var bankViews *bankview.Publisher
+	if source, ok := rpcServer.(bankViewSource); ok {
+		bankViews = source.BankViews()
+	}
+	if bankViews != nil {
+		defer bankViews.Reset(nil) // recovery may rewind durable state under old views
+	}
+	feeRecorder, _ := rpcServer.(prioritizationFeeRecorder)
+	if feeRecorder != nil && !feeRecorder.PrioritizationFeesEnabled() {
+		feeRecorder = nil
+	}
+	if feeRecorder != nil {
+		rpcFeeRecording.Store(true)
+		defer rpcFeeRecording.Store(false)
+	}
+	// History capture runs only with an RPC server that has history enabled.
+	var rpcIndex *rpcindex.Indexer
+	if source, ok := rpcServer.(rpcIndexSource); ok {
+		rpcIndex = source.RPCIndexer()
+	}
+	if rpcIndex != nil || feeRecorder != nil {
+		rpcCaptures.reset()
+	}
+	if rpcIndex != nil {
+		// Unfinalized blocks of an earlier attempt may be on an abandoned
+		// fork; this run reports again those it selects.
+		if startSlot > 0 {
+			rpcIndex.BeginReplay(startSlot - 1)
+		}
+		rpcWatch.Store(rpcIndex.Registry())
+		defer rpcWatch.Store(nil)
+	}
 	if rewardPublisher != nil {
 		if err := rewardPublisher.RewindEpochRewards(startSlot); err != nil {
 			result.Error = fmt.Errorf("rewind epoch rewards from replay slot %d: %w", startSlot, err)
@@ -2309,6 +2387,9 @@ func ReplayBlocks(
 	unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
 	trackedStakeTotals = unrootedTailState.durableStakeTotals
 	defer func() { trackedStakeTotals = nil }()
+	if bankViews != nil {
+		bankViews.Reset(bankview.StoreAccounts{WorkingSet: unrootedTailState.overlay, DB: acctsDb})
+	}
 	var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 	if consensusOpts != nil {
 		checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
@@ -2527,6 +2608,9 @@ func ReplayBlocks(
 		if promoter.failure != nil {
 			return true
 		}
+		if bankViews != nil {
+			bankViews.MarkDurable(mithrilState.LastRootedSlot)
+		}
 		if lastRootedWatermark == 0 {
 			return false
 		}
@@ -2583,6 +2667,15 @@ func ReplayBlocks(
 			}
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
+		}
+		if bankViews != nil {
+			// The same prefix the fold may make irreversible: certificate
+			// finality, the trailing verifier when required, and the Alpenglow
+			// block-identity gate.
+			bankViews.MarkFinalized(promoteThrough)
+		}
+		if rpcIndex != nil {
+			rpcIndex.Finalized(promoteThrough)
 		}
 		// Read publication uses the same verified prefix without waiting for disk.
 		// Advisory/disabled verification retains the durable-only read contract.
@@ -2812,7 +2905,8 @@ func ReplayBlocks(
 		blockStream = blockstream.NewBlockSource(opts)
 	}
 	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
-		health.SetHealthSlotSource(blockStream.HealthSlot)
+		certs, _ := consensusEngine.(alpenglowCertifiedTip)
+		health.SetHealthSlotSource(func() (uint64, bool) { return networkHealthSlot(certs, blockStream.HealthSlot) })
 		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
 	}
 	// Every state save records the repair peers that served this run well, so
@@ -2996,6 +3090,12 @@ func ReplayBlocks(
 		global.SetLatestBlockHash(rs.LastBlockhash)
 		if rs.TransactionCount != nil {
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
+		}
+		if bankViews != nil {
+			bankViews.Abandon(sw.Slot) // the overlay suffix is already evicted
+		}
+		if rpcIndex != nil {
+			rpcIndex.Abandon(sw.Slot)
 		}
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
 		replayFrontier = rs.ParentSlot
@@ -3373,7 +3473,11 @@ func ReplayBlocks(
 			// throttled (the RPC round-trip is slow). Offline replay has no
 			// fallback: footer certificates alone advance the root.
 			rooted, ok := uint64(0), false
-			if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
+			certRooted, certOk, notarized := alpenglowRootedAndNotarized(consensusEngine)
+			if bankViews != nil && notarized.Slot > 0 {
+				bankViews.MarkNotarized(notarized.Slot, notarized.Hash)
+			}
+			if certOk {
 				rooted, ok = certRooted, true
 			} else if DelegatedFinalityEnabled && rpcc != nil {
 				if time.Since(delegatedFinalizedAt) > 2*time.Second {
@@ -3799,6 +3903,29 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.ChainTipUpdate.AddTimingSince(chainTipStart)
 
 		global.SetBlockHeight(block.BlockHeight)
+		// The indexer gets the block before its bank becomes readable, so a
+		// request that selects the bank can wait for its discoveries.
+		if (rpcIndex != nil || feeRecorder != nil) && lastSlotCtx != nil {
+			bc := rpcCaptures.take(lastSlotCtx)
+			// Every completed bank is reported, captures or not: an empty
+			// report replaces whatever an abandoned fork left at its slot.
+			if rpcIndex != nil {
+				if bc == nil {
+					bc = &bankCaptures{}
+				}
+				rpcIndex.CompletedBlock(block.Slot, solana.Hash(block.AlpenglowBlockID), block, bc.captured, bc.tokens)
+			}
+			if feeRecorder != nil {
+				var txs []*solana.Transaction
+				if bc != nil {
+					txs = bc.feeTxs
+				}
+				feeRecorder.RecordPrioritizationFees(block.Slot, block.Features, txs)
+			}
+		}
+		if bankViews != nil && lastSlotCtx != nil {
+			bankViews.PublishProcessed(newBankView(block, lastSlotCtx, global.TransactionCount()))
+		}
 		if trailingVerifier != nil {
 			trailingVerifier.Record(buildSlotDigest(block))
 		}
@@ -5343,6 +5470,7 @@ func processBlockWithResults(
 	var totalComputeUnitsConsumed uint64
 	start = time.Now()
 
+	recordFeeTransactions(slotCtx, block.Transactions) // resolved in place by the account load
 	exec.setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()

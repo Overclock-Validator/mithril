@@ -4,13 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/DataDog/zstd"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
@@ -69,7 +68,6 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 	if err := json.Unmarshal(params[0], &pkStr); err != nil || len(pkStr) > 44 {
 		return GetAccountInfoResp{}, &InvalidParamsError{Message: "invalid account key"}
 	}
-
 	pk, err := solana.PublicKeyFromBase58(pkStr)
 	if err != nil {
 		return GetAccountInfoResp{}, &InvalidParamsError{Message: "invalid base58 encoding"}
@@ -77,24 +75,36 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 
 	conf, err := parseAccountConfig(params, nil)
 	if err != nil {
-		return GetAccountInfoResp{}, err
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: err.Error()}
 	}
-	rooted, acct, err := rpcServer.readRootedAccount(ctx, pk)
-	if err != nil && !errors.Is(err, accountsdb.ErrNoAccount) {
-		return GetAccountInfoResp{}, fmt.Errorf("read account at rooted slot %d: %w", rooted.Slot, err)
-	}
-	if conf.MinContextSlot > rooted.Slot {
-		return GetAccountInfoResp{}, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
-	}
-	if errors.Is(err, accountsdb.ErrNoAccount) {
-		return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}}, nil
-	}
+	var resp GetAccountInfoResp
+	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
+		acct, err := r.Account(pk)
+		if err != nil {
+			return err
+		}
+		val, err := accountInfoValue(acct, conf)
+		if err != nil {
+			return err
+		}
+		resp = GetAccountInfoResp{Context: accountContext(r.View.Slot), Value: val}
+		return nil
+	})
+	return resp, err
+}
 
-	val, err := accountInfoValue(acct, conf)
-	if err != nil {
-		return GetAccountInfoResp{}, err
+func accountContext(slot uint64) GetAccountInfoRespContext {
+	return GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: slot}
+}
+
+// accountReadConfig selects the bank an account method's parsed config asks
+// for. parseAccountConfig has already validated the commitment.
+func accountReadConfig(conf *GetAccountInfoConfig) commitmentConfig {
+	level := bankview.Finalized
+	if conf.Commitment != "" {
+		level, _ = bankview.ParseCommitment(conf.Commitment)
 	}
-	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}, Value: val}, nil
+	return commitmentConfig{level: level, minContextSlot: conf.MinContextSlot}
 }
 
 func accountInfoValue(acct *accounts.Account, conf *GetAccountInfoConfig) (*GetAccountInfoRespValue, error) {
@@ -141,8 +151,8 @@ func parseAccountConfig(params []json.RawMessage, defaultEncoding *int) (*GetAcc
 	}
 	conf := &GetAccountInfoConfig{EncodingType: defaultEncoding}
 	if input.Commitment != nil {
-		if err := validateRootedCommitment(*input.Commitment); err != nil {
-			return nil, err
+		if _, err := bankview.ParseCommitment(*input.Commitment); err != nil {
+			return nil, &InvalidParamsError{Message: "invalid commitment"}
 		}
 		conf.Commitment = *input.Commitment
 	}
@@ -289,4 +299,18 @@ func extractRequestedAcctData(data []byte, length uint64, offset uint64) []byte 
 	}
 
 	return data[offset : offset+length]
+}
+
+// parseGetAccountInfoConfMap parses the account config object at params[1] of
+// an already decoded parameter list, with parseAccountConfig's rules.
+func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, error) {
+	raw := make([]json.RawMessage, len(params))
+	for i, param := range params {
+		encoded, err := json.Marshal(param)
+		if err != nil {
+			return nil, err
+		}
+		raw[i] = encoded
+	}
+	return parseAccountConfig(raw, nil)
 }

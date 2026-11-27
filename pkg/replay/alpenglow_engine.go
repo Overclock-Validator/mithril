@@ -28,15 +28,27 @@ var DelegatedFinalityEnabled = true
 // certificate for — the Alpenglow finality watermark that drives promotion, the
 // certificate-based counterpart to TowerBFT's HighestRootedSlot.
 func alpenglowRootedSlot(consensusEngine consensusengine.Engine) (uint64, bool) {
+	slot, ok, _ := alpenglowRootedAndNotarized(consensusEngine)
+	return slot, ok
+}
+
+// alpenglowRootedAndNotarized also returns the newest block with a verified
+// notarization certificate, from the same engine snapshot, for RPC commitment.
+// The zero BlockID means none has been observed.
+func alpenglowRootedAndNotarized(consensusEngine consensusengine.Engine) (uint64, bool, alpenglow.BlockID) {
 	if consensusEngine == nil {
-		return 0, false
+		return 0, false, alpenglow.BlockID{}
 	}
 	snap := consensusEngine.Snapshot()
+	var notarized alpenglow.BlockID
+	if snap.Alpenglow != nil {
+		notarized = snap.Alpenglow.LatestNotarizedBlock
+	}
 	if snap.AlpenglowChain == nil {
-		return 0, false
+		return 0, false, notarized
 	}
 	slot := snap.AlpenglowChain.LatestDirectFinalizedBlock.Slot
-	return slot, slot > 0
+	return slot, slot > 0, notarized
 }
 
 // installAlpenglowValidatorSet builds and installs the BLS validator set for one

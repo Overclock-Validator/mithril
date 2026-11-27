@@ -2,6 +2,7 @@ package accounts
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/gagliardetto/solana-go"
 )
@@ -19,6 +20,11 @@ type WorkingSet struct {
 	flat          map[[32]byte]flatEntry // newest unrooted value per key
 	retainedBytes uint64                 // account capacities plus estimated per-version bookkeeping
 	revision      uint64                 // changes under mu with every visible account-view mutation
+	// generation is odd while EvictFrom rewrites the suffix and even otherwise.
+	// Add and PromotePrefix leave it unchanged: they never alter the value a
+	// key had at an already held slot. Readers outside the lock use it as a
+	// seqlock to detect that a fork switch replaced slots they may have read.
+	generation atomic.Uint64
 }
 
 type flatEntry struct {
@@ -136,6 +142,51 @@ func (w *WorkingSet) Lookup(pubkey [32]byte) (*Account, bool) {
 		return e.acct, true
 	}
 	return nil, false
+}
+
+// LookupAt returns the newest unrooted value for pubkey written at or below
+// maxSlot, so a reader can resolve a key as of an older replayed bank while
+// replay keeps adding slots. A miss means no held slot at or below maxSlot
+// wrote the key and the durable store owns the value.
+func (w *WorkingSet) LookupAt(pubkey [32]byte, maxSlot uint64) (*Account, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	e, ok := w.flat[pubkey]
+	if !ok {
+		return nil, false // flat is the fold of every held layer
+	}
+	if e.slot <= maxSlot {
+		return e.acct, true
+	}
+	for i := len(w.order) - 1; i >= 0; i-- {
+		slot := w.order[i]
+		if slot > maxSlot {
+			continue
+		}
+		if a, ok := w.bySlot[slot].writes[pubkey]; ok {
+			return a, true
+		}
+	}
+	return nil, false
+}
+
+// Generation returns the eviction seqlock counter (odd while an eviction is
+// in progress).
+func (w *WorkingSet) Generation() uint64 {
+	return w.generation.Load()
+}
+
+// RangeVersions calls fn for every held version of every account, oldest slot
+// first. It holds the read lock throughout, so replay's next Add waits for it:
+// keep fn to a cheap filter. fn must not retain or modify a.
+func (w *WorkingSet) RangeVersions(fn func(slot uint64, a *Account)) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for _, slot := range w.order {
+		for _, a := range w.bySlot[slot].writes {
+			fn(slot, a)
+		}
+	}
 }
 
 // LookupBatch fills out with the newest unrooted value for every matching
@@ -279,6 +330,8 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 		return
 	}
 	w.revision++
+	w.generation.Add(1) // odd: the suffix is being rewritten
+	defer w.generation.Add(1)
 
 	// Apply undos newest layer first: for keys written in several evicted
 	// layers, the OLDEST layer's undo applies last and wins — restoring the

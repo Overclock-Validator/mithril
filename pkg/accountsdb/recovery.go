@@ -240,9 +240,10 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 
 	// Recovery can also run in-process after a partial fold. Discard cached
 	// account bytes before rebuilding any derived view against the repaired index.
-	db.readCacheEpochMu.Lock()
+	db.readCacheEpochMu.LockAs("recovery")
 	db.readCacheEpoch++
 	db.pendingFold = nil
+	db.publishedThrough = res.DurableThrough
 	if db.commonAdmission != nil {
 		db.resetReadCachesLocked()
 	}

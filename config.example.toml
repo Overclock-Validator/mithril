@@ -587,8 +587,9 @@ name = "mithril"
 # [rpc] - Mithril RPC Server
 # ============================================================================
 #
-# Mithril exposes a Solana-compatible JSON-RPC interface,
-# allowing other tools to query Mithril's account state directly.
+# Mithril exposes a Solana-compatible JSON-RPC interface, allowing other tools
+# to query Mithril's account state directly. Admin calls never use this port;
+# they go through the Unix socket <ledger>/admin.rpc (mode 0600).
 #
 # Query with: curl http://localhost:8899 -X POST -H "Content-Type: application/json" \
 #   -d '{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}'
@@ -599,6 +600,18 @@ name = "mithril"
     # Literal IP for the shared HTTP/WebSocket listener (default: all interfaces).
     # Use 127.0.0.1 for a private local RPC endpoint.
     bind_address = "0.0.0.0"
+    # What the RPC answers. Each level includes the ones before it:
+    #   accounts - account reads, simulation and sendTransaction (default)
+    #   blocks   - adds rooted block summaries (getBlock, getBlocks)
+    #   wallet   - adds signature outcomes and prioritization fees for send
+    #              and confirm, and, with watch set, the watched wallets'
+    #              address history and token accounts
+    #   history  - adds transaction history (getTransaction)
+    # serve = "accounts"
+    # Wallets this node indexes at wallet level, and the only transactions
+    # history records at history level. Other transactions cost one lookup.
+    # watch = ["<wallet address>"]
+    # wallet_index_dir = "<accounts>/rpc-wallet-index"
 
 # ============================================================================
 # [tuning] - Performance Tuning & Profiling

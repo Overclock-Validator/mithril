@@ -46,9 +46,15 @@ func TestRootedRPCRejectsProcessedHTTP(t *testing.T) {
 			}
 			require.NoError(t, json.NewDecoder(response.Body).Decode(&reply))
 			require.NotNil(t, reply.Error, "must not substitute rooted state for processed")
+			require.Empty(t, reply.Result)
+			if test.method == "getAccountInfo" || test.method == "getBalance" {
+				// Bank-view reads serve processed from a processed bank; with
+				// none published they refuse rather than read the root.
+				require.Equal(t, -32005, reply.Error.Code)
+				return
+			}
 			require.Equal(t, -32602, reply.Error.Code)
 			require.Contains(t, reply.Error.Message, "processed commitment is not supported")
-			require.Empty(t, reply.Result)
 		})
 	}
 }

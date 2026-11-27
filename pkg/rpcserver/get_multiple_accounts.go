@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/bankview"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
 )
@@ -15,15 +16,14 @@ const maxMultipleAccountsDataBytes = 16 << 20
 
 const maxMultipleAccountsParsedBytes = 32 << 20
 
-// GetMultipleAccountsResp preserves request order and one rooted context.
+// GetMultipleAccountsResp preserves request order and one bank's context.
 type GetMultipleAccountsResp struct {
 	Context GetAccountInfoRespContext  `json:"context"`
 	Value   []*GetAccountInfoRespValue `json:"value"`
 }
 
-// GetMultipleAccounts serves one published rooted view over HTTP.
-// Its response permit covers serialization and the final write.
-// Confirmed and finalized use that root; processed commitment is unsupported.
+// GetMultipleAccounts reads every key from one bank view at the requested
+// commitment. Its response permit covers serialization and the final write.
 func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.RawParams) (GetMultipleAccountsResp, error) {
 	if len(p) > 16<<10 {
 		return GetMultipleAccountsResp{}, &InvalidParamsError{Message: "getMultipleAccounts parameters exceed 16 KiB"}
@@ -55,19 +55,21 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 	if err := acquireQueryResponse(ctx); err != nil {
 		return GetMultipleAccountsResp{}, err
 	}
-	remaining := uint64(maxMultipleAccountsDataBytes)
-	rooted, accountSet, err := rpcServer.readRootedAccountsWithBudget(ctx, keys, &remaining)
+	var accountSet []*accounts.Account
+	var slot uint64
+	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
+		var err error
+		accountSet, err = r.AccountsWithDataLimit(ctx, keys, maxMultipleAccountsDataBytes)
+		slot = r.View.Slot
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, accountsdb.ErrAccountDataLimit) {
 			return GetMultipleAccountsResp{}, &InvalidParamsError{Message: "getMultipleAccounts exceeds 16 MiB account data budget"}
 		}
-		return GetMultipleAccountsResp{}, fmt.Errorf("read accounts at rooted slot %d: %w", rooted.Slot, err)
+		return GetMultipleAccountsResp{}, err
 	}
-	if conf.MinContextSlot > rooted.Slot {
-		return GetMultipleAccountsResp{}, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
-	}
-	response := GetMultipleAccountsResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot},
-		Value: make([]*GetAccountInfoRespValue, len(keys))}
+	response := GetMultipleAccountsResp{Context: accountContext(slot), Value: make([]*GetAccountInfoRespValue, len(keys))}
 	parsedRemaining := maxMultipleAccountsParsedBytes
 	for i, acct := range accountSet {
 		if err := ctx.Err(); err != nil {

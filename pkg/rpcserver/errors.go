@@ -286,3 +286,14 @@ func rpcErrorRegistry() jsonrpc.Errors {
 	errs.Register(rpcCodeSlotSkipped, new(*SlotSkippedError))
 	return errs
 }
+
+// methodNotServedError is a method this node's rpc.serve level leaves off.
+type methodNotServedError struct{ method, level string }
+
+func (e *methodNotServedError) Error() string {
+	return e.method + " is not served by this node; it requires rpc.serve " + e.level + " or above"
+}
+
+func (e *methodNotServedError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: -32601, Message: e.Error()}, nil
+}

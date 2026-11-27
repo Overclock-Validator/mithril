@@ -235,6 +235,7 @@ func (db *AccountsDb) CommitBatch(
 	bw := bufio.NewWriterSize(segFile, 1<<20)
 	segWriter := io.MultiWriter(bw, crc)
 	records := make([]ManifestRecord, 0, len(keys))
+	sidecar := db.keySidecars.Load().builder()
 	var dataLen uint64
 	segErr := func() error {
 		for _, k := range keys {
@@ -243,6 +244,7 @@ func (db *AccountsDb) CommitBatch(
 				Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot,
 				Vote: v.acct.Lamports > 0 && v.acct.Owner == addresses.VoteProgramAddr,
 			})
+			sidecar.add(dataLen, v.acct.Owner, v.acct.Data)
 			ava := AppendVecAccount{
 				DataLen:    uint64(len(v.acct.Data)),
 				Pubkey:     v.acct.Key,
@@ -279,6 +281,7 @@ func (db *AccountsDb) CommitBatch(
 	timings.SegmentSync = time.Since(syncStart)
 	db.foldPhase.set(foldPhaseManifest)
 	db.trackDataFileLocked(filepath.Base(dataName))
+	sidecar.write(throughSlot, fileId, dataLen)
 	fire(db.foldHooks.afterSegmentFsync)
 	dataCRC := crc.Sum32()
 
@@ -345,15 +348,19 @@ func (db *AccountsDb) CommitBatch(
 	fire(db.foldHooks.beforeIndexCommit)
 	db.foldPhase.set(foldPhaseIndexCommit)
 	db.readCacheEpochMu.LockAs("fold_publication")
+	previousThrough := db.publishedThrough
 	db.pendingFold = union
 	db.readCacheEpoch++
 	db.carryBatchAbsencesLocked(union)
+	db.publishedThrough = throughSlot
 	db.readCacheEpochMu.Unlock()
 	fire(db.foldHooks.afterPublicationStart)
 
 	if err := db.applyManifestToIndex(manifest); err != nil {
 		db.readCacheEpochMu.LockAs("fold_publication")
 		db.pendingFold = nil
+		db.readCacheEpoch++
+		db.publishedThrough = previousThrough
 		db.readCacheEpochMu.Unlock()
 		return BatchCommitResult{}, err
 	}

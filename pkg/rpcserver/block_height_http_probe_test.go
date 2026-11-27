@@ -65,6 +65,7 @@ func TestBlockHeightBankHTTP(t *testing.T) {
 				server.SetRootedBankState(100, 0, 0)
 			} else if tc.missing == "processed" {
 				replay.UpdateChainTipFromSlotCtxWithBankMetadata(bank, nil, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{})
+				server.SetSlotCtx(bank) // publishing the tip publishes its processed bank
 			}
 			body := `{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"`
 			if tc.params != "" {

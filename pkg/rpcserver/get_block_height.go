@@ -7,30 +7,19 @@ import (
 	"github.com/filecoin-project/go-jsonrpc"
 )
 
+// GetBlockHeight returns the block height of the bank at the requested
+// commitment, defaulting to finalized.
 func (rpcServer *RpcServer) GetBlockHeight(ctx context.Context, p jsonrpc.RawParams) (uint64, error) {
-	config, err := parseBankReadConfig(ctx, "getBlockHeight", p)
+	conf, err := scalarConfig(ctx, "getBlockHeight", p)
 	if err != nil {
 		return 0, err
 	}
-	var slot, height uint64
-	if config.Commitment != nil && *config.Commitment == "processed" {
-		bank, err := rpcServer.processedBankContext()
-		if err != nil {
-			return 0, err
-		}
-		slot, height = bank.Slot, bank.BlockHeight
-	} else {
-		bank, ok := rpcServer.getRootedBankState()
-		if !ok {
-			return 0, fmt.Errorf("node has no rooted bank available")
-		}
-		slot, height = bank.Slot, bank.BlockHeight
+	view, err := rpcServer.currentView(ctx, conf)
+	if err != nil {
+		return 0, err
 	}
-	if slot > 0 && height == 0 {
-		return 0, fmt.Errorf("node has no block height available for slot %d", slot)
+	if view.Slot > 0 && view.BlockHeight == 0 {
+		return 0, fmt.Errorf("node has no block height available for slot %d", view.Slot)
 	}
-	if config.MinContextSlot != nil && slot < *config.MinContextSlot {
-		return 0, &MinContextSlotNotReachedError{ContextSlot: slot}
-	}
-	return height, nil
+	return view.BlockHeight, nil
 }
