@@ -2834,10 +2834,12 @@ func ReplayBlocks(
 	defer stopBenchLoad()
 	startBenchCheckpointLoad(benchLoadCtx, acctsDb)
 	waitBenchReplay := startBenchCheckpointReplay(benchLoadCtx, acctsDb, mithrilState)
+	waitBenchQuery := startBenchCheckpointQuery(benchLoadCtx, acctsDb, mithrilState)
 	defer func() {
 		// Deferred calls run last first: stop, then wait.
 		stopBenchLoad()
 		waitBenchReplay()
+		waitBenchQuery()
 	}()
 	var prefetcher *accountPrefetcher
 	if accountPrefetchEnabled {

@@ -15,6 +15,13 @@ const maxWatchedAddresses = 4096
 // its addresses. A nil set captures every transaction. It is immutable.
 type TransactionWatchSet struct {
 	addresses map[solana.PublicKey]struct{}
+	// signature, when set, selects that one transaction instead.
+	signature *solana.Signature
+}
+
+// watchSignature selects exactly the transaction with this signature.
+func watchSignature(signature solana.Signature) *TransactionWatchSet {
+	return &TransactionWatchSet{signature: &signature}
 }
 
 // NewTransactionWatchSet parses base58 addresses. No addresses means no watch
@@ -53,6 +60,9 @@ func (set *TransactionWatchSet) Len() int {
 func (set *TransactionWatchSet) touches(tx *solana.Transaction) bool {
 	if tx == nil {
 		return false
+	}
+	if set.signature != nil {
+		return len(tx.Signatures) > 0 && tx.Signatures[0] == *set.signature
 	}
 	for _, key := range tx.Message.AccountKeys {
 		if _, ok := set.addresses[key]; ok {

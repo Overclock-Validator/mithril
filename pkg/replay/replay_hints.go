@@ -115,6 +115,9 @@ type hintUse struct {
 	hints    *blockHints
 	violated atomic.Bool
 	skipped  atomic.Int64
+	// execute, when set, is a transaction to run even if it is a recorded
+	// failure: the caller wants its real result, not just its effects.
+	execute *solana.Signature
 }
 
 type replayHintStore struct {
@@ -267,6 +270,9 @@ func sealReplayHints(slotCtx *sealevel.SlotCtx, block *b.Block) {
 // knownFailure reports whether the node recorded that tx failed.
 func (use *hintUse) knownFailure(tx *solana.Transaction) bool {
 	if use == nil || len(tx.Signatures) == 0 {
+		return false
+	}
+	if use.execute != nil && tx.Signatures[0] == *use.execute {
 		return false
 	}
 	hint, known := use.hints.bySig[tx.Signatures[0]]

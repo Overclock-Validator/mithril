@@ -87,6 +87,22 @@ func (t *checkpointTail) boundary(ctx context.Context, keys []solana.PublicKey, 
 	return nil
 }
 
+// warm loads boundary accounts in the background, a chunk at a time, into the
+// replay's read cache, so a replay can start before its accounts are all in
+// memory: a key the replay needs first is simply read by the replay itself.
+func (t *checkpointTail) warm(ctx context.Context, keys []solana.PublicKey, chunk, workers int) {
+	for start := 0; start < len(keys) && ctx.Err() == nil; start += chunk {
+		part := keys[start:min(len(keys), start+chunk)]
+		loaded, _, err := t.view.LoadAccountsWith(ctx, part, workers)
+		if err != nil {
+			return
+		}
+		for i, key := range part {
+			t.fetched.LoadOrStore(key, loaded[i])
+		}
+	}
+}
+
 // GetAccountShared returns the bank-visible account without copying it. The
 // caller must not change it: the value is this replay's parent version.
 func (t *checkpointTail) GetAccountShared(_ uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
@@ -297,6 +313,12 @@ func (r *CheckpointReplay) Slot() uint64 { return r.parent.Slot }
 // Next replays block on top of the last one and returns its bank. The block
 // must be the next block of the chain the node executed after the boundary.
 func (r *CheckpointReplay) Next(block *b.Block) (*sealevel.SlotCtx, error) {
+	return r.next(block, nil, nil)
+}
+
+// next is Next, optionally capturing metadata for selected transactions and
+// executing one transaction in full even if it is a recorded failure.
+func (r *CheckpointReplay) next(block *b.Block, capture *blockMetadataCapture, execute *solana.Signature) (*sealevel.SlotCtx, error) {
 	if block == nil || block.Slot <= r.parent.Slot {
 		return nil, fmt.Errorf("checkpoint replay at slot %d cannot take this block", r.parent.Slot)
 	}
@@ -314,11 +336,11 @@ func (r *CheckpointReplay) Next(block *b.Block) (*sealevel.SlotCtx, error) {
 	var use *hintUse
 	if r.useHints {
 		if hints := hintsFor(block); hints != nil {
-			use = &hintUse{hints: hints}
+			use = &hintUse{hints: hints, execute: execute}
 			block.ReplayHints = use
 		}
 	}
-	slotCtx, err := processBlock(r.db, block, r.epochSchedule, r.workers, nil, r.hashes, r.tail, r.statuses, true, r.parentSysvars, nil)
+	slotCtx, err := processBlock(r.db, block, r.epochSchedule, r.workers, nil, r.hashes, r.tail, r.statuses, true, r.parentSysvars, capture)
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint replay of slot %d: %w", block.Slot, err)
 	}
