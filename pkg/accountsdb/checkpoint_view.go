@@ -187,14 +187,54 @@ type checkpointRead struct {
 	entry AccountIndexEntry
 }
 
+// checkpointLoadWorkers is how many files LoadAccounts reads at once.
+const checkpointLoadWorkers = 4
+
 // LoadAccounts returns every key's account as of the boundary, in the order
 // given, with nil where no account existed. It is meant to be called once for
 // everything a replay of the following fold will touch: locations are resolved
 // first (from fold records where the account has changed since, and only
-// otherwise through the index), then read file by file in offset order.
+// otherwise through the index), then read file by file in offset order, a few
+// files at a time.
 //
 // The returned accounts are owned by the caller.
 func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.PublicKey) ([]*accounts.Account, CheckpointLoadStats, error) {
+	return view.LoadAccountsWith(ctx, keys, checkpointLoadWorkers)
+}
+
+// PendingCheckpointLoad is the second stage of LoadAccountsStaged.
+type PendingCheckpointLoad struct {
+	done     chan struct{}
+	accounts []*accounts.Account
+	stats    CheckpointLoadStats
+	err      error
+}
+
+// Wait blocks until the stage has loaded and returns it, like LoadAccounts.
+func (pending *PendingCheckpointLoad) Wait() ([]*accounts.Account, CheckpointLoadStats, error) {
+	<-pending.done
+	return pending.accounts, pending.stats, pending.err
+}
+
+// LoadAccountsStaged loads first and returns it, with the rest loading behind
+// it. A replay can then begin on the first few blocks' accounts while the
+// remainder of the fold's accounts arrive, instead of waiting for all of them.
+// Both stages describe the same boundary. Cancelling ctx stops the second.
+func (view *CheckpointView) LoadAccountsStaged(ctx context.Context, first, rest []solana.PublicKey, workers int) ([]*accounts.Account, CheckpointLoadStats, *PendingCheckpointLoad, error) {
+	loaded, stats, err := view.LoadAccountsWith(ctx, first, workers)
+	if err != nil {
+		return nil, stats, nil, err
+	}
+	pending := &PendingCheckpointLoad{done: make(chan struct{})}
+	go func() {
+		defer close(pending.done)
+		pending.accounts, pending.stats, pending.err = view.LoadAccountsWith(ctx, rest, workers)
+	}()
+	return loaded, stats, pending, nil
+}
+
+// LoadAccountsWith is LoadAccounts reading up to workers files at once.
+func (view *CheckpointView) LoadAccountsWith(ctx context.Context, keys []solana.PublicKey, workers int) ([]*accounts.Account, CheckpointLoadStats, error) {
 	stats := CheckpointLoadStats{Requested: uint64(len(keys))}
 	out := make([]*accounts.Account, len(keys))
 	if len(keys) == 0 {
@@ -253,7 +293,15 @@ func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.Publ
 		reads[i].entry = entry
 	}
 
-	// Disk order: one pass over each file, front to back.
+	// Drop keys with no account, then put the rest in disk order: one pass
+	// over each file, front to back.
+	present := reads[:0]
+	for _, read := range reads {
+		if read.index >= 0 {
+			present = append(present, read)
+		}
+	}
+	reads = present
 	sort.Slice(reads, func(a, b int) bool {
 		x, y := reads[a].entry, reads[b].entry
 		if x.Slot != y.Slot {
@@ -264,6 +312,49 @@ func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.Publ
 		}
 		return x.Offset < y.Offset
 	})
+	// Each worker takes a contiguous run of the ordered reads, cut where the
+	// file changes, so no file is opened by two workers.
+	workers = max(1, min(workers, len(reads)))
+	parts := make([][]checkpointRead, 0, workers)
+	for start := 0; start < len(reads); {
+		end := min(len(reads), start+(len(reads)-start)/(workers-len(parts)))
+		end = max(end, start+1)
+		for end < len(reads) && len(parts) < workers-1 && reads[end].entry.Slot == reads[end-1].entry.Slot && reads[end].entry.FileId == reads[end-1].entry.FileId {
+			end++
+		}
+		if len(parts) == workers-1 {
+			end = len(reads)
+		}
+		parts = append(parts, reads[start:end])
+		start = end
+	}
+	type partResult struct {
+		files, dataBytes uint64
+		err              error
+	}
+	results := make([]partResult, len(parts))
+	var wait sync.WaitGroup
+	for n, part := range parts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results[n].files, results[n].dataBytes, results[n].err = view.readCheckpointPart(ctx, keys, part, out)
+		}()
+	}
+	wait.Wait()
+	for _, result := range results {
+		stats.Files += result.files
+		stats.DataBytes += result.dataBytes
+		if result.err != nil {
+			return nil, stats, result.err
+		}
+	}
+	return out, stats, nil
+}
+
+// readCheckpointPart reads one ordered run of records into out. Each record
+// has its own position in out, so parts never write the same element.
+func (view *CheckpointView) readCheckpointPart(ctx context.Context, keys []solana.PublicKey, reads []checkpointRead, out []*accounts.Account) (files, dataBytes uint64, err error) {
 	var file *os.File
 	var fileSlot, fileID uint64
 	defer func() {
@@ -272,12 +363,9 @@ func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.Publ
 		}
 	}()
 	for n, read := range reads {
-		if read.index < 0 {
-			continue
-		}
 		if n&255 == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, stats, err
+				return files, dataBytes, err
 			}
 		}
 		if file == nil || read.entry.Slot != fileSlot || read.entry.FileId != fileID {
@@ -285,29 +373,29 @@ func (view *CheckpointView) LoadAccounts(ctx context.Context, keys []solana.Publ
 				file.Close()
 				file = nil
 			}
-			path := db.appendVecPath(read.entry.Slot, read.entry.FileId)
+			path := view.db.appendVecPath(read.entry.Slot, read.entry.FileId)
 			opened, err := os.Open(path)
 			if err != nil {
-				return nil, stats, fmt.Errorf("open checkpoint data %s: %w", path, err)
+				return files, dataBytes, fmt.Errorf("open checkpoint data %s: %w", path, err)
 			}
 			file, fileSlot, fileID = opened, read.entry.Slot, read.entry.FileId
-			stats.Files++
+			files++
 		}
 		key := keys[read.index]
 		var record AppendVecAccount
 		section := io.NewSectionReader(file, int64(read.entry.Offset), 1<<62)
 		if err := record.unmarshal(section, ^uint64(0)); err != nil {
-			return nil, stats, fmt.Errorf("read %s at %s@%d: %w", key, file.Name(), read.entry.Offset, err)
+			return files, dataBytes, fmt.Errorf("read %s at %s@%d: %w", key, file.Name(), read.entry.Offset, err)
 		}
 		account := record.ToAccount()
 		if account.Key != key {
-			return nil, stats, fmt.Errorf("record at %s@%d holds %s, not %s", file.Name(), read.entry.Offset, account.Key, key)
+			return files, dataBytes, fmt.Errorf("record at %s@%d holds %s, not %s", file.Name(), read.entry.Offset, account.Key, key)
 		}
 		account.Slot = read.entry.Slot
-		stats.DataBytes += uint64(len(account.Data))
+		dataBytes += uint64(len(account.Data))
 		out[read.index] = account
 	}
-	return out, stats, nil
+	return files, dataBytes, nil
 }
 
 // foldManifestDirectory remembers where each fold's manifest is, so finding
@@ -355,4 +443,55 @@ func (dir *foldManifestDirectory) forget() {
 	dir.mu.Lock()
 	dir.bySeq = nil
 	dir.mu.Unlock()
+}
+
+// CheckpointBoundaries returns the fold boundaries a view can be opened at,
+// oldest first, without waiting on a fold in progress. A boundary may still
+// expire before it is used.
+func (db *AccountsDb) CheckpointBoundaries() ([]uint64, error) {
+	snapshot := db.Index.NewSnapshot()
+	defer snapshot.Close()
+	head, haveHead, err := readFoldMetaFrom(snapshot)
+	if err != nil || !haveHead {
+		return nil, err
+	}
+	floor, err := readCompactionHistoryFloorFrom(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	headers, err := db.foldManifests.headers(db.AcctsDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []uint64
+	for seq, header := range headers {
+		if seq >= floor.BatchSeq && seq <= head.BatchSeq {
+			out = append(out, header.ThroughSlot)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	return out, nil
+}
+
+// KeysWrittenAfter returns the accounts written by the fold that follows the
+// view's boundary: the accounts a replay of that fold changes. It returns nil
+// when the boundary is the head.
+func (view *CheckpointView) KeysWrittenAfter() ([]solana.PublicKey, error) {
+	headers, err := view.db.foldManifests.headers(view.db.AcctsDir)
+	if err != nil {
+		return nil, err
+	}
+	header, ok := headers[view.batchSeq+1]
+	if !ok {
+		return nil, nil
+	}
+	manifest, err := ReadSegmentManifest(header.Path)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]solana.PublicKey, len(manifest.Records))
+	for i := range manifest.Records {
+		keys[i] = solana.PublicKey(manifest.Records[i].Pubkey)
+	}
+	return keys, nil
 }

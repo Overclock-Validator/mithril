@@ -2,6 +2,7 @@ package accountsdb
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -68,6 +69,30 @@ func TestCheckpointViewOnStore(t *testing.T) {
 				}
 			}
 		}
+
+		// Reading several files at once, and a staged start: the first stage
+		// is about four blocks' worth of written accounts.
+		byWorkers := ""
+		for _, workers := range []int{1, 2, 4, 8} {
+			best := time.Hour
+			for range 3 {
+				start := time.Now()
+				_, _, err := view.LoadAccountsWith(context.Background(), keys, workers)
+				require.NoError(t, err)
+				best = min(best, time.Since(start))
+			}
+			byWorkers += fmt.Sprintf(" %d:%s", workers, best.Round(time.Microsecond))
+		}
+		firstStage := min(len(keys), 7000)
+		stagedStart := time.Now()
+		_, _, pending, err := view.LoadAccountsStaged(context.Background(), keys[:firstStage], keys[firstStage:], 4)
+		require.NoError(t, err)
+		firstReady := time.Since(stagedStart)
+		_, _, err = pending.Wait()
+		require.NoError(t, err)
+		allReady := time.Since(stagedStart)
+		t.Logf("boundary %d: best of 3 by workers%s | staged with 4 workers: first %d accounts ready in %s, all in %s",
+			boundary.ThroughSlot, byWorkers, firstStage, firstReady.Round(time.Microsecond), allReady.Round(time.Microsecond))
 
 		// The ordinary path, for scale: one index lookup and one read per key,
 		// with the account cache emptied first.

@@ -55,6 +55,21 @@ func requireCheckpointMatches(t *testing.T, view *CheckpointView, keys []solana.
 	require.Equal(t, uint64(len(keys)), stats.Requested)
 	require.Equal(t, absent, stats.Absent, msg)
 	require.Equal(t, uint64(len(keys)), stats.Changed+stats.Unchanged, msg)
+
+	// Any number of readers, and a staged load split anywhere, give the same accounts.
+	for _, workers := range []int{1, 3, 64} {
+		again, againStats, err := view.LoadAccountsWith(context.Background(), keys, workers)
+		require.NoError(t, err, msg)
+		require.Equal(t, got, again, "%s: %d workers", msg, workers)
+		require.Equal(t, stats, againStats, "%s: %d workers", msg, workers)
+	}
+	for _, split := range []int{0, 1, len(keys) / 3, len(keys)} {
+		first, _, pending, err := view.LoadAccountsStaged(context.Background(), keys[:split], keys[split:], 2)
+		require.NoError(t, err, msg)
+		rest, _, err := pending.Wait()
+		require.NoError(t, err, msg)
+		require.Equal(t, got, append(append([]*accounts.Account{}, first...), rest...), "%s: staged at %d", msg, split)
+	}
 	return stats
 }
 
@@ -259,4 +274,29 @@ func TestCheckpointViewAcrossCompaction(t *testing.T) {
 		require.NoError(t, openErr)
 		requireCheckpointMatches(t, reopened, keys, b.shadow, fmt.Sprintf("boundary %d reopened after compaction", b.through))
 	}
+}
+
+// A staged load stops its second stage when the caller gives up.
+func TestCheckpointViewStagedLoadHonorsCancellation(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	keys := make([]solana.PublicKey, 2000)
+	batch := make([]*accounts.Account, len(keys))
+	for i := range keys {
+		keys[i] = solana.PublicKey{byte(i), byte(i >> 8), 0xF7}
+		batch[i] = &accounts.Account{Key: keys[i], Lamports: 1}
+	}
+	commitTestBatch(t, db, 100, batch...)
+	view, err := db.OpenCheckpointView(100)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	first, _, pending, err := view.LoadAccountsStaged(ctx, keys[:10], keys[10:], 2)
+	require.NoError(t, err)
+	require.Len(t, first, 10)
+	cancel()
+	if _, _, err := pending.Wait(); err != nil {
+		require.ErrorIs(t, err, context.Canceled)
+	}
+	_, _, _, err = view.LoadAccountsStaged(ctx, keys[:10], keys[10:], 2)
+	require.ErrorIs(t, err, context.Canceled, "a cancelled first stage starts no second")
 }
