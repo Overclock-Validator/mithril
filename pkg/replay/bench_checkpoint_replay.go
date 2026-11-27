@@ -5,12 +5,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 )
@@ -34,6 +36,14 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
+		if path := os.Getenv("MITHRIL_BENCH_CHECKPOINT_REPLAY_PROFILE"); path != "" {
+			if file, err := os.Create(path); err == nil {
+				if pprof.StartCPUProfile(file) == nil {
+					defer pprof.StopCPUProfile()
+				}
+				defer file.Close()
+			}
+		}
 		var folds, blocks, mismatches, failures int
 		var loadTime, replayTime time.Duration
 		done := make(map[uint64]bool)
@@ -137,7 +147,12 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 			return replayed, wrong, load, elapsed, err
 		}
 		start := time.Now()
-		slotCtx, err := replay.Next(block)
+		var slotCtx *sealevel.SlotCtx
+		// The label marks this replay's samples (its workers inherit it) in a
+		// process-wide CPU profile.
+		pprof.Do(ctx, pprof.Labels("replay", "private"), func(context.Context) {
+			slotCtx, err = replay.Next(block)
+		})
 		elapsed += time.Since(start)
 		if err != nil {
 			return replayed, wrong, load, elapsed, err
