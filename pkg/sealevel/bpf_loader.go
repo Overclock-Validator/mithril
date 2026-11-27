@@ -1395,8 +1395,15 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	defer interpreter.Finish()
 	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddTimingSince(start)
 	start = time.Now()
+	available := execCtx.ComputeMeter.Remaining()
 	ret, _, runErr := interpreter.Run()
 	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddTimingSince(start)
+	if execCtx.Log != nil && !execCtx.SkipStableLogs {
+		execCtx.logConsumed(programId, available-execCtx.ComputeMeter.Remaining(), available)
+		if runErr == nil && ret == 0 {
+			execCtx.logReturn()
+		}
+	}
 
 	// Agave depletes the remaining transaction compute budget when the VM
 	// itself fails, including an access violation. A syscall error already

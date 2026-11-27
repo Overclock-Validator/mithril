@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -1855,7 +1856,8 @@ func TestInterpreter_Get_Processed_Sibling_Instruction_Test(t *testing.T) {
 	logStart := len(log.Logs)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{1})
 	require.NoError(t, err)
-	require.Len(t, log.Logs[logStart:], 7)
+	// Agave also logs "consumed" after each BPF program run, the CPI included.
+	require.Len(t, log.Logs[logStart:], 8)
 	require.Equal(t, "Program "+programPubkey.String()+" invoke [1]", log.Logs[logStart])
 	require.Equal(t, "Program "+programPubkey.String()+" success", log.Logs[len(log.Logs)-1])
 	programLogs := log.Logs[logStart+1 : len(log.Logs)-1]
@@ -1919,8 +1921,9 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 		"Program " + programPubkey.String() + " invoke [1]",
 		fmt.Sprintf("Program log: Signed by %s", signerPubkey),
 		`Program log: Memo (len 11): "hello world"`,
+		"Program " + programPubkey.String() + " consumed <n> of <m> compute units",
 		"Program " + programPubkey.String() + " success",
-	}, log.Logs)
+	}, maskConsumedUnits(log.Logs))
 
 	instrData = make([]byte, 2)
 	instrData[0] = 0xee
@@ -1933,8 +1936,9 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 		"Program " + programPubkey.String() + " invoke [1]",
 		fmt.Sprintf("Program log: Signed by %s", signerPubkey),
 		`Program log: Invalid UTF-8, from byte 0`,
+		"Program " + programPubkey.String() + " consumed <n> of <m> compute units",
 		"Program " + programPubkey.String() + " failed: invalid instruction data",
-	}, log.Logs[4:])
+	}, maskConsumedUnits(log.Logs[5:]))
 
 	for _, l := range log.Logs {
 		fmt.Printf("log: %s\n", l)
@@ -2082,4 +2086,16 @@ type testLogger struct {
 
 func (t testLogger) Printf(format string, args ...any) {
 	t.t.Logf(format, args...)
+}
+
+var consumedUnitsPattern = regexp.MustCompile(`^(Program \S+ consumed )\d+ of \d+( compute units)$`)
+
+// maskConsumedUnits replaces the counts of Agave's "consumed" log lines, which
+// depend on the length of keys a program logs and on the remaining budget.
+func maskConsumedUnits(logs []string) []string {
+	out := make([]string, len(logs))
+	for i, line := range logs {
+		out[i] = consumedUnitsPattern.ReplaceAllString(line, "${1}<n> of <m>${2}")
+	}
+	return out
 }

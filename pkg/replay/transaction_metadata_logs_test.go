@@ -3,6 +3,7 @@ package replay
 import (
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"sync"
 	"testing"
@@ -94,12 +95,13 @@ func TestTransactionMetadataRealLogsPreserveExecution(t *testing.T) {
 						"Program " + program + " invoke [1]",
 						"Program log: Signed by " + txfixture.PayerPubkey().String(),
 						`Program log: Memo (len 12): "metadata log"`,
+						"Program " + program + " consumed <n> of <m> compute units",
 						"Program " + program + " success",
 					}
 					if tc.failed {
 						logs = append(logs, "Program "+solana.SystemProgramID.String()+" invoke [1]", "Program "+solana.SystemProgramID.String()+" failed: invalid instruction data")
 					}
-					require.Equal(t, logs, capture.Record.LogMessages)
+					require.Equal(t, logs, maskConsumedUnits(capture.Record.LogMessages))
 					if tc.failed {
 						require.JSONEq(t, `{"InstructionError":[2,"InvalidInstructionData"]}`, string(capture.Record.Error))
 					} else {
@@ -206,4 +208,16 @@ func TestTransactionMetadataNativeTransferHasNoSyscallLogs(t *testing.T) {
 		"Program " + solana.SystemProgramID.String() + " invoke [1]",
 		"Program " + solana.SystemProgramID.String() + " success",
 	}, capture.Record.LogMessages)
+}
+
+var consumedUnitsPattern = regexp.MustCompile(`^(Program \S+ consumed )\d+ of \d+( compute units)$`)
+
+// maskConsumedUnits replaces the counts of Agave's "consumed" log lines,
+// which depend on the length of keys a program logs and on the CU limit.
+func maskConsumedUnits(logs []string) []string {
+	out := make([]string, len(logs))
+	for i, line := range logs {
+		out[i] = consumedUnitsPattern.ReplaceAllString(line, "${1}<n> of <m>${2}")
+	}
+	return out
 }

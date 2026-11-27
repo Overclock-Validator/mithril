@@ -118,9 +118,10 @@ func TestExecute_Tx_Sysvar_Instructions_Bpf_Test(t *testing.T) {
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.NoError(t, err)
-	require.Len(t, log.Logs, 18)
+	require.Len(t, log.Logs, 19)
 	require.Equal(t, "Program "+programPubkey.String()+" invoke [1]", log.Logs[0])
-	require.Equal(t, "Program "+programPubkey.String()+" success", log.Logs[17])
+	require.Equal(t, "Program "+programPubkey.String()+" consumed 76725 of 10000000000 compute units", log.Logs[17])
+	require.Equal(t, "Program "+programPubkey.String()+" success", log.Logs[18])
 	programLogs := log.Logs[1:17]
 
 	// instruction 1 program id & instr data
