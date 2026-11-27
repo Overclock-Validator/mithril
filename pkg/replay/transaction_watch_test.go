@@ -72,6 +72,21 @@ func TestWatchSetCapturesOnlyWatchedTransactions(t *testing.T) {
 		})
 	}
 
+	// The path a block takes when it is not streamed resets its capture for the
+	// attempt. The watch set must survive that reset.
+	for _, workers := range []int{0, 4} {
+		capture := blockMetadataCapture{watch: watch}
+		block := env.block(txs)
+		block.MarkTransactionSignaturesVerified()
+		_, err := processBlock(env.acctsDb, block, env.epochSchedule, workers, nil, &persistedTracker{},
+			&lifecycleTail{durable: env.durable}, NewTransactionStatusCache(), false, env.parent, &capture)
+		require.NoError(t, err)
+		require.NoError(t, capture.Err)
+		require.True(t, capture.Record.Watched, "whole block, %d workers", workers)
+		require.Equal(t, []*transactionMetadata{all.Record.Transactions[2], all.Record.Transactions[9]},
+			capture.Record.Transactions, "whole block, %d workers", workers)
+	}
+
 	// A block naming no watched address is still recorded, with no transactions,
 	// so coverage can tell it from a block that was never captured.
 	nobody, err := NewTransactionWatchSet([]string{solana.PublicKey{0xEE, 0xEE}.String()})

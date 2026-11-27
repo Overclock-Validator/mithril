@@ -549,6 +549,11 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	done := make(chan int, len(txs))
 	plannerDone := make(chan struct{})
 	workAhead := newWorkAhead(slotCtx, view, execute, dbgOpts)
+	if metadata.capturesEveryTransaction() {
+		// Every transaction must execute in order to be captured, so an early
+		// execution could never be adopted.
+		workAhead = nil
+	}
 	processTx := func(workerIdx, idx int) {
 		if !execute[idx] {
 			return
@@ -558,6 +563,9 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
 		}
 		executed, release := workAhead.claim(idx)
+		if metadata.transaction(idx) != nil {
+			executed = nil // a captured transaction executes here, not early
+		}
 		execStart := time.Now()
 		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransactionWithResult(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, executed, timings.at(workerIdx), metadata.transaction(idx), results.transaction(idx))
 		execElapsed := time.Since(execStart)

@@ -145,6 +145,11 @@ func (w *TransactionHistorySession) poll() error {
 			if errors.Is(w.pending.err, transactionhistory.ErrRetention) {
 				// Retention pressure omits this block, but later captures can retry.
 				result = "retention_refused"
+			} else if errors.Is(w.pending.err, transactionhistory.ErrLimit) || errors.Is(w.pending.err, errMetadataBudget) {
+				// This one block is larger than the store takes. It becomes a
+				// gap; the blocks after it are recorded as usual.
+				result = "block_too_large"
+				mlog.Log.Warnf("transaction history: slot %d is too large to record and is skipped: %v", w.pending.slot, w.pending.err)
 			} else if w.pending.err != nil {
 				result = "write_failed"
 				if w.err == nil {

@@ -102,8 +102,10 @@ func (block *blockMetadata) historyBlock() (transactionhistory.Block, error) {
 		}
 		// The writer validates its framed-record and batch budgets separately.
 		// Conversion retains at most one additional bounded record on refusal.
+		// The bound is the store's own for a block, not the capture's
+		// reservation ceiling, which is deliberately looser.
 		size := uint64(len(converted.Transaction) + len(converted.Metadata))
-		if size > metadataBlockLimit-bytes {
+		if size > historyBlockBytes-bytes {
 			return transactionhistory.Block{}, errMetadataBudget
 		}
 		bytes += size
@@ -111,3 +113,7 @@ func (block *blockMetadata) historyBlock() (transactionhistory.Block, error) {
 	}
 	return result, nil
 }
+
+// historyBlockBytes is the most transaction and metadata bytes one stored
+// block may hold: the store's block limit less its framing of each record.
+var historyBlockBytes = transactionhistory.DefaultLimits().MaxBlockBytes - metadataTransactionLimit*128

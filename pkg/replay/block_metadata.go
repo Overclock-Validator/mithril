@@ -72,6 +72,11 @@ func (capture *blockMetadataCapture) beginGroup(ctx *sealevel.SlotCtx, txs []*so
 	return group
 }
 
+// capturesEveryTransaction reports whether no watch set narrows the group.
+func (group *transactionMetadataGroup) capturesEveryTransaction() bool {
+	return group != nil && group.selected == nil
+}
+
 func (group *transactionMetadataGroup) transaction(index int) *transactionMetadataCapture {
 	if group == nil || (group.selected != nil && !group.selected[index]) {
 		return nil

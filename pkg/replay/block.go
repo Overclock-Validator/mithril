@@ -4945,6 +4945,11 @@ func parallelTxLoop(
 		trace := newDepTrace(block)
 		loopStart := time.Now()
 		workAhead := newWorkAhead(slotCtx, block, executionPlan.execute, dbgOpts)
+		if metadata.capturesEveryTransaction() {
+			// Every transaction must execute in order to be captured, so an
+			// early execution could never be adopted.
+			workAhead = nil
+		}
 		var onSend func(int)
 		if trace != nil {
 			onSend = func(tx int) { trace.recordSend(tx, time.Since(loopStart)) }
@@ -4975,6 +4980,9 @@ func parallelTxLoop(
 				shadow.ready(idx)
 			}
 			executed, release := workAhead.claim(idx)
+			if metadata.transaction(idx) != nil {
+				executed = nil // a captured transaction executes here, not early
+			}
 			execStart := time.Now()
 			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures, executed, timings.at(worker), metadata.transaction(idx), results.transaction(idx))
 			execElapsed := time.Since(execStart)
@@ -5263,7 +5271,8 @@ func processBlockWithResults(
 	results *blockResultCapture,
 ) (*sealevel.SlotCtx, error) {
 	if metadata != nil {
-		*metadata = blockMetadataCapture{}
+		// A fresh capture for this attempt, with the session's watch set kept.
+		*metadata = blockMetadataCapture{watch: metadata.watch}
 	}
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
