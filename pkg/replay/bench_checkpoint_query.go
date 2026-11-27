@@ -66,9 +66,8 @@ func startBenchCheckpointQuery(ctx context.Context, db *accountsdb.AccountsDb, p
 			runtime.GC()
 			runtime.ReadMemStats(&after)
 			gib := func(v uint64) float64 { return float64(v) / (1 << 30) }
-			mlog.Log.Infof("bench checkpoint query memory: heap in use %.2f GiB before a forced collection, %.2f after; idle heap not returned to the system %.2f GiB; taken from the system %.2f GiB; kept folds hold about %.2f GiB of account versions each; private parameter arena peak %.1f MiB in one block, %.1f MiB ever spilled to the heap",
-				gib(before.HeapAlloc), gib(after.HeapAlloc), gib(after.HeapIdle-after.HeapReleased), gib(after.Sys), gib(keptBytes),
-				float64(privateParameterPeak.Load())/(1<<20), float64(privateParameterOverflow.Load())/(1<<20))
+			mlog.Log.Infof("bench checkpoint query memory: heap in use %.2f GiB before a forced collection, %.2f after; idle heap not returned to the system %.2f GiB; taken from the system %.2f GiB; kept folds hold about %.2f GiB of account versions each",
+				gib(before.HeapAlloc), gib(after.HeapAlloc), gib(after.HeapIdle-after.HeapReleased), gib(after.Sys), gib(keptBytes))
 			if len(answers) == 0 {
 				mlog.Log.Infof("bench checkpoint query: no answers, %d failures", failures)
 				return
