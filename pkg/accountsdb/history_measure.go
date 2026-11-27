@@ -134,6 +134,7 @@ type historyMeasurer struct {
 	readNs   uint64
 	totalNs  uint64
 	seg      *hmSegState
+	xor      *hmXorState // set only with MITHRIL_HISTORY_MEASURE_XOR=1, which runs the XOR model alone
 }
 
 var (
@@ -175,6 +176,9 @@ func newHistoryMeasurer(dir string) (*historyMeasurer, error) {
 		return nil, err
 	}
 	m := &historyMeasurer{dir: dir, folds: map[[32]byte]uint64{}, isVote: map[[32]byte]bool{}, enc: enc, windows: w, seg: seg}
+	if os.Getenv("MITHRIL_HISTORY_MEASURE_XOR") == "1" {
+		m.xor = newHMXorState()
+	}
 	for _, n := range hmSpacings {
 		sp := &hmSpacing{n: n, window: -1, pending: map[[32]byte]*hmVer{}, prev: map[[32]byte]*hmVer{}}
 		if hmCompressSpacings[n] {
@@ -244,6 +248,30 @@ func (m *historyMeasurer) observe(db *AccountsDb, deltas []accounts.SlotDelta) {
 			}
 			m.folds[k] = 0
 		}
+	}
+
+	if m.xor != nil {
+		for _, sd := range deltas {
+			m.xorBeginSlot(sd.Slot)
+			for _, a := range sd.Delta {
+				if a == nil {
+					continue
+				}
+				k := [32]byte(a.Key)
+				v := hmFromAccount(a)
+				if a.Lamports == 0 {
+					v.absent = false
+				}
+				m.folds[k] |= 0
+				m.isVote[k] = a.Owner == hmVoteOwner
+				m.xorChange(k, v)
+			}
+			m.lastSlot = sd.Slot
+		}
+		m.batches++
+		m.totalNs += uint64(time.Since(start))
+		m.writeXor()
+		return
 	}
 
 	for _, sd := range deltas {
