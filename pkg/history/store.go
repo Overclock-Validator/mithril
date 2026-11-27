@@ -66,6 +66,7 @@ type Store struct {
 	segments      []*segment // ascending; the last one is open unless empty
 	lastBank      uint64     // slot of the newest bank record, when lastBankKnown
 	lastBankKnown bool
+	banks         bankFiles
 	repaired      string
 }
 
@@ -727,6 +728,7 @@ func (s *Store) TruncateFrom(slot uint64) error {
 			return nil
 		}
 		s.lastBankKnown = false
+		s.banks.clear()
 		// The index goes first: a crash part way leaves an open segment whose
 		// table is rebuilt from the chunks that remain.
 		if seg.index != nil {
@@ -772,5 +774,6 @@ func (s *Store) Reset() error {
 	}
 	s.segments = nil
 	s.lastBankKnown = false
+	s.banks.clear()
 	return nil
 }

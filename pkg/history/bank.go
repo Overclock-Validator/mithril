@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 // Bank context per recorded slot, so a past block can be replayed from history
@@ -157,6 +158,43 @@ func readBankFile(path string) (*BankData, error) {
 	return decodeBank(b)
 }
 
+// bankFiles keeps the last few parsed bank files: a query walking parent
+// links reads the same one or two files many times. Entries are dropped when
+// history is truncated or reset, since a re-recorded range reuses its name.
+type bankFiles struct {
+	mu    sync.Mutex
+	paths [4]string
+	data  [4]*BankData
+	next  int
+}
+
+func (c *bankFiles) get(path string) (*BankData, error) {
+	c.mu.Lock()
+	for i, p := range c.paths {
+		if p == path {
+			d := c.data[i]
+			c.mu.Unlock()
+			return d, nil
+		}
+	}
+	c.mu.Unlock()
+	d, err := readBankFile(path)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.paths[c.next], c.data[c.next] = path, d
+	c.next = (c.next + 1) % len(c.paths)
+	c.mu.Unlock()
+	return d, nil
+}
+
+func (c *bankFiles) clear() {
+	c.mu.Lock()
+	c.paths, c.data = [4]string{}, [4]*BankData{}
+	c.mu.Unlock()
+}
+
 func (c *chunkMeta) bankPath() string {
 	return filepath.Join(filepath.Dir(c.path), bankFileName(c.from, c.to))
 }
@@ -176,7 +214,8 @@ func (s *Store) chunkFor(slot uint64) (int, int) {
 	return -1, -1
 }
 
-// BankAt returns the bank context of the folded block at slot.
+// BankAt returns the bank context of the folded block at slot. The returned
+// records are shared: callers must not modify them.
 func (s *Store) BankAt(slot uint64) (SlotBank, error) {
 	s.mu.RLock()
 	i, j := s.chunkFor(slot)
@@ -188,7 +227,7 @@ func (s *Store) BankAt(slot uint64) (SlotBank, error) {
 	if path == "" {
 		return SlotBank{}, ErrNoBank
 	}
-	d, err := readBankFile(path)
+	d, err := s.banks.get(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return SlotBank{}, ErrNoBank
 	}
@@ -203,7 +242,7 @@ func (s *Store) BankAt(slot uint64) (SlotBank, error) {
 }
 
 // ChunkBankAtOrBefore returns the newest chunk record whose slot is at or
-// before slot.
+// before slot. The caller owns the returned copy.
 func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 	s.mu.RLock()
 	// Newest first: the first chunk record at or before slot wins. Chunks
@@ -219,7 +258,7 @@ func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 	}
 	s.mu.RUnlock()
 	for _, p := range paths {
-		d, err := readBankFile(p)
+		d, err := s.banks.get(p)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -227,7 +266,10 @@ func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 			return nil, err
 		}
 		if d.Top != nil && d.Top.Slot <= slot {
-			return d.Top, nil
+			c := *d.Top // a copy: the parsed file is cached
+			c.AccountsLtHash = append([]byte(nil), d.Top.AccountsLtHash...)
+			c.RecentBlockhashes = append([]BlockhashFee(nil), d.Top.RecentBlockhashes...)
+			return &c, nil
 		}
 	}
 	return nil, ErrNoBank
