@@ -584,7 +584,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	}
 	if directDispatch && schedulingOnFor(slotCtx.Slot) {
 		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
-			runDependencyPlan(plan, workers, workAhead, scheduleFor(txs, slotCtx.Slot), nil, processTx))
+			runDependencyPlan(plan, workers, workAhead, hintedSchedule(slotCtx, txs, scheduleFor(txs, slotCtx.Slot)), nil, processTx))
 	} else {
 		go func() {
 			defer close(plannerDone)
@@ -768,6 +768,7 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	start = time.Now()
 	setReplayStage("bankhash")
 	slotCtx.FinalBankhash = bankhash.CalculateBankHash(slotCtx, writableAccts, modifiedAccts, block.ParentBankhash, slotCtx.NumSignatures, block.Blockhash)
+	sealReplayHints(slotCtx, block)
 	metrics.GlobalBlockReplay.BankHash.AddTimingSince(start)
 	if alpenglowClock {
 		footerVerificationStart := time.Now()

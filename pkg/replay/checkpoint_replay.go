@@ -187,7 +187,23 @@ type CheckpointReplay struct {
 	parentSysvars *sealevel.BankSysvars
 	blockHeight   uint64
 	epoch         uint64
+
+	// useHints replays each block with the hints this node stored for it.
+	useHints bool
+	// HintedBlocks and SkippedFailures count what the hints did.
+	HintedBlocks, SkippedFailures int64
 }
+
+// ErrReplayHintsDisagree means a block did not behave as its stored hints
+// said. The replay's state is not to be trusted from that block on: discard
+// it and replay again without hints.
+var ErrReplayHintsDisagree = errors.New("a block did not match this node's stored replay hints")
+
+// UseHints makes the replay use this node's stored hints for each block that
+// has them (see replay_hints.go). The caller must compare every bank hash with
+// the recorded one and, on a mismatch or ErrReplayHintsDisagree, discard this
+// replay and run it again without hints.
+func (r *CheckpointReplay) UseHints(on bool) { r.useHints = on }
 
 // NewCheckpointReplay prepares a replay that starts after view's boundary.
 // persisted supplies what a resume record does not carry (the fee governor's
@@ -267,9 +283,23 @@ func (r *CheckpointReplay) Next(block *b.Block) (*sealevel.SlotCtx, error) {
 	block.LastBlockhash = r.parent.Blockhash
 	block.BlockHeight = r.blockHeight + 1
 	block.Features = r.parent.Features
+	var use *hintUse
+	if r.useHints {
+		if hints := hintsFor(block); hints != nil {
+			use = &hintUse{hints: hints}
+			block.ReplayHints = use
+		}
+	}
 	slotCtx, err := processBlock(r.db, block, r.epochSchedule, r.workers, nil, r.hashes, r.tail, r.statuses, true, r.parentSysvars, nil)
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint replay of slot %d: %w", block.Slot, err)
+	}
+	if use != nil {
+		if use.violated.Load() {
+			return nil, fmt.Errorf("slot %d: %w", block.Slot, ErrReplayHintsDisagree)
+		}
+		r.HintedBlocks++
+		r.SkippedFailures += use.skipped.Load()
 	}
 	r.parent, r.parentSysvars, r.blockHeight = slotCtx, slotCtx.BankSysvars(), block.BlockHeight
 	return slotCtx, nil

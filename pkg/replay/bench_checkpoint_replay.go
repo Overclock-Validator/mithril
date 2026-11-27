@@ -22,6 +22,9 @@ import (
 // privately from the fold boundary before it, and compares every bank hash
 // with the one the fold recorded. The directory holds this node's spooled
 // shred files (s<slot>.shreds) for those slots. Nothing is published.
+// MITHRIL_BENCH_CHECKPOINT_REPLAY_HINTS=1 (with MITHRIL_REPLAY_HINTS=1) replays
+// with the node's stored hints; a fold whose hinted replay disagrees is
+// replayed again without them and counted as a fallback.
 func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState) (wait func()) {
 	spec := os.Getenv("MITHRIL_BENCH_CHECKPOINT_REPLAY")
 	if spec == "" || db == nil || persisted == nil {
@@ -45,7 +48,9 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 				}
 			}
 		}
-		var folds, blocks, mismatches, failures int
+		var folds, blocks, mismatches, failures, fallbacks int
+		var hinted, skipped int64
+		hints := os.Getenv("MITHRIL_BENCH_CHECKPOINT_REPLAY_HINTS") == "1"
 		var loadTime, replayTime time.Duration
 		done := make(map[uint64]bool)
 		defer func() {
@@ -53,8 +58,8 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 			if blocks > 0 {
 				perBlock = replayTime / time.Duration(blocks)
 			}
-			mlog.Log.Infof("bench checkpoint replay: %d folds, %d blocks, %d bank hash mismatches, %d failures, %d workers; load %s per fold, replay %s per block",
-				folds, blocks, mismatches, failures, workers, (loadTime / time.Duration(max(1, folds))).Round(time.Microsecond), perBlock.Round(time.Microsecond))
+			mlog.Log.Infof("bench checkpoint replay: %d folds, %d blocks, %d bank hash mismatches, %d failures, %d workers; hints %t: %d hinted blocks, %d failed transactions not executed, %d fallbacks; load %s per fold, replay %s per block",
+				folds, blocks, mismatches, failures, workers, hints, hinted, skipped, fallbacks, (loadTime / time.Duration(max(1, folds))).Round(time.Microsecond), perBlock.Round(time.Microsecond))
 		}()
 		for ctx.Err() == nil {
 			boundaries, err := db.CheckpointBoundaries()
@@ -77,7 +82,15 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 				continue
 			}
 			done[next] = true
-			replayed, wrong, load, elapsed, err := benchReplayFold(ctx, db, persisted, next, workers, shredDir)
+			result, err := benchReplayFold(ctx, db, persisted, next, workers, shredDir, hints)
+			if hints && ctx.Err() == nil && (err != nil || result.wrong > 0) {
+				fallbacks++
+				mlog.Log.Infof("bench checkpoint replay: fold after %d with hints: %d mismatches, err %v; replaying without hints", next, result.wrong, err)
+				result, err = benchReplayFold(ctx, db, persisted, next, workers, shredDir, false)
+			}
+			replayed, wrong, load, elapsed := result.replayed, result.wrong, result.load, result.elapsed
+			hinted += result.hinted
+			skipped += result.skipped
 			if err != nil {
 				if ctx.Err() == nil {
 					failures++
@@ -106,46 +119,58 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 // benchReplayFold replays the fold after boundary. It returns the blocks
 // replayed and how many had a bank hash other than the recorded one; zero
 // blocks means the fold's shreds are not in the directory.
-func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState, boundary uint64, workers int, shredDir string) (replayed, wrong int, load, elapsed time.Duration, err error) {
+type benchFoldResult struct {
+	replayed, wrong int
+	load, elapsed   time.Duration
+	hinted, skipped int64
+}
+
+func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState, boundary uint64, workers int, shredDir string, hints bool) (result benchFoldResult, err error) {
+	replayed, wrong, load, elapsed, hinted, skipped, err := benchReplayFoldRun(ctx, db, persisted, boundary, workers, shredDir, hints)
+	return benchFoldResult{replayed, wrong, load, elapsed, hinted, skipped}, err
+}
+
+func benchReplayFoldRun(ctx context.Context, db *accountsdb.AccountsDb, persisted *state.MithrilState, boundary uint64, workers int, shredDir string, hints bool) (replayed, wrong int, load, elapsed time.Duration, hinted, skipped int64, err error) {
 	view, err := db.OpenCheckpointView(boundary)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, 0, err
 	}
 	fold, err := view.FoldAfter()
 	if err != nil || fold == nil || len(fold.Bankhashes) == 0 {
 		mlog.Log.Infof("bench checkpoint replay: skip %d: fold %v, err %v", boundary, fold != nil, err)
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, 0, err
 	}
 	for _, slot := range fold.Bankhashes {
 		if _, statErr := os.Stat(filepath.Join(shredDir, turbine.SpoolFileName(slot.Slot))); statErr != nil {
 			mlog.Log.Infof("bench checkpoint replay: skip %d: fold (%d, %d] has %d hashes, no shreds for slot %d", boundary, fold.FromSlot, fold.ThroughSlot, len(fold.Bankhashes), slot.Slot)
-			return 0, 0, 0, 0, nil
+			return 0, 0, 0, 0, 0, 0, nil
 		}
 	}
 	loadStart := time.Now()
 	mlog.Log.Infof("bench checkpoint replay: fold after %d: setting up", boundary)
 	replay, err := NewCheckpointReplay(ctx, db, view, persisted, workers)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, 0, err
 	}
+	replay.UseHints(hints)
 	loaded, _, err := view.LoadAccounts(ctx, fold.Keys)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, 0, err
 	}
 	replay.Preload(fold.Keys, loaded)
 	load = time.Since(loadStart)
 	mlog.Log.Infof("bench checkpoint replay: fold after %d: set up and loaded %d accounts in %s", boundary, len(fold.Keys), load.Round(time.Millisecond))
 	for _, want := range fold.Bankhashes {
 		if err := ctx.Err(); err != nil {
-			return replayed, wrong, load, elapsed, err
+			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
 		}
 		packets, err := turbine.ReadSpoolFile(filepath.Join(shredDir, turbine.SpoolFileName(want.Slot)))
 		if err != nil {
-			return replayed, wrong, load, elapsed, err
+			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
 		}
 		block, err := turbine.BlockFromSpooledPackets(want.Slot, packets)
 		if err != nil {
-			return replayed, wrong, load, elapsed, err
+			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
 		}
 		start := time.Now()
 		var slotCtx *sealevel.SlotCtx
@@ -156,7 +181,7 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 		})
 		elapsed += time.Since(start)
 		if err != nil {
-			return replayed, wrong, load, elapsed, err
+			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
 		}
 		replayed++
 		if !bytes.Equal(slotCtx.FinalBankhash, want.Bankhash[:]) {
@@ -166,5 +191,5 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 			}
 		}
 	}
-	return replayed, wrong, load, elapsed, nil
+	return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, nil
 }

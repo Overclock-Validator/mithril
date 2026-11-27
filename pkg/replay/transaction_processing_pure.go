@@ -462,7 +462,17 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	var instrErr error
 	var currentInstrIdx uint8
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
+	if use := hintUseOf(slotCtx); use != nil && use.knownFailure(tx) {
+		// This node recorded that the transaction failed. Its only effects are
+		// the fee and a nonce advance, applied by the failure path below, so
+		// none of its instructions run.
+		instrErr = sealevel.InstrErrProgramFailedToComplete
+		use.skipped.Add(1)
+	}
 	for instrIdx, instr := range tx.Message.Instructions {
+		if instrErr != nil {
+			break
+		}
 		currentInstrIdx = uint8(instrIdx)
 		execCtx.SetCurrentTopLevelInstr(uint8(instrIdx))
 		if instructionsSysvarIdx >= 0 {

@@ -757,6 +757,9 @@ func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.W
 	if capture != nil {
 		*capture = transactionMetadataCapture{budget: capture.budget}
 	}
+	if slotCtx.ReplayHints != nil {
+		defer func() { replayHintsAtOutcome(slotCtx, tx, computeUnits, executionErr != nil) }()
+	}
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {

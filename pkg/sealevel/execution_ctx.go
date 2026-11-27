@@ -149,7 +149,10 @@ type SlotCtx struct {
 	DeferVoteCachePublication bool
 	// PrivateReplay marks a bank replayed on the side from an earlier
 	// checkpoint (see block.Block.PrivateReplay): it publishes nothing.
-	PrivateReplay           bool
+	PrivateReplay bool
+	// ReplayHints is owned by package replay: a recorder while the node
+	// replays a block, the block's stored hints during a private replay.
+	ReplayHints             any
 	PendingVoteCacheMu      sync.Mutex
 	PendingVoteCache        map[solana.PublicKey]*VoteStateVersions
 	PendingVoteCacheDeletes map[solana.PublicKey]struct{}

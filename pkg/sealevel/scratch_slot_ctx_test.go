@@ -54,6 +54,7 @@ var derivedSlotCtxFields = map[string]string{
 	"bankSysvars":               "shared",
 	"TraceCtx":                  "shared",
 	"DeferVoteCachePublication": "private",
+	"ReplayHints":               "private", // hints belong to the block being replayed, not to a derived context
 	"PrivateReplay":             "private", // a derived context publishes nothing in any case
 	"PendingVoteCacheMu":        "private",
 	"PendingVoteCache":          "private",

@@ -313,6 +313,9 @@ func plannerAccountsForBlock(b *block.Block) ([]plannerTransactionAccounts, bool
 		accounts[idx] = builder.finish()
 		storageOffset += capacity
 	}
+	if use := blockHintUse(b); use != nil {
+		use.applyGraph(b.Transactions, accounts)
+	}
 	return accounts, true
 }
 

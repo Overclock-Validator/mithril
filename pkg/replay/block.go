@@ -4679,6 +4679,11 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 		slotCtx.SerializedParameterArena = nil
 		slotCtx.PrivateReplay = true
 		slotCtx.DeferVoteCachePublication = true
+		if use := blockHintUse(block); use != nil {
+			slotCtx.ReplayHints = use
+		}
+	} else if replayHintsEnabled {
+		slotCtx.ReplayHints = &hintRecorder{}
 	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
@@ -5040,7 +5045,7 @@ func parallelTxLoop(
 
 		if directDispatch && shadow == nil && schedulingOnFor(slotCtx.Slot) {
 			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
-				runDependencyPlan(dependencyPlan, txParallelism, workAhead, scheduleFor(block.Transactions, slotCtx.Slot), onSend, processTx))
+				runDependencyPlan(dependencyPlan, txParallelism, workAhead, hintedSchedule(slotCtx, block.Transactions, scheduleFor(block.Transactions, slotCtx.Slot)), onSend, processTx))
 		} else {
 			go func() {
 				defer close(plannerDone)

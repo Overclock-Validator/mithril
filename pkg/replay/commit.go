@@ -40,6 +40,7 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 	if workAheadUnchanged {
 		learnUnchanged(execCtx)
 	}
+	replayHintsAtCommit(slotCtx, execCtx)
 	stats := handleModifiedAccounts(slotCtx, execCtx)
 	if recordMetrics {
 		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionTxPublishTouchedAccountState, touchedStart)
