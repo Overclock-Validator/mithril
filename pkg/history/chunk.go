@@ -1,0 +1,311 @@
+package history
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"sort"
+	"sync"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// A chunk file holds one fold's history, records sorted by account key and
+// compressed in blocks:
+//
+//	magic "MHCHUNK1"
+//	blocks: one zstd frame each, records in key order
+//	index: per block {first key [32], offset u64, compressed len u32, raw len u32}
+//	footer: index offset u64, block count u32, index crc32 u32,
+//	        from slot u64, to slot u64, magic "MHCHUNK1"
+//
+// A record is: key [32], flags byte (bit 0: a full copy follows), the full
+// copy (AppendWhole), then a uvarint count of differences, each a uvarint slot
+// offset from the chunk's first slot, a uvarint length and the XOR bytes.
+const (
+	chunkMagic      = "MHCHUNK1"
+	chunkFooterLen  = 8 + 4 + 4 + 8 + 8 + 8
+	indexEntryLen   = 32 + 8 + 4 + 4
+	targetBlockSize = 64 << 10
+	recordHasFull   = 1
+)
+
+// Diff is one slot's change to an account.
+type Diff struct {
+	Slot  uint64
+	Bytes []byte
+}
+
+// Record is one account's history within a chunk.
+type Record struct {
+	Key   [32]byte
+	Full  *Version // version before the first change in the segment; nil if not in this chunk
+	Diffs []Diff   // ascending by slot
+}
+
+var (
+	encOnce sync.Once
+	enc     *zstd.Encoder
+	dec     *zstd.Decoder
+)
+
+func codecs() (*zstd.Encoder, *zstd.Decoder) {
+	encOnce.Do(func() {
+		enc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		dec, _ = zstd.NewReader(nil)
+	})
+	return enc, dec
+}
+
+func appendRecord(dst []byte, r *Record, from uint64) []byte {
+	dst = append(dst, r.Key[:]...)
+	if r.Full != nil {
+		dst = append(dst, recordHasFull)
+		dst = AppendWhole(dst, r.Full)
+	} else {
+		dst = append(dst, 0)
+	}
+	dst = binary.AppendUvarint(dst, uint64(len(r.Diffs)))
+	for _, d := range r.Diffs {
+		dst = binary.AppendUvarint(dst, d.Slot-from)
+		dst = binary.AppendUvarint(dst, uint64(len(d.Bytes)))
+		dst = append(dst, d.Bytes...)
+	}
+	return dst
+}
+
+func readRecord(b []byte, from uint64) (*Record, []byte, error) {
+	if len(b) < 33 {
+		return nil, nil, errChunk
+	}
+	r := &Record{}
+	copy(r.Key[:], b[:32])
+	flags := b[32]
+	b = b[33:]
+	if flags&recordHasFull != 0 {
+		v, rest, err := ReadWhole(b)
+		if err != nil {
+			return nil, nil, err
+		}
+		r.Full, b = v, rest
+	}
+	n, k := binary.Uvarint(b)
+	if k <= 0 {
+		return nil, nil, errChunk
+	}
+	b = b[k:]
+	r.Diffs = make([]Diff, 0, n)
+	for i := uint64(0); i < n; i++ {
+		off, k1 := binary.Uvarint(b)
+		if k1 <= 0 {
+			return nil, nil, errChunk
+		}
+		b = b[k1:]
+		l, k2 := binary.Uvarint(b)
+		if k2 <= 0 || l > uint64(len(b)-k2) {
+			return nil, nil, errChunk
+		}
+		b = b[k2:]
+		r.Diffs = append(r.Diffs, Diff{Slot: from + off, Bytes: b[:l:l]})
+		b = b[l:]
+	}
+	return r, b, nil
+}
+
+var errChunk = errors.New("history: malformed chunk")
+
+// writeChunk writes records (sorted by key) as a chunk file covering slots
+// [from, to], through a temporary file renamed into place after fsync.
+func writeChunk(path string, from, to uint64, records []*Record) error {
+	e, _ := codecs()
+	out := []byte(chunkMagic)
+	var index []byte
+	var raw []byte
+	var first [32]byte
+	blocks := 0
+	flush := func() {
+		if len(raw) == 0 {
+			return
+		}
+		z := e.EncodeAll(raw, nil)
+		index = append(index, first[:]...)
+		index = binary.LittleEndian.AppendUint64(index, uint64(len(out)))
+		index = binary.LittleEndian.AppendUint32(index, uint32(len(z)))
+		index = binary.LittleEndian.AppendUint32(index, uint32(len(raw)))
+		out = append(out, z...)
+		raw = raw[:0]
+		blocks++
+	}
+	for _, r := range records {
+		if len(raw) == 0 {
+			first = r.Key
+		}
+		raw = appendRecord(raw, r, from)
+		if len(raw) >= targetBlockSize {
+			flush()
+		}
+	}
+	flush()
+	indexOffset := uint64(len(out))
+	out = append(out, index...)
+	out = binary.LittleEndian.AppendUint64(out, indexOffset)
+	out = binary.LittleEndian.AppendUint32(out, uint32(blocks))
+	out = binary.LittleEndian.AppendUint32(out, crc32.ChecksumIEEE(index))
+	out = binary.LittleEndian.AppendUint64(out, from)
+	out = binary.LittleEndian.AppendUint64(out, to)
+	out = append(out, chunkMagic...)
+	return writeFileSync(path, out)
+}
+
+func writeFileSync(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+type blockRef struct {
+	first      [32]byte
+	offset     uint64
+	clen, rlen uint32
+}
+
+// chunkReader reads one chunk file. Its index is kept in memory; blocks are
+// read and decompressed on demand.
+type chunkReader struct {
+	path     string
+	from, to uint64
+	blocks   []blockRef
+}
+
+func openChunk(path string) (*chunkReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := st.Size()
+	if size < int64(len(chunkMagic)+chunkFooterLen) {
+		return nil, fmt.Errorf("%w: %s too short", errChunk, path)
+	}
+	foot := make([]byte, chunkFooterLen)
+	if _, err := f.ReadAt(foot, size-chunkFooterLen); err != nil {
+		return nil, err
+	}
+	if string(foot[32:]) != chunkMagic {
+		return nil, fmt.Errorf("%w: %s bad footer", errChunk, path)
+	}
+	indexOffset := binary.LittleEndian.Uint64(foot)
+	n := int(binary.LittleEndian.Uint32(foot[8:]))
+	sum := binary.LittleEndian.Uint32(foot[12:])
+	c := &chunkReader{path: path, from: binary.LittleEndian.Uint64(foot[16:]), to: binary.LittleEndian.Uint64(foot[24:])}
+	index := make([]byte, n*indexEntryLen)
+	if int64(indexOffset)+int64(len(index)) != size-chunkFooterLen {
+		return nil, fmt.Errorf("%w: %s index bounds", errChunk, path)
+	}
+	if _, err := f.ReadAt(index, int64(indexOffset)); err != nil {
+		return nil, err
+	}
+	if crc32.ChecksumIEEE(index) != sum {
+		return nil, fmt.Errorf("%w: %s index checksum", errChunk, path)
+	}
+	c.blocks = make([]blockRef, n)
+	for i := range c.blocks {
+		e := index[i*indexEntryLen:]
+		copy(c.blocks[i].first[:], e[:32])
+		c.blocks[i].offset = binary.LittleEndian.Uint64(e[32:])
+		c.blocks[i].clen = binary.LittleEndian.Uint32(e[40:])
+		c.blocks[i].rlen = binary.LittleEndian.Uint32(e[44:])
+	}
+	return c, nil
+}
+
+func (c *chunkReader) close() error { return nil }
+
+// block reads and decompresses block i. The file is opened per read so a
+// store with thousands of chunks holds no descriptors.
+func (c *chunkReader) block(i int) ([]byte, error) {
+	b := c.blocks[i]
+	f, err := os.Open(c.path)
+	if err != nil {
+		return nil, err
+	}
+	z := make([]byte, b.clen)
+	_, err = f.ReadAt(z, int64(b.offset))
+	f.Close()
+	if err != nil {
+		return nil, err
+	}
+	_, d := codecs()
+	raw, err := d.DecodeAll(z, make([]byte, 0, b.rlen))
+	if err != nil {
+		return nil, fmt.Errorf("history: %s block %d: %w", c.path, i, err)
+	}
+	return raw, nil
+}
+
+// lookup returns the record for key, or nil if the chunk does not hold it.
+func (c *chunkReader) lookup(key [32]byte) (*Record, error) {
+	i := sort.Search(len(c.blocks), func(i int) bool { return bytes.Compare(c.blocks[i].first[:], key[:]) > 0 }) - 1
+	if i < 0 {
+		return nil, nil
+	}
+	raw, err := c.block(i)
+	if err != nil {
+		return nil, err
+	}
+	for len(raw) > 0 {
+		r, rest, err := readRecord(raw, c.from)
+		if err != nil {
+			return nil, fmt.Errorf("history: %s: %w", c.path, err)
+		}
+		switch bytes.Compare(r.Key[:], key[:]) {
+		case 0:
+			return r, nil
+		case 1:
+			return nil, nil
+		}
+		raw = rest
+	}
+	return nil, nil
+}
+
+// keys returns every key in the chunk in order, with whether its record holds
+// a full copy. Used to rebuild the open segment's table after a restart.
+func (c *chunkReader) keys(fn func(key [32]byte)) error {
+	for i := range c.blocks {
+		raw, err := c.block(i)
+		if err != nil {
+			return err
+		}
+		for len(raw) > 0 {
+			r, rest, err := readRecord(raw, c.from)
+			if err != nil {
+				return err
+			}
+			fn(r.Key)
+			raw = rest
+		}
+	}
+	return nil
+}

@@ -111,6 +111,8 @@ type AccountsDb struct {
 	compactCRCBuf         []byte // reused to stream retained manifests through their CRC
 	rewindPending         bool   // guarded by foldMu until lowered state is saved
 	rewindHooks           rewindTestHooks
+
+	history historyState // optional record of past account versions, fed by folds
 }
 
 // DurableThrough returns the highest slot whose fold is fully committed.

@@ -120,6 +120,7 @@ func (db *AccountsDb) CommitBatch(
 	bankhashes map[uint64][32]byte,
 	resumeCtx []byte,
 ) (BatchCommitResult, error) {
+	db.recordHistory(deltas, throughSlot)
 	var timings FoldTimings
 	clock := stepClock{last: time.Now()}
 	timings.LockRequestedNS = clock.last.UnixNano()
