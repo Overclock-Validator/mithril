@@ -452,7 +452,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 
 	// Set rent-exempt rent epoch max and compute pre-tx rent states
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
-	rent.MaybeSetRentExemptRentEpochMax(slotCtx, &rentSysvar, &execCtx.Features, &execCtx.TransactionContext.Accounts)
+	rent.MaybeSetRentExemptRentEpochMax(slotCtx, &rentSysvar, &execCtx.Features, &execCtx.TransactionContext.Accounts, input.IsSimulation)
 	preTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
 	input.TimingRecorder.AddTimingSince(metrics.TransactionPreTxRentStates, start)
 

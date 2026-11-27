@@ -203,11 +203,12 @@ func VerifyRentStateChanges(preStates []*RentStateInfo, postStates []*RentStateI
 	return nil
 }
 
-func MaybeSetRentExemptRentEpochMax(slotCtx *sealevel.SlotCtx, rent *sealevel.SysvarRent, f *features.Features, txAccts *sealevel.TransactionAccounts) {
+// MaybeSetRentExemptRentEpochMax marks rent-exempt accounts. writableOnly
+// leaves read-only accounts as loaded, which a simulation needs so that the
+// accounts it returns are unmodified. Replay passes false.
+func MaybeSetRentExemptRentEpochMax(slotCtx *sealevel.SlotCtx, rent *sealevel.SysvarRent, f *features.Features, txAccts *sealevel.TransactionAccounts, writableOnly bool) {
 	for idx := range txAccts.Accounts {
-		// The epoch test is two compares and almost always false, so it runs
-		// before the costlier writability test.
-		if ShouldSetRentExemptRentEpochMax(slotCtx, rent, f, txAccts.Accounts[idx]) && sealevel.IsWritable(txAccts.AcctMetas[idx], f) {
+		if ShouldSetRentExemptRentEpochMax(slotCtx, rent, f, txAccts.Accounts[idx]) && (!writableOnly || sealevel.IsWritable(txAccts.AcctMetas[idx], f)) {
 			touchedAcct, err := txAccts.Touch(uint64(idx))
 			if err != nil {
 				panic("unable to mark rent-exempt account as touched")

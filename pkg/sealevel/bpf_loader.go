@@ -1637,6 +1637,10 @@ func mapVirtualAddressSpaceRunErr(execCtx *ExecutionCtx, err error, inputRegions
 	return err
 }
 
+// normalizeProgramRunErr maps a program's exit to an instruction error. A
+// failed cross-program call reaches here wrapped, and reports the callee's
+// custom code, as Agave does. This chooses the reported error only: the
+// instruction fails either way.
 func normalizeProgramRunErr(err error) error {
 	if err == nil {
 		return nil
@@ -1700,8 +1704,9 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	if !programAcct.IsExecutable() {
 		return InstrErrUnsupportedProgramId
 	}
-	// The loader already validated the real account; legacy metadata-only
-	// program stubs deliberately carry zero lamports.
+	// Before DisableAccountLoaderSpecialCase activates, the account loader
+	// passes a program that no instruction names as a metadata-only stub with
+	// zero lamports, having validated the real account itself.
 	if programAcct.Lamports() == 0 && !programAcct.Account.IsDummy {
 		return InstrErrUnsupportedProgramId
 	}

@@ -27,7 +27,7 @@ func TestRentEpochNormalizationOnlyTouchesWritableAccounts(t *testing.T) {
 				tx := sealevel.NewTransactionAccountsFromRefs([]*accounts.Account{source}, []bool{true})
 				tx.AcctMetas = []*sealevel.AccountMeta{{Pubkey: key, IsWritable: writable}}
 				rent := testRent()
-				MaybeSetRentExemptRentEpochMax(&sealevel.SlotCtx{Slot: 100, Epoch: 2}, &rent, f, tx)
+				MaybeSetRentExemptRentEpochMax(&sealevel.SlotCtx{Slot: 100, Epoch: 2}, &rent, f, tx, true)
 				if writable && !sysvar {
 					require.Equal(t, uint64(math.MaxUint64), tx.Accounts[0].RentEpoch)
 					require.True(t, tx.Touched[0])
@@ -49,7 +49,7 @@ func TestRentEpochNormalizationRequiresTransactionMetadata(t *testing.T) {
 		tx := sealevel.NewTransactionAccounts([]accounts.Account{{Key: solana.PublicKey{70}, Lamports: 1_000_000}})
 		tx.AcctMetas = metas
 		require.Panics(t, func() {
-			MaybeSetRentExemptRentEpochMax(&sealevel.SlotCtx{}, &rent, features.NewFeaturesDefault(), tx)
+			MaybeSetRentExemptRentEpochMax(&sealevel.SlotCtx{}, &rent, features.NewFeaturesDefault(), tx, true)
 		}, "invalid internal metadata must not be assumed writable")
 	}
 }
