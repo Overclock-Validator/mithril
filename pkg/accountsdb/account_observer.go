@@ -39,6 +39,12 @@ func (db *AccountsDb) CommittedAccountVersion() (uint64, bool) {
 	return version, db.accountStateVersion.Load() == version
 }
 
+// AccountStateUncertain reports that the last committed-state change failed
+// part way, such as a rewind that undid the index but not its files. Unlike
+// an unstable CommittedAccountVersion, it is not set while a fold is merely
+// writing its segment: that fold publishes its accounts later, atomically.
+func (db *AccountsDb) AccountStateUncertain() bool { return db.accountStateUncertain.Load() }
+
 // CommittedAccountSlot identifies the last completed write. Zero is the
 // snapshot baseline, whose slot is supplied by the RPC's initial bank state.
 // Use only inside a stable CommittedAccountVersion fence.

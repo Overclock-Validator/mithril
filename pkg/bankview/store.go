@@ -26,12 +26,16 @@ func (s StoreAccounts) LookupAt(pubkey [32]byte, maxSlot uint64) (*accounts.Acco
 func (s StoreAccounts) ReadPublication() (uint64, uint64, bool) { return durablePublication(s.DB) }
 
 // durablePublication combines the store's read-cache epoch, which every fold
-// publication advances, with its committed account version, which rewinds
-// and recoveries advance and which is unstable while one is in progress.
+// publication advances, with its committed account version, which every
+// fold, rewind and recovery advances. A read that overlaps either is retried.
+// Reads are refused only while committed state is uncertain after a failed
+// change. A fold holds its version change open for its whole segment write
+// (hundreds of milliseconds) while readers still see the previous state, so
+// an in-progress version alone must not refuse them.
 func durablePublication(db *accountsdb.AccountsDb) (uint64, uint64, bool) {
 	epoch, through := db.ReadPublication()
-	version, stable := db.CommittedAccountVersion()
-	return epoch ^ version<<32, through, stable
+	version, _ := db.CommittedAccountVersion()
+	return epoch ^ version<<32, through, !db.AccountStateUncertain()
 }
 
 func (s StoreAccounts) GetDurable(pubkey solana.PublicKey) (*accounts.Account, error) {
