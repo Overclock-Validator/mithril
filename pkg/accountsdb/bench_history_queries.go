@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,9 @@ import (
 // Keys are sampled from what folds recorded; slots are random within the
 // recorded range. Accounts history reports unchanged are read from the store,
 // as the RPC path does. Latency percentiles are logged every 10 s.
+//
+// MITHRIL_BENCH_KEYS_FILE=<path> writes the sampled keys (base58, one per
+// line) to that file every 10 s, for an outside RPC load driver.
 
 type queryKeySample struct {
 	mu   sync.Mutex
@@ -67,21 +71,55 @@ func benchHistorySample(keys []history.KeyHistory) {
 	}
 }
 
-// StartBenchHistoryQueries starts the query load if the switch is set. Only
-// the first call starts it; later ones (replay restarts) are no-ops.
+// StartBenchHistoryQueries starts the query load and the keys file if their
+// switches are set. Only the first call starts them; later ones (replay
+// restarts) are no-ops.
 func (db *AccountsDb) StartBenchHistoryQueries(ctx context.Context) {
-	v, ok := os.LookupEnv("MITHRIL_BENCH_HISTORY_QUERIES")
-	if !ok {
+	v, queries := os.LookupEnv("MITHRIL_BENCH_HISTORY_QUERIES")
+	keysFile := os.Getenv("MITHRIL_BENCH_KEYS_FILE")
+	if !queries && keysFile == "" {
 		return
-	}
-	perSec := 0
-	if v != "max" {
-		perSec, _ = strconv.Atoi(v)
 	}
 	if !benchQueryKeys.CompareAndSwap(nil, &queryKeySample{rng: rand.New(rand.NewSource(2))}) {
 		return
 	}
-	go db.runBenchHistoryQueries(ctx, perSec)
+	if keysFile != "" {
+		go writeBenchKeys(ctx, keysFile)
+	}
+	if queries {
+		perSec := 0
+		if v != "max" {
+			perSec, _ = strconv.Atoi(v)
+		}
+		go db.runBenchHistoryQueries(ctx, perSec)
+	}
+}
+
+func writeBenchKeys(ctx context.Context, path string) {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		q := benchQueryKeys.Load()
+		q.mu.Lock()
+		var b strings.Builder
+		for _, k := range q.keys {
+			b.WriteString(solana.PublicKey(k).String())
+			b.WriteByte('\n')
+		}
+		q.mu.Unlock()
+		if b.Len() == 0 {
+			continue
+		}
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err == nil {
+			_ = os.Rename(tmp, path)
+		}
+	}
 }
 
 func (db *AccountsDb) runBenchHistoryQueries(ctx context.Context, perSec int) {
