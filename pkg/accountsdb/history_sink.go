@@ -116,16 +116,22 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 			return
 		}
 	}
+	buildStart := time.Now()
 	keys, err := db.historyKeys(deltas, from)
+	buildTime := time.Since(buildStart)
 	if err != nil {
 		db.disableHistory(err)
 		return
 	}
 	benchHistorySample(keys.keys)
+	writeStart := time.Now()
 	if err := s.AppendKeys(from, throughSlot, keys.keys, bank); err != nil {
 		db.disableHistory(err)
 		return
 	}
+	mlog.Log.FileOnlyf("history: recorded %d..%d: %d keys, %d versions in %s (previous versions %s, differences %s, write %s)",
+		from, throughSlot, len(keys.keys), keys.versions, time.Since(start).Round(time.Millisecond),
+		keys.prevNanos.Round(time.Millisecond), (buildTime - keys.prevNanos).Round(time.Millisecond), time.Since(writeStart).Round(time.Millisecond))
 	prevNanos := keys.prevNanos
 	accountsWritten := keys.versions
 	st := &db.history.stats
