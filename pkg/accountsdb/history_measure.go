@@ -133,6 +133,7 @@ type historyMeasurer struct {
 	batches  uint64
 	readNs   uint64
 	totalNs  uint64
+	seg      *hmSegState
 }
 
 var (
@@ -169,7 +170,11 @@ func newHistoryMeasurer(dir string) (*historyMeasurer, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &historyMeasurer{dir: dir, folds: map[[32]byte]uint64{}, isVote: map[[32]byte]bool{}, enc: enc, windows: w}
+	seg, err := newHMSegState()
+	if err != nil {
+		return nil, err
+	}
+	m := &historyMeasurer{dir: dir, folds: map[[32]byte]uint64{}, isVote: map[[32]byte]bool{}, enc: enc, windows: w, seg: seg}
 	for _, n := range hmSpacings {
 		sp := &hmSpacing{n: n, window: -1, pending: map[[32]byte]*hmVer{}, prev: map[[32]byte]*hmVer{}}
 		if hmCompressSpacings[n] {
@@ -234,6 +239,9 @@ func (m *historyMeasurer) observe(db *AccountsDb, deltas []accounts.SlotDelta) {
 			for _, sp := range m.spacings {
 				sp.prev[k] = v
 			}
+			if !v.absent {
+				m.seg.cur[k] = v
+			}
 			m.folds[k] = 0
 		}
 	}
@@ -250,6 +258,7 @@ func (m *historyMeasurer) observe(db *AccountsDb, deltas []accounts.SlotDelta) {
 				sp.window = w
 			}
 		}
+		m.segBeginSlot(s)
 		for _, a := range sd.Delta {
 			if a == nil {
 				continue
@@ -266,12 +275,15 @@ func (m *historyMeasurer) observe(db *AccountsDb, deltas []accounts.SlotDelta) {
 				m.folds[k] |= 1 << fold
 			}
 			m.isVote[k] = a.Owner == hmVoteOwner
+			m.segChange(s, k, v)
 		}
+		m.segEndSlot()
 		m.lastSlot = s
 	}
 	m.batches++
 	m.totalNs += uint64(time.Since(start))
 	m.writeSummary()
+	m.writeSegments()
 }
 
 func (m *historyMeasurer) closeWindow(sp *hmSpacing) {

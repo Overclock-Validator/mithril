@@ -2,7 +2,6 @@ package accountsdb
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"math/rand"
 	"os"
@@ -14,59 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// hmApplyDiff rebuilds cur from prev and an hmEncodeDiff encoding.
-func hmApplyDiff(t *testing.T, prev *hmVer, d []byte) *hmVer {
+func mustApply(t *testing.T, prev *hmVer, d []byte) *hmVer {
 	t.Helper()
-	flags := d[0]
-	d = d[1:]
-	if flags&hmFlagCreated != 0 {
-		v := &hmVer{lamports: binary.LittleEndian.Uint64(d)}
-		copy(v.owner[:], d[8:40])
-		v.exec = d[40] == 1
-		v.rentEpoch = binary.LittleEndian.Uint64(d[41:])
-		n, k := binary.Uvarint(d[49:])
-		v.data = bytes.Clone(d[49+k : 49+k+int(n)])
-		return v
-	}
-	v := &hmVer{lamports: prev.lamports, owner: prev.owner, exec: prev.exec, rentEpoch: prev.rentEpoch, data: bytes.Clone(prev.data)}
-	if flags&hmFlagLamports != 0 {
-		v.lamports = binary.LittleEndian.Uint64(d)
-		d = d[8:]
-	}
-	if flags&hmFlagOwner != 0 {
-		copy(v.owner[:], d[:32])
-		d = d[32:]
-	}
-	if flags&hmFlagExec != 0 {
-		v.exec = !v.exec
-	}
-	if flags&hmFlagRent != 0 {
-		v.rentEpoch = binary.LittleEndian.Uint64(d)
-		d = d[8:]
-	}
-	if flags&hmFlagLength != 0 {
-		n, k := binary.Uvarint(d)
-		d = d[k:]
-		if int(n) < len(v.data) {
-			v.data = v.data[:n]
-		} else {
-			v.data = append(v.data, make([]byte, int(n)-len(v.data))...)
-		}
-	}
-	ranges, k := binary.Uvarint(d)
-	d = d[k:]
-	pos := 0
-	for r := uint64(0); r < ranges; r++ {
-		gap, k := binary.Uvarint(d)
-		d = d[k:]
-		n, k2 := binary.Uvarint(d)
-		d = d[k2:]
-		pos += int(gap)
-		copy(v.data[pos:], d[:n])
-		d = d[n:]
-		pos += int(n)
-	}
-	require.Empty(t, d)
+	v, err := hmApplyDiff(prev, d)
+	require.NoError(t, err)
 	return v
 }
 
@@ -93,12 +43,12 @@ func TestHistoryMeasureDiffRoundTrip(t *testing.T) {
 		}
 		d, zr, _, _ := hmEncodeDiff(nil, prev, cur)
 		require.Positive(t, zr)
-		got := hmApplyDiff(t, prev, d)
+		got := mustApply(t, prev, d)
 		require.True(t, hmSame(got, cur), "case %d", i)
 	}
 	created := &hmVer{lamports: 3, data: []byte{1, 2, 3}}
 	d, _, _, _ := hmEncodeDiff(nil, &hmVer{absent: true}, created)
-	require.True(t, hmSame(hmApplyDiff(t, nil, d), created))
+	require.True(t, hmSame(mustApply(t, nil, d), created))
 }
 
 func TestHistoryMeasureZeroRuns(t *testing.T) {
@@ -156,4 +106,24 @@ func TestHistoryMeasureWindows(t *testing.T) {
 	require.Positive(t, byN[128].Compress.ZstdDiff)
 	// N=1024 has not closed a window.
 	require.EqualValues(t, 0, byN[1024].Other.Versions)
+	raw, err = os.ReadFile(filepath.Join(dir, "segments.json"))
+	require.NoError(t, err)
+	var seg struct {
+		PerSlot  HMPerSlot        `json:"per_slot_frames"`
+		Segments []HMSegmentStats `json:"segments"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &seg))
+	require.EqualValues(t, 164, seg.PerSlot.Slots)
+	for _, s := range seg.Segments {
+		if s.P != 128 {
+			require.Zero(t, s.Segments)
+			continue
+		}
+		require.EqualValues(t, 1, s.Segments)
+		require.EqualValues(t, 2, s.Rebuilds)
+		require.Zero(t, s.RebuildBad)
+		require.EqualValues(t, 128, s.ChainMax) // the pool changed in every slot of the segment
+		require.EqualValues(t, 129, s.Other.Diffs)
+		require.Positive(t, s.Other.KeyframeZstd) // the pool existed before the run
+	}
 }
