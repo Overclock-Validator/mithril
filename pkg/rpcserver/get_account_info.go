@@ -21,6 +21,9 @@ type GetAccountInfoConfig struct {
 	EncodingType   *int
 	DataSlice      *GetAccountInfoDataSlice
 	MinContextSlot uint64
+	// AtSlot reads the account as it was at the end of this past slot, from
+	// account history (Mithril extension, config field "slot").
+	AtSlot *uint64
 }
 
 type GetAccountInfoDataSlice struct {
@@ -76,6 +79,17 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 	conf, err := parseAccountConfig(params, nil)
 	if err != nil {
 		return GetAccountInfoResp{}, &InvalidParamsError{Message: err.Error()}
+	}
+	if conf.AtSlot != nil {
+		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot)
+		if err != nil {
+			return GetAccountInfoResp{}, err
+		}
+		val, err := accountInfoValue(accts[0], conf)
+		if err != nil {
+			return GetAccountInfoResp{}, err
+		}
+		return GetAccountInfoResp{Context: accountContext(*conf.AtSlot), Value: val}, nil
 	}
 	var resp GetAccountInfoResp
 	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
@@ -139,6 +153,7 @@ func parseAccountConfig(params []json.RawMessage, defaultEncoding *int) (*GetAcc
 		Commitment     *string `json:"commitment"`
 		Encoding       *string `json:"encoding"`
 		MinContextSlot *uint64 `json:"minContextSlot"`
+		Slot           *uint64 `json:"slot"`
 		DataSlice      *struct {
 			Length *uint64 `json:"length"`
 			Offset *uint64 `json:"offset"`
@@ -159,6 +174,7 @@ func parseAccountConfig(params []json.RawMessage, defaultEncoding *int) (*GetAcc
 	if input.MinContextSlot != nil {
 		conf.MinContextSlot = *input.MinContextSlot
 	}
+	conf.AtSlot = input.Slot
 	if input.Encoding != nil {
 		encoding, err := parseGetAcctDataEncodingType(*input.Encoding)
 		if err != nil {

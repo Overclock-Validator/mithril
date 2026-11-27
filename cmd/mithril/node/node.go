@@ -37,6 +37,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/history"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
@@ -161,6 +162,11 @@ var (
 	rpcWatch              *replay.TransactionWatchSet
 	rpcServe              rpcServePlan
 	rpcWalletIndexDir     string
+	// Account history: past account versions recorded by folds, for account
+	// reads at a past slot.
+	rpcAccountHistory         bool
+	rpcAccountHistoryDir      string
+	rpcAccountHistorySegments int
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -976,6 +982,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return errors.New("rpc.watch selects the wallets this node indexes and what transaction history records; set rpc.serve to wallet or history")
 	}
 	rpcWalletIndexDir = getString("rpc-wallet-index-dir", "rpc.wallet_index_dir")
+	rpcAccountHistory = config.GetBool("rpc.account_history")
+	rpcAccountHistoryDir = config.GetString("rpc.account_history_dir")
+	rpcAccountHistorySegments = config.GetInt("rpc.account_history_segments")
 	resolvedTxParallelism := txParallelismForMode(consensusMode, txParallelism, txParallelismExplicit, runtime.NumCPU())
 	if resolvedTxParallelism != txParallelism {
 		txParallelism = resolvedTxParallelism
@@ -2707,6 +2716,22 @@ postBootstrap:
 			retentionSlots := schedule.SlotsPerEpoch * 2
 			if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
 				klog.Fatalf("enable RPC block history: %v", err)
+			}
+		}
+		if rpcAccountHistory {
+			dir := rpcAccountHistoryDir
+			if dir == "" {
+				dir = filepath.Join(accountsPath, "rpc-account-history")
+			}
+			hs, err := history.Open(dir, history.Options{KeepSegments: rpcAccountHistorySegments})
+			if err != nil {
+				klog.Fatalf("open account history: %v", err)
+			}
+			accountsDb.SetHistory(hs)
+			if first, through, ok := hs.Range(); ok {
+				mlog.Log.Infof("account history: %s holds slots %d to %d", dir, first, through)
+			} else {
+				mlog.Log.Infof("account history: recording into %s from the next fold", dir)
 			}
 		}
 		publishRPCBankState(rpcServer, mithrilState)

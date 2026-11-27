@@ -57,12 +57,28 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 	}
 	var accountSet []*accounts.Account
 	var slot uint64
-	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
-		var err error
-		accountSet, err = r.AccountsWithDataLimit(ctx, keys, maxMultipleAccountsDataBytes)
-		slot = r.View.Slot
-		return err
-	})
+	if conf.AtSlot != nil {
+		slot = *conf.AtSlot
+		accountSet, err = rpcServer.accountsAtSlot(ctx, keys, slot)
+		if err == nil {
+			total := 0
+			for _, a := range accountSet {
+				if a != nil {
+					total += len(a.Data)
+				}
+			}
+			if total > maxMultipleAccountsDataBytes {
+				err = accountsdb.ErrAccountDataLimit
+			}
+		}
+	} else {
+		err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
+			var err error
+			accountSet, err = r.AccountsWithDataLimit(ctx, keys, maxMultipleAccountsDataBytes)
+			slot = r.View.Slot
+			return err
+		})
+	}
 	if err != nil {
 		if errors.Is(err, accountsdb.ErrAccountDataLimit) {
 			return GetMultipleAccountsResp{}, &InvalidParamsError{Message: "getMultipleAccounts exceeds 16 MiB account data budget"}

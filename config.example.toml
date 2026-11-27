@@ -613,6 +613,17 @@ name = "mithril"
     # watch = ["<wallet address>"]
     # wallet_index_dir = "<accounts>/rpc-wallet-index"
 
+    # Account history: each fold records the account versions of its slots
+    # (XOR differences plus a full copy per account per segment, zstd), so
+    # getAccountInfo, getBalance and getMultipleAccounts accept a "slot" field
+    # in their config to read an account as it was at the end of that past slot
+    # (a Mithril extension). A segment is 64 folds (8,192 slots at 128-slot
+    # folds); about 48 segments is a day at today's slot rate. Measured on a
+    # mainnet sample at about 20 GiB a day.
+    # account_history = false
+    # account_history_dir = "<accounts>/rpc-account-history"
+    # account_history_segments = 48
+
 # ============================================================================
 # [tuning] - Performance Tuning & Profiling
 # ============================================================================

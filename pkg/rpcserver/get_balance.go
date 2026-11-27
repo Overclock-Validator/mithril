@@ -46,6 +46,17 @@ func (rpcServer *RpcServer) GetBalance(ctx context.Context, p jsonrpc.RawParams)
 	if err != nil {
 		return GetBalanceResp{}, err
 	}
+	if conf.AtSlot != nil {
+		accts, err := rpcServer.accountsAtSlot(ctx, []solana.PublicKey{pk}, *conf.AtSlot)
+		if err != nil {
+			return GetBalanceResp{}, err
+		}
+		resp := GetBalanceResp{Context: accountContext(*conf.AtSlot)}
+		if accts[0] != nil {
+			resp.Value = accts[0].Lamports
+		}
+		return resp, nil
+	}
 	var resp GetBalanceResp
 	err = rpcServer.readView(ctx, accountReadConfig(conf), func(r *bankview.Read) error {
 		acct, err := r.Account(pk)
