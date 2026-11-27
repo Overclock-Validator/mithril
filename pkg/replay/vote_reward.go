@@ -79,7 +79,7 @@ func applyVoteRewardsWithVersions(
 	}
 
 	var rewardDetails *metrics.VoteRewardDetails
-	if slotCtx.Replay {
+	if slotCtx.Replay && !slotCtx.PrivateReplay {
 		rewardDetails = &metrics.GlobalBlockReplay.VoteRewardDetails
 	}
 	var statePreparationDuration time.Duration
@@ -122,13 +122,26 @@ func applyVoteRewardsWithVersions(
 			validated, preparation.Prepared = preparedLeaderRewardValidations.take(block.Slot, skipRaw, notarRaw, verifierMaterial)
 			preparation.LookupDuration = time.Since(started)
 		}
-		if preparation == nil || !preparation.Prepared {
+		// A private replay reuses what this node's own replay of the block
+		// verified (verified_certs.go); otherwise verify in full.
+		var remembered bool
+		var rememberedKey verifiedCertKey
+		if replayHintsEnabled {
+			rememberedKey = rewardCertKey(block.Slot, rewardEpoch, shredVersion, skipRaw, notarRaw)
+			if slotCtx.PrivateReplay {
+				validated, remembered = verifiedCerts.reward(rememberedKey)
+			}
+		}
+		if !remembered && (preparation == nil || !preparation.Prepared) {
 			validated, validationTimings, err = verifierMaterial.validateRewardCertificates(
 				block.Slot,
 				skipRaw,
 				notarRaw,
 				rewardDetails != nil,
 			)
+		}
+		if replayHintsEnabled && !slotCtx.PrivateReplay && err == nil {
+			verifiedCerts.putReward(rememberedKey, validated)
 		}
 		if rewardDetails != nil {
 			if validationTimings.Skip > 0 {
@@ -225,13 +238,28 @@ func applyVoteRewardsWithVersions(
 		}
 		// The pre-consensus preflight may already have validated these exact inputs
 		// in the background; otherwise validate here as before.
-		validatedFinal, prefetched := takeFinalCertPrefetch(block.Slot, finalCertRaw, finalEpoch, verifierMaterial)
-		if !prefetched {
-			validatedFinal, err = rewardcerts.ValidateDecodedBlockFinalCertificateWithVerifier(
-				fc,
-				finalEpoch,
-				verifierMaterial.verifier,
-			)
+		var validatedFinal *rewardcerts.ValidatedFinalCert
+		var remembered bool
+		var rememberedKey verifiedCertKey
+		if replayHintsEnabled {
+			rememberedKey = finalCertKey(block.Slot, finalEpoch, shredVersion, finalCertRaw)
+			if slotCtx.PrivateReplay {
+				validatedFinal, remembered = verifiedCerts.final(rememberedKey)
+			}
+		}
+		if !remembered {
+			var prefetched bool
+			validatedFinal, prefetched = takeFinalCertPrefetch(block.Slot, finalCertRaw, finalEpoch, verifierMaterial)
+			if !prefetched {
+				validatedFinal, err = rewardcerts.ValidateDecodedBlockFinalCertificateWithVerifier(
+					fc,
+					finalEpoch,
+					verifierMaterial.verifier,
+				)
+			}
+		}
+		if replayHintsEnabled && !slotCtx.PrivateReplay && err == nil {
+			verifiedCerts.putFinal(rememberedKey, validatedFinal)
 		}
 		if rewardDetails != nil {
 			rewardDetails.FinalCertificateValidation.AddTimingSince(validationStart)
