@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -34,6 +35,10 @@ type checkpointTail struct {
 	overlay *accounts.WorkingSet
 	// preloaded holds accounts as of the boundary, nil for an absent account.
 	preloaded map[solana.PublicKey]*accounts.Account
+	// fetched holds boundary accounts read during the replay (the ones no
+	// block of the fold changed: programs, read-only inputs), so each is read
+	// from the store once. Values are *accounts.Account, nil for absent.
+	fetched sync.Map
 }
 
 func newCheckpointTail(view *accountsdb.CheckpointView) *checkpointTail {
@@ -57,6 +62,10 @@ func (t *checkpointTail) boundary(ctx context.Context, keys []solana.PublicKey, 
 			out[i] = acct
 			continue
 		}
+		if acct, ok := t.fetched.Load(keys[i]); ok {
+			out[i] = acct.(*accounts.Account)
+			continue
+		}
 		lookups = append(lookups, keys[i])
 		positions = append(positions, i)
 	}
@@ -68,14 +77,19 @@ func (t *checkpointTail) boundary(ctx context.Context, keys []solana.PublicKey, 
 		return err
 	}
 	for n, i := range positions {
-		out[i] = loaded[n]
+		// Two workers may read the same account at once; both keep the first
+		// stored value, so a shared reader always sees one identity per key.
+		kept, _ := t.fetched.LoadOrStore(lookups[n], loaded[n])
+		out[i] = kept.(*accounts.Account)
 	}
 	return nil
 }
 
-func (t *checkpointTail) GetAccount(_ uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+// GetAccountShared returns the bank-visible account without copying it. The
+// caller must not change it: the value is this replay's parent version.
+func (t *checkpointTail) GetAccountShared(_ uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	if acct, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
-		return acct.Clone(), nil
+		return acct, nil
 	}
 	out := make([]*accounts.Account, 1)
 	if err := t.boundary(context.Background(), []solana.PublicKey{pubkey}, out, []int{0}); err != nil {
@@ -84,7 +98,23 @@ func (t *checkpointTail) GetAccount(_ uint64, pubkey solana.PublicKey) (*account
 	if out[0] == nil {
 		return nil, accountsdb.ErrNoAccount
 	}
-	return out[0].Clone(), nil
+	return out[0], nil
+}
+
+func (t *checkpointTail) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	acct, err := t.GetAccountShared(slot, pubkey)
+	if err != nil {
+		return nil, err
+	}
+	return acct.Clone(), nil
+}
+
+func (t *checkpointTail) GetAccountDataLen(slot uint64, pubkey solana.PublicKey) (uint64, error) {
+	acct, err := t.GetAccountShared(slot, pubkey)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(len(acct.Data)), nil
 }
 
 // GetAccountWithDataLimit serves the bank-context builder.
