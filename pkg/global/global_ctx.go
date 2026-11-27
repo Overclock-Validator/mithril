@@ -44,10 +44,16 @@ type GlobalCtx struct {
 	calcUnixTimeForClockSysvar bool
 	manageLeaderSchedule       bool
 	pendingStakeMutex          sync.Mutex // Protects pendingNewStakePubkeys
-	voteCacheMutex             sync.RWMutex
-	slotsConfirmedMutex        sync.Mutex
-	leaderScheduleMutex        sync.RWMutex
-	mu                         sync.Mutex
+	// stakeIndexFileMutex serializes every read and write of the stake pubkey
+	// index file with the cache made from it: an append, a rewrite and a load
+	// each hold it from start to finish, so a load never parses a file that
+	// is being appended to, nor caches one that an append is about to change.
+	// It is taken before pendingStakeMutex.
+	stakeIndexFileMutex sync.Mutex
+	voteCacheMutex      sync.RWMutex
+	slotsConfirmedMutex sync.Mutex
+	leaderScheduleMutex sync.RWMutex
+	mu                  sync.Mutex
 }
 
 var instance = GlobalCtx{epochStakes: epochstakes.NewEpochStakesCache()}
@@ -496,6 +502,8 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 // Each pubkey is appended once per flush, retaining its latest available
 // location hint from an eligible slot. Returns the number of entries flushed.
 func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64, committed ...solana.PublicKey) (int, error) {
+	instance.stakeIndexFileMutex.Lock()
+	defer instance.stakeIndexFileMutex.Unlock()
 	instance.pendingStakeMutex.Lock()
 	var pending []accountsdb.StakeIndexEntry
 	seen := make(map[solana.PublicKey]int, len(committed))
@@ -607,6 +615,8 @@ const compactThreshold = 1000
 // Only triggers when at least compactThreshold entries have been appended since last compaction.
 // Should be called at epoch boundary when the cache is already populated.
 func CompactStakePubkeyIndex(accountsDbDir string) error {
+	instance.stakeIndexFileMutex.Lock()
+	defer instance.stakeIndexFileMutex.Unlock()
 	instance.pendingStakeMutex.Lock()
 	flushed := instance.entriesFlushedSinceCompact
 	cached := instance.cachedStakeEntries
@@ -640,6 +650,18 @@ func CompactStakePubkeyIndex(accountsDbDir string) error {
 // Legacy format: 32-byte pubkeys with no location hints (FileId=0, Offset=0).
 // Current format: 8-byte header ("STKI" + version) + 48-byte records (pubkey + fileId + offset).
 func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, error) {
+	instance.pendingStakeMutex.Lock()
+	if instance.cachedStakeEntries != nil {
+		cached := instance.cachedStakeEntries
+		instance.pendingStakeMutex.Unlock()
+		return cached, nil
+	}
+	instance.pendingStakeMutex.Unlock()
+
+	// Read and cache under the file lock; another loader may have finished
+	// while this one waited for it.
+	instance.stakeIndexFileMutex.Lock()
+	defer instance.stakeIndexFileMutex.Unlock()
 	instance.pendingStakeMutex.Lock()
 	if instance.cachedStakeEntries != nil {
 		cached := instance.cachedStakeEntries
