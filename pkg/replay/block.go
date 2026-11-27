@@ -5358,7 +5358,9 @@ func processBlockWithResults(
 	if err := bankSysvars.ValidateForExecution(); err != nil {
 		return nil, fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
 	}
-	metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
+	if !block.PrivateReplay {
+		metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
+	}
 
 	slotCtxSetupStart := time.Now()
 	if err := exec.installSlotCtx(accts, parentAccts, accountMapCapacity, bankSysvars); err != nil {
@@ -5389,7 +5391,9 @@ func processBlockWithResults(
 		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, txComputeUnitsConsumed, dbgOpts, shouldVerifySignatures, groupMetadata, groupResults)
 	}
 	txLoopRegion.End()
-	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
+	if !block.PrivateReplay {
+		metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
+	}
 	if txLoopErr != nil {
 		// The partially executed SlotCtx is dropped unfinalized.
 		return nil, fmt.Errorf("execute transactions for slot %d: %w", block.Slot, txLoopErr)

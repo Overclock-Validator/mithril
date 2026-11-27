@@ -292,7 +292,9 @@ func (exec *blockExecution) open() error {
 	if err := bankSysvars.ValidateForExecution(); err != nil {
 		return fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
 	}
-	metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
+	if !exec.block.PrivateReplay {
+		metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
+	}
 
 	slotCtxSetupStart := time.Now()
 	if err := exec.installSlotCtx(accts, parentAccts, accountMapCapacity, bankSysvars); err != nil {
@@ -408,7 +410,9 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	feeInfos, computeUnits, err := exec.runTransactionGroup(txs, execute, shouldVerifySignatures, base)
 	txLoopRegion.End()
-	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
+	if !exec.block.PrivateReplay {
+		metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
+	}
 	if err != nil {
 		return err
 	}
