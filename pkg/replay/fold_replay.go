@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sync"
 	"time"
@@ -40,6 +41,34 @@ type foldBank struct {
 	slotCtx     *sealevel.SlotCtx
 	sysvars     *sealevel.BankSysvars
 	blockHeight uint64
+}
+
+// bankShell copies what a child block takes from its parent bank. Two things
+// in a bank are changed in place by the block built on it, the running
+// account hash and the vote timestamps, so a kept bank and every use of it
+// need their own copies; the rest is shared and never written.
+func bankShell(bank *sealevel.SlotCtx) *sealevel.SlotCtx {
+	shell := &sealevel.SlotCtx{
+		Slot:                   bank.Slot,
+		Epoch:                  bank.Epoch,
+		FinalBankhash:          bank.FinalBankhash,
+		VoteTimestamps:         maps.Clone(bank.VoteTimestamps),
+		VoteAccts:              bank.VoteAccts,
+		TotalEpochStake:        bank.TotalEpochStake,
+		LatestEvictedBlockhash: bank.LatestEvictedBlockhash,
+		FeeRateGovernor:        bank.FeeRateGovernor,
+		NumSignatures:          bank.NumSignatures,
+		Blockhash:              bank.Blockhash,
+		Features:               bank.Features,
+	}
+	if bank.AcctsLtHash != nil {
+		shell.AcctsLtHash = bank.AcctsLtHash.Clone()
+	}
+	if bank.FeeRateGovernor != nil {
+		governor := *bank.FeeRateGovernor
+		shell.FeeRateGovernor = &governor
+	}
+	return shell
 }
 
 // Boundary is the fold boundary the kept replay started from.
@@ -84,7 +113,7 @@ func (q *CheckpointQuerier) buildFold(ctx context.Context, boundary uint64, hint
 		defer warming.Done()
 		replay.tail.warm(work, fold.Keys, queryWarmChunk, queryWarmWorkers)
 	}()
-	kept.banks = append(kept.banks, foldBank{replay.parent, replay.parentSysvars, replay.blockHeight})
+	kept.banks = append(kept.banks, foldBank{bankShell(replay.parent), replay.parentSysvars, replay.blockHeight})
 	for i, slot := range kept.slots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -103,7 +132,8 @@ func (q *CheckpointQuerier) buildFold(ctx context.Context, boundary uint64, hint
 		if !bytes.Equal(slotCtx.FinalBankhash, kept.recorded[i][:]) {
 			return nil, fmt.Errorf("slot %d: %w", slot, errBankHashDiffers)
 		}
-		kept.banks = append(kept.banks, foldBank{replay.parent, replay.parentSysvars, replay.blockHeight})
+		// Copied now: the next block changes parts of this bank in place.
+		kept.banks = append(kept.banks, foldBank{bankShell(replay.parent), replay.parentSysvars, replay.blockHeight})
 	}
 	kept.base = replay
 	kept.Bytes = replay.tail.overlay.RetainedBytes()
@@ -129,6 +159,7 @@ func (fold *FoldReplay) transaction(ctx context.Context, q *CheckpointQuerier, s
 		return nil, fmt.Errorf("decode spooled slot %d: %w", slot, err)
 	}
 	parent := fold.banks[at]
+	parent.slotCtx = bankShell(parent.slotCtx) // this query's own copy
 	replay := &CheckpointReplay{
 		db: fold.base.db, tail: fold.base.tail.viewAfter(parent.slotCtx.Slot),
 		epochSchedule: fold.base.epochSchedule, workers: q.Workers,
