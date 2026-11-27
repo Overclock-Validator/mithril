@@ -54,7 +54,8 @@ func TestSerializeParametersAlignedZeroPadding(t *testing.T) {
 					parameterArena = arena.New[byte](uint64(len(golden)))
 					ctx.SlotCtx.SerializedParameterArena = parameterArena
 				}
-				ctx.IsSimulation = allocation == "simulation"
+				ctx.Speculative = allocation == "simulation"
+				ctx.PrivateParameters = ctx.Speculative
 				for round := range 3 {
 					if parameterArena != nil {
 						// Model guest writes into an earlier invocation's input.

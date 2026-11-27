@@ -37,7 +37,10 @@ type LoadAndExecuteTransactionInput struct {
 	Arena *arena.Arena[sealevel.BorrowedAccount]
 	// TxMeta is the on-chain transaction metadata (optional, used for fee calculation)
 	TxMeta *rpc.TransactionMeta
-	// IsSimulation indicates this is a simulation (no side effects on shared state)
+	// IsSimulation marks an RPC simulation. It executes as Speculative with
+	// PrivateParameters, so it shares the early-execution rules for publishing
+	// nothing. Beyond that it only shapes what is reported: account snapshots
+	// for the response, and read-only accounts returned as loaded.
 	IsSimulation bool
 	// Speculative and PrivateParameters set the ExecutionCtx fields (see there).
 	SpeculativeCancel *atomic.Bool
@@ -367,12 +370,11 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	execCtx.TransactionContext.AllInstructions = instrs
 	execCtx.TransactionContext.Signature = tx.Signatures[0]
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena
-	execCtx.IsSimulation = input.IsSimulation
-	execCtx.Speculative = input.Speculative
+	execCtx.Speculative = input.Speculative || input.IsSimulation
 	if input.Speculative {
 		execCtx.SpeculativeCancel = input.SpeculativeCancel
 	}
-	execCtx.PrivateParameters = input.PrivateParameters
+	execCtx.PrivateParameters = input.PrivateParameters || input.IsSimulation
 	execCtx.PrivatePrograms = input.PrivatePrograms
 	execCtx.SkipTimingMetrics = input.SkipTimingMetrics
 	execCtx.TimingRecorder = input.TimingRecorder

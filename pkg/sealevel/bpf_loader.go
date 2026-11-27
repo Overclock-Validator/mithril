@@ -709,7 +709,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	}
 
 	var serializedData []byte
-	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0]
 	} else {
@@ -1075,7 +1075,7 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, uint64, []seri
 	size += solana.PublicKeyLength     // program id
 
 	var serializedData []byte
-	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0] // Use arena slice with zero length but full capacity
 	} else {
@@ -1482,9 +1482,7 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 
 	entry := &accountsdb.ProgramCacheEntry{Program: program}
 	entry.BindSource(programData, &execCtx.Features)
-	if !execCtx.IsSimulation {
-		addProgramToCache(execCtx, programAddr, entry)
-	}
+	addProgramToCache(execCtx, programAddr, entry)
 
 	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
 	if programCompileLog {
@@ -1578,7 +1576,7 @@ func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot 
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.Speculative || execCtx.IsSimulation || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+	if execCtx.Speculative || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
@@ -2901,9 +2899,9 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					// An early execution or a simulation publishes nothing (loader
-					// instructions are never executed early; this does not rely on that).
-					if !execCtx.Speculative && !execCtx.IsSimulation {
+					// A speculative execution publishes nothing (loader instructions
+					// are never executed early; this does not rely on that).
+					if !execCtx.Speculative {
 						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
 					}
 				}

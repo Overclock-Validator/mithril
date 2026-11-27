@@ -129,7 +129,7 @@ func TestTransactionMetadataCPIBufferOwnership(t *testing.T) {
 	})
 	require.Nil(t, output.ProcessingResult.TransactionError)
 	require.NotNil(t, output.ExecCtx)
-	require.False(t, output.ExecCtx.IsSimulation)
+	require.False(t, output.ExecCtx.Speculative)
 	require.NoError(t, ApplySuccessfulTransaction(ctx, output))
 	// Seed return data only to test copying; the allocation program emits none.
 	returnProgram := tx.Message.AccountKeys[tx.Message.Instructions[0].ProgramIDIndex]

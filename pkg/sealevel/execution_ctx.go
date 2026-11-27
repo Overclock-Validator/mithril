@@ -35,10 +35,11 @@ type ExecutionCtx struct {
 	PrevLamportsPerSignature uint64
 	SlotCtx                  *SlotCtx
 	ModifiedVoteStates       map[solana.PublicKey]*VoteStateVersions
-	IsSimulation             bool
-	// Speculative marks an execution whose result may be discarded: it never
-	// publishes to the shared program cache; its program cache misses compile a
-	// private entry.
+	// Speculative marks an execution that publishes nothing: an early
+	// execution whose result may be discarded, or an RPC simulation. It never
+	// inserts into or removes from the shared program cache; its program cache
+	// misses compile a private entry. This is the only such mode the runtime
+	// knows; callers that differ in what they report do so outside it.
 	Speculative bool
 	// SpeculativeCancel is private to an attempt already rejected by replay.
 	SpeculativeCancel *atomic.Bool

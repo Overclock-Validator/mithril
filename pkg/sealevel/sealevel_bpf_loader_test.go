@@ -50,7 +50,8 @@ func TestBPFLoaderExecutesLegacyProgramStub(t *testing.T) {
 			tx := NewTransactionAccounts([]accounts.Account{stub})
 			ctx := newBenchExecCtx(tx, 100)
 			initializeLegacyBankFixture(t, ctx)
-			ctx.IsSimulation = simulation
+			ctx.Speculative = simulation
+			ctx.PrivateParameters = ctx.Speculative
 			require.NoError(t, ctx.Accounts.SetAccount((*[32]byte)(&programKey), real))
 			require.NoError(t, ctx.ProcessInstruction(nil, nil, []uint64{0}))
 			require.Zero(t, ctx.TransactionContext.Accounts.Accounts[0].Lamports)
@@ -1873,7 +1874,8 @@ func testCloseProgramData(t *testing.T, simulation bool) {
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
 	initializeLegacyBankFixture(t, &execCtx)
-	execCtx.IsSimulation = simulation
+	execCtx.Speculative = simulation
+	execCtx.PrivateParameters = execCtx.Speculative
 	execCtx.SlotCtx.TrackProgramCacheAdds = true
 	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(bufferPubkey, cached)
@@ -2375,7 +2377,8 @@ func testExtendProgram(t *testing.T, simulation bool) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
-	execCtx.IsSimulation = simulation
+	execCtx.Speculative = simulation
+	execCtx.PrivateParameters = execCtx.Speculative
 	execCtx.SlotCtx.TrackProgramCacheAdds = true
 	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
@@ -2794,7 +2797,8 @@ func testUpgradeProgram(t *testing.T, simulation bool) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
-	execCtx.IsSimulation = simulation
+	execCtx.Speculative = simulation
+	execCtx.PrivateParameters = execCtx.Speculative
 	execCtx.SlotCtx.TrackProgramCacheAdds = true
 	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
@@ -3021,7 +3025,8 @@ func testDeployProgram(t *testing.T, simulation bool) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
-	execCtx.IsSimulation = simulation
+	execCtx.Speculative = simulation
+	execCtx.PrivateParameters = execCtx.Speculative
 	execCtx.SlotCtx.TrackProgramCacheAdds = true
 	cached := &accountsdb.ProgramCacheEntry{}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
