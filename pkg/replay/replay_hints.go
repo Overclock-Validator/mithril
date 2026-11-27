@@ -59,10 +59,55 @@ type blockHints struct {
 	bySig     map[solana.Signature]txHint
 }
 
-// hintRecorder collects one block's hints while the node replays it.
+// hintRecorder collects one block's hints while the node replays it. The
+// node's replay only appends two small records per transaction; the lookup
+// table is built later, by the first private replay that asks for it.
 type hintRecorder struct {
-	touched sync.Map // solana.Signature -> []solana.PublicKey, until the outcome arrives
-	done    sync.Map // solana.Signature -> txHint
+	mu       sync.Mutex
+	commits  []hintCommit
+	outcomes []hintOutcome
+}
+
+type hintCommit struct {
+	signature solana.Signature
+	touched   []solana.PublicKey
+}
+
+type hintOutcome struct {
+	signature solana.Signature
+	failed    bool
+	kcu       int32
+}
+
+// recordedHints is a sealed recorder and the hints built from it on demand.
+type recordedHints struct {
+	blockhash [32]byte
+	recorder  *hintRecorder
+	once      sync.Once
+	hints     *blockHints
+}
+
+func (recorded *recordedHints) build() *blockHints {
+	recorded.once.Do(func() {
+		recorder := recorded.recorder
+		recorder.mu.Lock()
+		defer recorder.mu.Unlock()
+		touched := make(map[solana.Signature][]solana.PublicKey, len(recorder.commits))
+		for _, commit := range recorder.commits {
+			touched[commit.signature] = commit.touched
+		}
+		hints := &blockHints{blockhash: recorded.blockhash, bySig: make(map[solana.Signature]txHint, len(recorder.outcomes))}
+		for _, outcome := range recorder.outcomes {
+			hint := txHint{failed: outcome.failed, kcu: outcome.kcu}
+			if !outcome.failed {
+				hint.touched = touched[outcome.signature]
+			}
+			hints.bySig[outcome.signature] = hint
+		}
+		recorded.hints = hints
+		recorded.recorder = nil
+	})
+	return recorded.hints
 }
 
 // hintUse applies one block's hints to a private replay of it.
@@ -74,13 +119,13 @@ type hintUse struct {
 
 type replayHintStore struct {
 	mu     sync.Mutex
-	bySlot map[uint64]*blockHints
+	bySlot map[uint64]*recordedHints
 	order  []uint64
 }
 
-var replayHints = replayHintStore{bySlot: make(map[uint64]*blockHints)}
+var replayHints = replayHintStore{bySlot: make(map[uint64]*recordedHints)}
 
-func (store *replayHintStore) put(slot uint64, hints *blockHints) {
+func (store *replayHintStore) put(slot uint64, hints *recordedHints) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if _, replaced := store.bySlot[slot]; !replaced {
@@ -93,7 +138,7 @@ func (store *replayHintStore) put(slot uint64, hints *blockHints) {
 	store.bySlot[slot] = hints
 }
 
-func (store *replayHintStore) get(slot uint64) *blockHints {
+func (store *replayHintStore) get(slot uint64) *recordedHints {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return store.bySlot[slot]
@@ -101,11 +146,11 @@ func (store *replayHintStore) get(slot uint64) *blockHints {
 
 // hintsFor returns the stored hints for exactly this block, or nil.
 func hintsFor(block *b.Block) *blockHints {
-	hints := replayHints.get(block.Slot)
-	if hints == nil || hints.blockhash != block.Blockhash || hints.blockhash == ([32]byte{}) {
+	recorded := replayHints.get(block.Slot)
+	if recorded == nil || recorded.blockhash != block.Blockhash || recorded.blockhash == ([32]byte{}) {
 		return nil
 	}
-	return hints
+	return recorded.build()
 }
 
 func hintRecorderOf(slotCtx *sealevel.SlotCtx) *hintRecorder {
@@ -167,7 +212,9 @@ func replayHintsAtCommit(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionC
 			touched = append(touched, key)
 			return true
 		})
-		hints.touched.Store(signature, touched)
+		hints.mu.Lock()
+		hints.commits = append(hints.commits, hintCommit{signature, touched})
+		hints.mu.Unlock()
 	case *hintUse:
 		hint, known := hints.hints.bySig[signature]
 		if !known {
@@ -197,11 +244,9 @@ func replayHintsAtOutcome(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, com
 	signature := tx.Signatures[0]
 	switch hints := slotCtx.ReplayHints.(type) {
 	case *hintRecorder:
-		hint := txHint{failed: failed, kcu: int32(computeUnits/1000) + 1}
-		if touched, ok := hints.touched.LoadAndDelete(signature); ok && !failed {
-			hint.touched = touched.([]solana.PublicKey)
-		}
-		hints.done.Store(signature, hint)
+		hints.mu.Lock()
+		hints.outcomes = append(hints.outcomes, hintOutcome{signature, failed, int32(computeUnits/1000) + 1})
+		hints.mu.Unlock()
 	case *hintUse:
 		if hint, known := hints.hints.bySig[signature]; known && failed && !hint.failed {
 			hints.violated.Store(true)
@@ -216,12 +261,7 @@ func sealReplayHints(slotCtx *sealevel.SlotCtx, block *b.Block) {
 	if recorder == nil {
 		return
 	}
-	hints := &blockHints{blockhash: block.Blockhash, bySig: make(map[solana.Signature]txHint, len(block.Transactions))}
-	recorder.done.Range(func(signature, hint any) bool {
-		hints.bySig[signature.(solana.Signature)] = hint.(txHint)
-		return true
-	})
-	replayHints.put(block.Slot, hints)
+	replayHints.put(block.Slot, &recordedHints{blockhash: block.Blockhash, recorder: recorder})
 }
 
 // knownFailure reports whether the node recorded that tx failed.

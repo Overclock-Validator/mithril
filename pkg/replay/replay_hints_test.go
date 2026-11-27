@@ -102,17 +102,25 @@ func TestReplayHintsLeaveUnresolvedNonceTransactionsAlone(t *testing.T) {
 
 func TestReplayHintsAreBoundToTheBlock(t *testing.T) {
 	store := &replayHints
-	hints := &blockHints{blockhash: [32]byte{7}, bySig: map[solana.Signature]txHint{}}
-	store.put(999_000_001, hints)
+	recorder := &hintRecorder{
+		commits:  []hintCommit{{solana.Signature{1}, []solana.PublicKey{{9}}}, {solana.Signature{2}, []solana.PublicKey{{8}}}},
+		outcomes: []hintOutcome{{solana.Signature{1}, false, 12}, {solana.Signature{2}, true, 3}, {solana.Signature{3}, true, 1}},
+	}
+	store.put(999_000_001, &recordedHints{blockhash: [32]byte{7}, recorder: recorder})
+	hints := hintsFor(&b.Block{Slot: 999_000_001, Blockhash: [32]byte{7}})
+	require.NotNil(t, hints)
 	require.Same(t, hints, hintsFor(&b.Block{Slot: 999_000_001, Blockhash: [32]byte{7}}))
+	require.Equal(t, txHint{kcu: 12, touched: []solana.PublicKey{{9}}}, hints.bySig[solana.Signature{1}])
+	require.Equal(t, txHint{failed: true, kcu: 3}, hints.bySig[solana.Signature{2}], "a failure keeps no changed accounts")
+	require.Equal(t, txHint{failed: true, kcu: 1}, hints.bySig[solana.Signature{3}])
 	require.Nil(t, hintsFor(&b.Block{Slot: 999_000_001, Blockhash: [32]byte{8}}), "another block at the slot gets no hints")
 	require.Nil(t, hintsFor(&b.Block{Slot: 999_000_002, Blockhash: [32]byte{7}}))
-	store.put(999_000_003, &blockHints{bySig: map[solana.Signature]txHint{}})
+	store.put(999_000_003, &recordedHints{recorder: &hintRecorder{}})
 	require.Nil(t, hintsFor(&b.Block{Slot: 999_000_003}), "hints without a block hash are never used")
 
 	// The store is bounded: the oldest slot goes first.
 	for slot := uint64(999_100_000); slot < 999_100_000+replayHintSlots; slot++ {
-		store.put(slot, &blockHints{blockhash: [32]byte{1}})
+		store.put(slot, &recordedHints{blockhash: [32]byte{1}, recorder: &hintRecorder{}})
 	}
 	require.Nil(t, store.get(999_000_001))
 	require.LessOrEqual(t, len(store.bySlot), replayHintSlots)

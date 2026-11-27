@@ -4683,7 +4683,8 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 			slotCtx.ReplayHints = use
 		}
 	} else if replayHintsEnabled {
-		slotCtx.ReplayHints = &hintRecorder{}
+		transactions := max(len(block.Transactions), 1024)
+		slotCtx.ReplayHints = &hintRecorder{commits: make([]hintCommit, 0, transactions), outcomes: make([]hintOutcome, 0, transactions)}
 	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
