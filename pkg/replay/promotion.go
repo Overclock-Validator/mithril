@@ -51,7 +51,11 @@ func compactWorkingSet(ws *accounts.WorkingSet, through uint64) {
 	}
 	go func() {
 		defer compactionRunning.Store(false)
-		ws.CompactThrough(through)
+		start := time.Now()
+		before := ws.RetainedBytes()
+		n := ws.CompactThrough(through)
+		mlog.Log.FileOnlyf("working set compaction: through %d compacted %d versions in %s, retained %d -> %d bytes, held %d slots",
+			through, n, time.Since(start).Round(time.Millisecond), before, ws.RetainedBytes(), ws.HeldSlots())
 	}()
 }
 
