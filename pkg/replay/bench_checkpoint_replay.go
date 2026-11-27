@@ -102,10 +102,12 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 	}
 	fold, err := view.FoldAfter()
 	if err != nil || fold == nil || len(fold.Bankhashes) == 0 {
+		mlog.Log.Infof("bench checkpoint replay: skip %d: fold %v, err %v", boundary, fold != nil, err)
 		return 0, 0, 0, 0, err
 	}
 	for _, slot := range fold.Bankhashes {
 		if _, statErr := os.Stat(filepath.Join(shredDir, turbine.SpoolFileName(slot.Slot))); statErr != nil {
+			mlog.Log.Infof("bench checkpoint replay: skip %d: fold (%d, %d] has %d hashes, no shreds for slot %d", boundary, fold.FromSlot, fold.ThroughSlot, len(fold.Bankhashes), slot.Slot)
 			return 0, 0, 0, 0, nil
 		}
 	}
