@@ -39,6 +39,8 @@ type checkpointTail struct {
 	// block of the fold changed: programs, read-only inputs), so each is read
 	// from the store once. Values are *accounts.Account, nil for absent.
 	fetched sync.Map
+	// deltas, when set, sizes each block's changes (bench).
+	deltas *deltaStats
 }
 
 func newCheckpointTail(view *accountsdb.CheckpointView) *checkpointTail {
@@ -166,6 +168,32 @@ func (t *checkpointTail) GetAccountsBatchShared(ctx context.Context, _ uint64, p
 
 func (t *checkpointTail) Add(slot uint64, delta []*accounts.Account, _ []byte) {
 	t.overlay.Add(slot, delta)
+	if t.deltas != nil {
+		t.deltas.add(delta)
+	}
+}
+
+// deltaStats sizes what each block changes (bench): the per-slot differences a
+// node would keep to answer for any slot without replaying up to it.
+type deltaStats struct {
+	slots, accounts, bytes, voteAccounts, voteBytes uint64
+}
+
+func (stats *deltaStats) add(delta []*accounts.Account) {
+	stats.slots++
+	for _, acct := range delta {
+		if acct == nil {
+			continue
+		}
+		// 32-byte key and owner, lamports, rent epoch and flags, then data.
+		size := uint64(len(acct.Data)) + 32 + 32 + 8 + 8 + 2
+		stats.accounts++
+		stats.bytes += size
+		if acct.Owner == addresses.VoteProgramAddr {
+			stats.voteAccounts++
+			stats.voteBytes += size
+		}
+	}
 }
 
 func (t *checkpointTail) SetContext(uint64, *state.ResumeContext, ...*sealevel.BankSysvars) {}

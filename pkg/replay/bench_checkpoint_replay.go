@@ -175,6 +175,18 @@ func benchReplayFoldRun(ctx context.Context, db *accountsdb.AccountsDb, persiste
 		return 0, 0, 0, 0, 0, 0, err
 	}
 	replay.UseHints(hints)
+	if os.Getenv("MITHRIL_BENCH_DELTAS") == "1" {
+		stats := &deltaStats{}
+		replay.tail.deltas = stats
+		defer func() {
+			if stats.slots > 0 {
+				perSlot := func(v uint64) float64 { return float64(v) / float64(stats.slots) }
+				mlog.Log.Infof("bench deltas: fold after %d, %d slots: per slot %.0f changed accounts, %.2f MiB; of which vote accounts %.0f, %.2f MiB; the rest %.0f accounts, %.2f MiB; the fold's own deduplicated set is %d accounts",
+					boundary, stats.slots, perSlot(stats.accounts), perSlot(stats.bytes)/(1<<20), perSlot(stats.voteAccounts), perSlot(stats.voteBytes)/(1<<20),
+					perSlot(stats.accounts-stats.voteAccounts), perSlot(stats.bytes-stats.voteBytes)/(1<<20), len(fold.Keys))
+			}
+		}()
+	}
 	loaded := <-loading
 	if loaded.err != nil {
 		return 0, 0, 0, 0, 0, 0, loaded.err
