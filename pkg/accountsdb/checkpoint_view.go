@@ -473,10 +473,19 @@ func (db *AccountsDb) CheckpointBoundaries() ([]uint64, error) {
 	return out, nil
 }
 
-// KeysWrittenAfter returns the accounts written by the fold that follows the
-// view's boundary: the accounts a replay of that fold changes. It returns nil
-// when the boundary is the head.
-func (view *CheckpointView) KeysWrittenAfter() ([]solana.PublicKey, error) {
+// FoldRecord describes the fold that follows a view's boundary.
+type FoldRecord struct {
+	// The fold covers slots (FromSlot, ThroughSlot].
+	FromSlot, ThroughSlot uint64
+	// Bankhashes holds the bank hash of every slot the fold contains, ascending.
+	Bankhashes []SlotBankhash
+	// Keys are the accounts the fold wrote: the accounts replaying it changes.
+	Keys []solana.PublicKey
+}
+
+// FoldAfter returns the record of the fold that follows the view's boundary,
+// or nil when the boundary is the head.
+func (view *CheckpointView) FoldAfter() (*FoldRecord, error) {
 	headers, err := view.db.foldManifests.headers(view.db.AcctsDir)
 	if err != nil {
 		return nil, err
@@ -489,9 +498,22 @@ func (view *CheckpointView) KeysWrittenAfter() ([]solana.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	keys := make([]solana.PublicKey, len(manifest.Records))
-	for i := range manifest.Records {
-		keys[i] = solana.PublicKey(manifest.Records[i].Pubkey)
+	record := &FoldRecord{
+		FromSlot: manifest.FromSlot, ThroughSlot: manifest.ThroughSlot,
+		Bankhashes: manifest.Bankhashes, Keys: make([]solana.PublicKey, len(manifest.Records)),
 	}
-	return keys, nil
+	for i := range manifest.Records {
+		record.Keys[i] = solana.PublicKey(manifest.Records[i].Pubkey)
+	}
+	return record, nil
+}
+
+// KeysWrittenAfter returns the accounts written by the fold that follows the
+// view's boundary, or nil when the boundary is the head.
+func (view *CheckpointView) KeysWrittenAfter() ([]solana.PublicKey, error) {
+	record, err := view.FoldAfter()
+	if err != nil || record == nil {
+		return nil, err
+	}
+	return record.Keys, nil
 }

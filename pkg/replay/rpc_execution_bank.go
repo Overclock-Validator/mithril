@@ -29,16 +29,47 @@ func RootedRPCBankContext(ctx context.Context, db *accountsdb.AccountsDb, s *sta
 	if db == nil || s == nil {
 		return nil, fmt.Errorf("rooted execution state is unavailable")
 	}
+	rooted := s.LastRootedContext
+	if rooted != nil && rooted.Slot != s.LastRootedSlot {
+		return nil, fmt.Errorf("rooted execution context slot %d does not match durable root %d", rooted.Slot, s.LastRootedSlot)
+	}
+	version, stable := db.CommittedAccountVersion()
+	slot := s.ManifestParentSlot
+	if rooted != nil {
+		slot = rooted.Slot
+	}
+	if !stable || !rpcExecutionRootMatches(db, slot) {
+		return nil, fmt.Errorf("durable execution account view is unavailable at slot %d", slot)
+	}
+	bank, err := bankContextFromRecord(ctx, db, s, rooted, resume)
+	if err != nil {
+		return nil, err
+	}
+	latest, stable := db.CommittedAccountVersion()
+	if !stable || version != latest || !rpcExecutionRootMatches(db, slot) {
+		return nil, fmt.Errorf("durable execution account view changed at slot %d", slot)
+	}
+	bank.AccountVersion, bank.AccountVersionsReady = version, true
+	return bank, nil
+}
+
+// bankContextReader reads accounts as of the slot a bank context is built for.
+type bankContextReader interface {
+	GetAccountWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error)
+}
+
+// bankContextFromRecord reconstructs a bank's execution parameters from a
+// resume record and the accounts as of its slot: the durable root (record is
+// the state file's rooted context, or nil for the snapshot manifest) or an
+// earlier fold boundary (record is that fold's stored context, reader a view
+// of the accounts at that boundary). It writes nothing and publishes nothing.
+func bankContextFromRecord(ctx context.Context, reader bankContextReader, s *state.MithrilState, rooted *state.ResumeContext, resume *ResumeState) (*ChainTipSnapshot, error) {
 	slot, height := s.ManifestParentSlot, s.ManifestBlockHeight
 	bankhash, recentEntries, evicted := s.ManifestParentBankhash, s.ManifestRecentBlockhashes, s.ManifestEvictedBlockhash
 	fees := reconstructFeeRateGovernor(s)
 	var clockBytes []byte
 	var slotHashes *sealevel.SysvarSlotHashes
-	rooted := s.LastRootedContext
 	if rooted != nil {
-		if rooted.Slot != s.LastRootedSlot {
-			return nil, fmt.Errorf("rooted execution context slot %d does not match durable root %d", rooted.Slot, s.LastRootedSlot)
-		}
 		slot, height, bankhash = rooted.Slot, rooted.BlockHeight, rooted.Bankhash
 		recentEntries, evicted = rooted.RecentBlockhashes, rooted.EvictedBlockhash
 		if rooted.Clock == "" || rooted.SlotHashes == nil {
@@ -92,10 +123,6 @@ func RootedRPCBankContext(ctx context.Context, db *accountsdb.AccountsDb, s *sta
 		return nil, fmt.Errorf("rooted execution blockhash fee does not match its governor at slot %d", slot)
 	}
 
-	version, stable := db.CommittedAccountVersion()
-	if !stable || !rpcExecutionRootMatches(db, slot) {
-		return nil, fmt.Errorf("durable execution account view is unavailable at slot %d", slot)
-	}
 	var keys []solana.PublicKey
 	if err := sealevel.RangeBankSysvarAddresses(func(key solana.PublicKey) error { keys = append(keys, key); return nil }); err != nil {
 		return nil, err
@@ -110,7 +137,7 @@ func RootedRPCBankContext(ctx context.Context, db *accountsdb.AccountsDb, s *sta
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		acct, err := db.GetAccountWithDataLimit(slot, key, remaining)
+		acct, err := reader.GetAccountWithDataLimit(slot, key, remaining)
 		if errors.Is(err, accountsdb.ErrNoAccount) {
 			continue
 		}
@@ -178,16 +205,12 @@ func RootedRPCBankContext(ctx context.Context, db *accountsdb.AccountsDb, s *sta
 	if err != nil {
 		return nil, err
 	}
-	latest, stable := db.CommittedAccountVersion()
-	if !stable || version != latest || !rpcExecutionRootMatches(db, slot) {
-		return nil, fmt.Errorf("durable execution account view changed at slot %d", slot)
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return &ChainTipSnapshot{Slot: slot, Bankhash: parentHash, LastBlockhash: lastHash, BlockHeight: height,
 		LatestEvictedBlockhash: evictedHash, Features: f, PrevFeeGovernor: fees, BankSysvars: sysvars,
-		EpochStakes: stakes.Stakes, TotalEpochStake: stakes.TotalStake, AccountVersion: version, AccountVersionsReady: true}, nil
+		EpochStakes: stakes.Stakes, TotalEpochStake: stakes.TotalStake}, nil
 }
 
 func rpcExecutionRootMatches(db *accountsdb.AccountsDb, slot uint64) bool {
