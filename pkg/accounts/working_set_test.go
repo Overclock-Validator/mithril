@@ -15,6 +15,29 @@ func wsAcct(key byte, lamports uint64) *Account {
 
 func wsKey(b byte) [32]byte { return [32]byte{b} }
 
+func TestWorkingSetRevisionTracksPublicationAndForkReplacement(t *testing.T) {
+	w := NewWorkingSet()
+	require.Zero(t, w.Revision())
+	w.Add(5, []*Account{wsAcct(1, 100)})
+	first := w.Revision()
+	w.Add(5, []*Account{wsAcct(1, 200)})
+	require.Greater(t, w.Revision(), first, "same-slot writes invalidate the old publication")
+	second := w.Revision()
+	w.EvictFrom(5)
+	require.Greater(t, w.Revision(), second)
+	w.Add(5, []*Account{wsAcct(1, 100)})
+	require.Greater(t, w.Revision(), second, "restoring identical bytes must not restore an old revision")
+	beforePromotion := w.Revision()
+	w.PromotePrefix(5)
+	require.Greater(t, w.Revision(), beforePromotion)
+	unchanged := w.Revision()
+	w.EvictFrom(9)
+	w.PromotePrefix(9)
+	require.Equal(t, unchanged, w.Revision(), "empty pruning does not change the view")
+	w.Add(10, nil)
+	require.Greater(t, w.Revision(), unchanged, "a completed empty bank still has a new revision")
+}
+
 func TestWorkingSetLookupBatchPreservesOrderAndMisses(t *testing.T) {
 	w := NewWorkingSet()
 	first := wsAcct(1, 100)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/trace"
@@ -31,11 +32,20 @@ type AccountsDb struct {
 	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
+	voteIndexMu      sync.Mutex
 	CommonAcctsCache *commonAccountCache
 	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
+
+	// Coherent, process-local derived views of committed account state.
+	accountStateMu        sync.Mutex
+	accountStateVersion   atomic.Uint64
+	accountCommittedSlot  atomic.Uint64
+	accountStateUncertain atomic.Bool
+	accountObserversMu    sync.Mutex
+	accountObservers      map[AccountStateObserver]struct{}
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
@@ -95,6 +105,11 @@ type AccountsDb struct {
 	compactCRCBuf         []byte // reused to stream retained manifests through their CRC
 	rewindPending         bool   // guarded by foldMu until lowered state is saved
 	rewindHooks           rewindTestHooks
+}
+
+// DurableThrough returns the highest slot whose fold is fully committed.
+func (accountsDb *AccountsDb) DurableThrough() uint64 {
+	return accountsDb.durableThrough.Load()
 }
 
 // silentLogger suppresses informational messages while retaining errors and fatal failures.
@@ -395,6 +410,10 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 
 // getStoredAccountPinned requires appendVecReadMu to be held for reading.
 func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	return accountsDb.getStoredAccountPinnedWithDataLimit(slot, pubkey, math.MaxUint64)
+}
+
+func (accountsDb *AccountsDb) getStoredAccountPinnedWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
 	if accountsDb.Index == nil {
 		return nil, ErrNoAccount
 	}
@@ -402,17 +421,20 @@ func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.
 	cachedAcct, hasAcct, cacheEpoch := accountsDb.getCachedAccountAndEpoch(pubkey)
 	if hasAcct {
 		r.End()
+		if cachedAcct != nil && uint64(len(cachedAcct.Data)) > maxDataBytes {
+			return nil, accountDataLimitError(uint64(len(cachedAcct.Data)), maxDataBytes)
+		}
 		return cachedAcct, nil
 	}
 	r.End()
 
 	defer trace.StartRegion(context.Background(), "GetStoredAccountDisk").End()
-	acct, err := accountsDb.readIndexedAccount(pubkey)
+	acct, err := accountsDb.readIndexedAccountWithDataLimit(pubkey, maxDataBytes)
 	if err == ErrNoAccount {
 		return nil, ErrNoAccount
 	}
 	if err != nil {
-		if acct, err = accountsDb.readIndexedAccount(pubkey); err != nil {
+		if acct, err = accountsDb.readIndexedAccountWithDataLimit(pubkey, maxDataBytes); err != nil {
 			if err == ErrNoAccount {
 				return nil, ErrNoAccount
 			}
@@ -579,6 +601,10 @@ func (accountsDb *AccountsDb) pendingFoldContainsLocked(pubkey solana.PublicKey)
 
 // readIndexedAccount performs one index-fetch + file-read attempt.
 func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
+	return accountsDb.readIndexedAccountWithDataLimit(pubkey, math.MaxUint64)
+}
+
+func (accountsDb *AccountsDb) readIndexedAccountWithDataLimit(pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
 	acctIdxEntryBytes, c, err := accountsDb.Index.Get(pubkey[:])
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -605,10 +631,12 @@ func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*acco
 		return nil, fmt.Errorf("seek %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
 
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	var appendVecAcct AppendVecAccount
+	err = appendVecAcct.unmarshal(appendVecFile, maxDataBytes)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal account at %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
+	acct := appendVecAcct.ToAccount()
 	if acct.Key != pubkey {
 		return nil, fmt.Errorf("record at %s@%d holds %s (stale index entry)", appendVecFileName, acctIdxEntry.Offset, acct.Key)
 	}

@@ -83,6 +83,9 @@ type blockExecution struct {
 
 	// Retained across global metric resets while a speculative stream waits.
 	accountLoader metrics.AccountLoader
+
+	metadata *blockMetadataCapture
+	results  *blockResultCapture
 }
 
 // newBlockExecution installs the per-bank trace task, the stage watchdog and
@@ -220,6 +223,12 @@ func (exec *blockExecution) close() {
 	}
 	if exec.task != nil {
 		exec.task.End()
+	}
+	if exec.results != nil && !exec.results.sealed {
+		exec.results.fail(errors.New("block execution did not finish"))
+	}
+	if exec.metadata != nil && exec.metadata.Record == nil {
+		exec.metadata.fail(errors.New("block execution did not finish"))
 	}
 }
 
@@ -508,6 +517,8 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	if !canUseDependencyPlanner(view) {
 		return nil, nil, errors.New("streaming group has unresolved address tables")
 	}
+	metadata := exec.metadata.beginGroup(slotCtx, txs, workers)
+	results := exec.results.beginGroup(len(txs))
 	var plan *dependencyPlan
 	if workers > 1 {
 		plannerBuildStart := time.Now()
@@ -521,11 +532,12 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 				continue
 			}
 			var txErr error
-			feeInfos[idx], computeUnits[idx], txErr = ProcessTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures)
+			feeInfos[idx], computeUnits[idx], txErr = processTransactionWithResult(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures, nil, nil, metadata.transaction(idx), results.transaction(idx))
 			if feeInfos[idx] == nil {
 				return nil, nil, unprocessableTransactionError(base+idx, txErr)
 			}
 		}
+		exec.metadata.finishGroup(metadata)
 		return feeInfos, computeUnits, nil
 	}
 
@@ -547,7 +559,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		}
 		executed, release := workAhead.claim(idx)
 		execStart := time.Now()
-		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, executed, timings.at(workerIdx))
+		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransactionWithResult(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, executed, timings.at(workerIdx), metadata.transaction(idx), results.transaction(idx))
 		execElapsed := time.Since(execStart)
 		release()
 		workAhead.verify(idx, txErrors[idx], computeUnits[idx])
@@ -597,6 +609,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
 		}
 	}
+	exec.metadata.finishGroup(metadata)
 	return feeInfos, computeUnits, nil
 }
 
@@ -673,6 +686,9 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	setReplayStage("distribute_fees")
 
 	if err := distributeBlockTxFees(slotCtx, block, &txFeeAccumulator); err != nil {
+		return nil, err
+	}
+	if err := recordBlockFeeReward(block, slotCtx, &txFeeAccumulator); err != nil {
 		return nil, err
 	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
@@ -785,6 +801,11 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 
 	global.IncrTransactionCount(executionPlan.processedTxCount)
 	setReplayStage("done")
+	if exec.metadata != nil || exec.results != nil {
+		exec.sigverifyWg.Wait()
+		exec.metadata.seal(block, slotCtx)
+		exec.results.seal(block)
+	}
 	exec.recordStages()
 	return slotCtx, err
 }

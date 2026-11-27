@@ -37,6 +37,9 @@ type ChainTipSnapshot struct {
 	NanosecondClockAccount        *accounts.Account
 	HasNanosecondClockAccount     bool
 	UnrootedRead                  sealevel.AccountReader
+	AccountVersion                uint64
+	UnrootedVersion               uint64
+	AccountVersionsReady          bool
 }
 
 // ChainTipBankMetadata contains replay-bank scalars that are not carried by
@@ -84,6 +87,9 @@ var (
 	chainTipHasNanosecondClockAccount     bool
 	chainTipPrevFeeGovernor               *sealevel.FeeRateGovernor
 	chainTipUnrootedRead                  sealevel.AccountReader
+	chainTipAccountVersion                uint64
+	chainTipUnrootedVersion               uint64
+	chainTipAccountVersionsReady          bool
 )
 
 // InitChainTip seeds blockprod parent context before the first ProcessBlock.
@@ -135,6 +141,9 @@ func clearChainTipParentLocked() {
 	chainTipHasNanosecondClockAccount = false
 	chainTipPrevFeeGovernor = nil
 	chainTipUnrootedRead = nil
+	chainTipAccountVersion = 0
+	chainTipUnrootedVersion = 0
+	chainTipAccountVersionsReady = false
 }
 
 // ResetChainTip invalidates producer parent state while replay is rewinding or
@@ -217,6 +226,21 @@ func UpdateChainTipFromSlotCtxWithBankMetadata(slotCtx *sealevel.SlotCtx, f *fea
 	} else if slotCtx.UnrootedRead != nil {
 		chainTipUnrootedRead = slotCtx.UnrootedRead
 	}
+	// Bind account versions while replay still owns this completed bank.
+	// Sampling the reader's current revision only when an RPC starts would
+	// accept unpublished same-slot fork replacements with the old parameters.
+	chainTipAccountVersionsReady = false
+	chainTipAccountVersion, chainTipUnrootedVersion = 0, 0
+	if slotCtx.AccountsDb != nil {
+		chainTipAccountVersion, chainTipAccountVersionsReady = slotCtx.AccountsDb.CommittedAccountVersion()
+		if chainTipUnrootedRead != nil {
+			if reader, ok := chainTipUnrootedRead.(interface{ AccountReadVersion() uint64 }); ok {
+				chainTipUnrootedVersion = reader.AccountReadVersion()
+			} else {
+				chainTipAccountVersionsReady = false
+			}
+		}
+	}
 	if slotCtx.AcctsLtHash != nil {
 		chainTipAcctsLtHash = slotCtx.AcctsLtHash.Clone()
 	}
@@ -282,6 +306,9 @@ func ChainTipParentContext() ChainTipSnapshot {
 		HasNanosecondClockAccount:     chainTipHasNanosecondClockAccount,
 		UnrootedRead:                  chainTipUnrootedRead,
 		TransactionStatuses:           chainTipTransactionStatuses,
+		AccountVersion:                chainTipAccountVersion,
+		UnrootedVersion:               chainTipUnrootedVersion,
+		AccountVersionsReady:          chainTipAccountVersionsReady,
 	}
 	if chainTipAcctsLtHash != nil {
 		ctx.AcctsLtHash = chainTipAcctsLtHash.Clone()
@@ -305,6 +332,28 @@ func ChainTipBankSysvars() *sealevel.BankSysvars {
 	chainTipMu.RLock()
 	defer chainTipMu.RUnlock()
 	return chainTipBankSysvars
+}
+
+// rpcExecutionBankContext retains only execution parameters from the completed
+// bank. Accounts, producer state and transaction-status lineage are not retained.
+func rpcExecutionBankContext(completed *sealevel.SlotCtx) *ChainTipSnapshot {
+	if completed == nil || completed.BankSysvars() == nil {
+		return nil
+	}
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	if chainTipSlot != completed.Slot || chainTipBankSysvars != completed.BankSysvars() || chainTipLastBlockhash != solana.Hash(completed.Blockhash) {
+		return nil
+	}
+	// These parameter objects are immutable after chain-tip publication; later
+	// banks replace them. The RPC factory copies writable features and fees.
+	return &ChainTipSnapshot{
+		Generation: chainTipGeneration, Slot: chainTipSlot, Bankhash: chainTipBankhash,
+		Features: chainTipFeatures, PrevFeeGovernor: chainTipPrevFeeGovernor,
+		LastBlockhash: chainTipLastBlockhash, BlockHeight: chainTipBlockHeight,
+		LatestEvictedBlockhash: chainTipLatestEvictedBlockhash, BankSysvars: chainTipBankSysvars,
+		EpochStakes: chainTipEpochStakes, TotalEpochStake: chainTipTotalEpochStake,
+	}
 }
 
 // ChainTipFeatureActive reports the current replay tip's feature state without

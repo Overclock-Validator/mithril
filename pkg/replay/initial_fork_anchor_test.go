@@ -83,7 +83,7 @@ func TestInitialForkAnchorAllowsSwitchBeforeFirstFold(t *testing.T) {
 	tail.Add(8, []*accounts.Account{testAccount(1, 8)}, testHashBytes(8))
 	tail.SetContext(8, forkTestContext(8), testUnwindBankSysvars(t, 8, 800))
 	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
-	rs, bankSysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{LastRootedSlot: 7}, schedule, 0, nil)
+	rs, bankSysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{LastRootedSlot: 7}, schedule, 0, nil, nil)
 	require.Empty(t, reason)
 	require.Equal(t, uint64(7), rs.ParentSlot)
 	require.Equal(t, uint64(7), bankSysvars.Slot())

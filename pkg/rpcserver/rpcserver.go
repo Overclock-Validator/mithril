@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,13 +12,19 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/filecoin-project/go-jsonrpc"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -31,12 +38,27 @@ type rpcHandler struct {
 
 type rpcMethods interface {
 	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetMultipleAccounts(context.Context, jsonrpc.RawParams) (GetMultipleAccountsResp, error)
+	GetBalance(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
 	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlock(context.Context, jsonrpc.RawParams) (GetBlockResp, error)
+	GetBlocks(context.Context, jsonrpc.RawParams) ([]uint64, error)
 	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
 	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetSignatureStatuses(context.Context, jsonrpc.RawParams) (GetSignatureStatusesResp, error)
+	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
+	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
+	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
 }
@@ -45,22 +67,44 @@ type RpcServer struct {
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
 
-	isReady       bool
-	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
-	listener      net.Listener
-	acctsDb       *accountsdb.AccountsDb
-	epochSchedule *sealevel.SysvarEpochSchedule
-	slotCtx       *sealevel.SlotCtx
-	slotCtxMu     sync.RWMutex
-	genesisHash   string
-	epochRewards  *epochrewards.Store
+	isReady              bool
+	rpcService           *jsonrpc.RPCServer
+	serv                 *httptest.Server
+	listener             net.Listener
+	acctsDb              *accountsdb.AccountsDb
+	epochSchedule        *sealevel.SysvarEpochSchedule
+	slotCtx              *sealevel.SlotCtx
+	slotCtxMu            sync.RWMutex
+	healthSlot           func() (uint64, bool)
+	healthReady          bool
+	executionGeneration  uint64
+	executionInvalidated bool
+	simulationOnce       sync.Once
+	simulationCalls      chan struct{}
+	genesisHash          string
+	epochRewards         *epochrewards.Store
+	blockHistory         *blockhistory.Store
+	rootedBank           atomic.Pointer[rootedBankState]
+	identity             string
+	identitySource       func() string
+
+	stakeCacheOnce              sync.Once
+	stakeCache                  rootedStakeCache
+	voteRecordsOnce             sync.Once
+	voteRecords                 rootedVoteRecordCache
+	transactionHistory          *transactionhistory.Store
+	transactionHistoryReads     chan struct{}
+	transactionHistoryResponses chan struct{}
+	queryResponses              chan struct{}
+	resultCache                 *txstatus.ResultCache
+	lifecycleMu                 sync.Mutex
+	lifecycle                   *rpcServerLifecycle
+	lifecycleStopped            bool
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
 	leaderTPUCacheUpdatedAt  time.Time
 	clusterNodesRefreshEvery time.Duration
-	clusterNodesRefreshOnce  sync.Once
 
 	clusterRPCEndpoints []string
 	clusterNodesFetcher clusterNodesFetcher
@@ -69,18 +113,99 @@ type RpcServer struct {
 	sendTransactionLeaderForwardCount uint64
 }
 
+// rootedBankState identifies the durable AccountsDB view served by state RPCs.
+// Publishing it only after a successful fold keeps response context and account
+// values on the same finalized bank.
+type rootedBankState struct {
+	Slot             uint64
+	BlockHeight      uint64
+	TransactionCount uint64
+	executionBank    *replay.ChainTipSnapshot
+	executionVersion uint64
+	executionReady   bool
+}
+
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
-	"getAccountInfo":      {},
-	"getBankHash":         {},
-	"getBlockHeight":      {},
-	"getEpochInfo":        {},
-	"getGenesisHash":      {},
-	"getInflationReward":  {},
-	"getLatestBlockhash":  {},
-	"sendTransaction":     {},
-	"simulateTransaction": {},
+	"getAccountInfo":         {},
+	"getMultipleAccounts":    {},
+	"getBalance":             {},
+	"getBankHash":            {},
+	"getBlock":               {},
+	"getBlocks":              {},
+	"getBlockHeight":         {},
+	"getBlockProduction":     {},
+	"getEpochInfo":           {},
+	"getFirstAvailableBlock": {},
+	"getGenesisHash":         {},
+	"getInflationReward":     {},
+	"getHealth":              {},
+	"getIdentity":            {},
+	"getLatestBlockhash":     {},
+	"getLeaderSchedule":      {},
+	"getSignatureStatuses":   {},
+	"getSlot":                {},
+	"getTransaction":         {},
+	"getVoteAccounts":        {},
+	"getVersion":             {},
+	"minimumLedgerSlot":      {},
+	"sendTransaction":        {},
+	"simulateTransaction":    {},
+}
+
+func (rpcServer *RpcServer) EnableBlockHistory(dir string, retentionSlots, rootedSlot uint64) error {
+	store, err := blockhistory.Open(dir, retentionSlots)
+	if err != nil {
+		return err
+	}
+	if err := store.SetRooted(rootedSlot); err != nil {
+		return err
+	}
+	rpcServer.blockHistory = store
+	return nil
+}
+
+func (rpcServer *RpcServer) RecordBlockHistory(block *b.Block) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordBlock(block)
+}
+
+func (rpcServer *RpcServer) RecordSkippedBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordSkipped(slot)
+}
+
+func (rpcServer *RpcServer) PrepareBlockHistory(through uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Prepare(through)
+}
+
+func (rpcServer *RpcServer) SetRootedBlockHistorySlot(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.SetRooted(slot)
+}
+
+func (rpcServer *RpcServer) RewindBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Rewind(slot)
+}
+
+func (rpcServer *RpcServer) DiscardUnrootedBlockHistory(from uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.DiscardUnrootedFrom(from)
 }
 
 // EnableEpochRewards attaches durable Alpenglow reward history to the RPC server.
@@ -200,6 +325,124 @@ func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
 	}
 }
 
+func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	rpcServer.rootedBank.Store(&rootedBankState{
+		Slot:             slot,
+		BlockHeight:      blockHeight,
+		TransactionCount: transactionCount,
+	})
+}
+
+// SetRootedExecutionBank completes the matching durable publication. An old or
+// incomplete bank must never replace a newer root's execution parameters.
+func (rpcServer *RpcServer) SetRootedExecutionBank(bank *replay.ChainTipSnapshot) {
+	if rpcServer == nil || bank == nil {
+		return
+	}
+	for {
+		root := rpcServer.rootedBank.Load()
+		if root == nil || root.Slot != bank.Slot || root.BlockHeight != bank.BlockHeight {
+			return
+		}
+		next := *root
+		next.executionBank = bank
+		if rpcServer.acctsDb != nil {
+			next.executionVersion, next.executionReady = rpcServer.acctsDb.CommittedAccountVersion()
+			next.executionReady = next.executionReady && !rpcServer.rootedPublicationPending(bank.Slot)
+		}
+		if rpcServer.rootedBank.CompareAndSwap(root, &next) {
+			rpcServer.slotCtxMu.Lock()
+			rpcServer.executionGeneration++
+			rpcServer.executionInvalidated = false
+			rpcServer.slotCtxMu.Unlock()
+			return
+		}
+	}
+}
+
+func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
+	rooted := rpcServer.rootedBank.Load()
+	if rooted == nil {
+		return rootedBankState{}, false
+	}
+	return *rooted, true
+}
+
+func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana.PublicKey) (rootedBankState, *accounts.Account, error) {
+	rooted, accountSet, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{pubkey})
+	if err != nil {
+		return rooted, nil, err
+	}
+	// Batch reads use zero-lamport placeholders for absent/deleted accounts.
+	// Translate that loader representation into absence at the RPC boundary.
+	if len(accountSet) != 1 || accountSet[0] == nil || accountSet[0].Lamports == 0 {
+		return rooted, nil, accountsdb.ErrNoAccount
+	}
+	return rooted, accountSet[0], nil
+}
+
+func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
+	return rpcServer.readRootedAccountsWithBudget(ctx, pubkeys, nil)
+}
+
+func (rpcServer *RpcServer) readRootedAccountsWithBudget(ctx context.Context, pubkeys []solana.PublicKey, remaining *uint64) (rootedBankState, []*accounts.Account, error) {
+	for {
+		bank := rpcServer.rootedBank.Load()
+		if bank == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no rooted bank available")
+		}
+		rooted := *bank
+		if rpcServer.acctsDb == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no accounts database available")
+		}
+		version, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		var accountSet []*accounts.Account
+		var stats accountsdb.BatchReadStats
+		var err error
+		if remaining == nil {
+			accountSet, stats, err = rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		} else {
+			accountSet, stats, err = rpcServer.acctsDb.GetAccountsBatchSharedWithDataLimit(ctx, rooted.Slot, pubkeys, *remaining)
+			*remaining -= stats.DataBytesCharged
+			if errors.Is(err, accountsdb.ErrAccountDataLimit) {
+				return rooted, nil, err
+			}
+		}
+		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || stats.PendingFoldHits > 0 ||
+			rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		return rooted, accountSet, err
+	}
+}
+
+func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
+	durableThrough := rpcServer.acctsDb.DurableThrough()
+	// Zero means the snapshot baseline is active and no fold has committed yet.
+	return durableThrough != 0 && durableThrough != rootedSlot
+}
+
+func waitForRootedPublication(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
 	rpcServer, err := NewRpcServerWithBindAddress(acctsDb, "0.0.0.0", port, epochSchedule, genesisHash)
 	if err != nil {
@@ -221,7 +464,7 @@ func NewRpcServerWithBindAddress(acctsDb *accountsdb.AccountsDb, bindAddress str
 	if err != nil {
 		return nil, fmt.Errorf("listen for RPC on %s: %w", addrStr, err)
 	}
-	rpcServer := &RpcServer{genesisHash: genesisHash.String(), listener: listener}
+	rpcServer := &RpcServer{genesisHash: genesisHash.String(), listener: listener, queryResponses: make(chan struct{}, 2)}
 
 	rpcErrors := rpcErrorRegistry()
 	rpcServer.rpcService = jsonrpc.NewServer(
@@ -264,6 +507,15 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.healthReady = slotCtx != nil
+	rpcServer.executionGeneration++
+	rpcServer.executionInvalidated = slotCtx == nil
+	rpcServer.slotCtxMu.Unlock()
+}
+
+func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.identity = identity
 	rpcServer.slotCtxMu.Unlock()
 }
 
@@ -273,15 +525,32 @@ func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
 	return rpcServer.slotCtx
 }
 
-func (rpcServer *RpcServer) Start() {
-	rpcServer.startClusterNodesRefreshLoop()
-	go http.Serve(rpcServer.listener, rpcServer)
-}
-
 func (rpcServer *RpcServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Match go-jsonrpc's upgrade dispatch so optional owned profiles cannot
+	// create hijacked connections that Shutdown cannot join.
+	if rpcServer.requiresHTTPOnly() && strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		http.Error(w, "optional RPC profile requires HTTP without upgrades", http.StatusBadRequest)
+		return
+	}
 	if quietNonRPCProbe(w, r) || writeQuietRPCProbeError(w, r) {
 		return
 	}
+	// Mixed batches share a deadline across both response owners.
+	deadline := time.Now().Add(historyResponseTimeout)
+	queryResponse := newResponseOwner(r.Context(), w, rpcServer.queryResponses, deadline)
+	if queryResponse != nil {
+		r = r.WithContext(context.WithValue(r.Context(), queryResponseKey{}, queryResponse))
+	}
+	var historyResponse *historyResponseOwner
+	if rpcServer.transactionHistory != nil {
+		historyResponse = newResponseOwner(r.Context(), w, rpcServer.transactionHistoryResponses, deadline)
+		r = r.WithContext(context.WithValue(r.Context(), historyResponseKey{}, historyResponse))
+	}
+	defer func() {
+		if err := finalizeResponseOwners(queryResponse, historyResponse); err != nil {
+			mlog.Log.Debugf("RPC response write failed: %v", err)
+		}
+	}()
 	rpcServer.rpcService.ServeHTTP(w, r)
 }
 
@@ -430,27 +699,31 @@ func readQuietMethodProbeBody(r *http.Request) ([]byte, bool) {
 	return body, true
 }
 
-func (rpcServer *RpcServer) startClusterNodesRefreshLoop() {
-	rpcServer.clusterNodesRefreshOnce.Do(func() {
-		if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
-			return
+func (rpcServer *RpcServer) startClusterNodesRefreshLoop(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
+			mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
 		}
-
-		go func() {
-			if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
-				mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
-			}
-
-			ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
-			defer ticker.Stop()
-
-			for range ticker.C {
-				if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
+		ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
 					mlog.Log.Warnf("sendTransaction: periodic cluster node refresh failed: %v", err)
 				}
 			}
-		}()
-	})
+		}
+	}()
+	return done
 }
 
 func (rpcServer *RpcServer) clusterNodesRefreshInterval() time.Duration {

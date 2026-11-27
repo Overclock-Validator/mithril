@@ -728,7 +728,7 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 }
 
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool) (*fees.TxFeeInfo, uint64, error) {
-	return processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil, nil)
+	return processTransactionWithResult(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil, nil, nil, nil)
 }
 
 // processTransaction is ProcessTransaction. A non-nil executed output, from an
@@ -740,6 +740,23 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 // before the execution context returns to any caller. Independent callers
 // retain atomics.
 func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, executed *LoadAndExecuteTransactionOutput, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, uint64, error) {
+	return processTransactionWithResult(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, executed, timings, nil, nil)
+}
+
+// processTransactionWithResult is processTransaction with optional history
+// outputs. capture receives the transaction's status metadata and result its
+// signature outcome; both are nil on the ordinary node path.
+//
+// An early execution records no logs or inner instructions, so a transaction
+// whose metadata is being captured is always executed here, even when an
+// executed output is offered.
+func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, executed *LoadAndExecuteTransactionOutput, timings *metrics.TransactionTimings, capture *transactionMetadataCapture, result *transactionResultCapture) (feeInfo *fees.TxFeeInfo, computeUnits uint64, executionErr error) {
+	if result != nil {
+		*result = transactionResultCapture{}
+	}
+	if capture != nil {
+		*capture = transactionMetadataCapture{budget: capture.budget}
+	}
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -790,14 +807,42 @@ func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		defer mlog.Log.DisableInfLogging()
 	}
 
+	var metadata *transactionMetadata
+	if capture != nil {
+		metadata, capture.Err = prepareTransactionMetadata(slotCtx, tx, capture.budget)
+	}
+
 	// Execute via pure function
 	var output LoadAndExecuteTransactionOutput
-	if executed != nil {
+	if executed != nil && metadata == nil {
 		output = *executed
 	} else {
 		input := transactionExecutionInput(slotCtx, tx, txMeta, arena, debugTx, captureTx)
 		input.TimingRecorder = timings
+		if metadata != nil {
+			input.RecordLogs = true
+			input.boundedMetadata = true
+			input.RecordInnerInstructions = true
+		}
 		output = LoadAndExecuteTransaction(input)
+	}
+	if result != nil {
+		defer func() {
+			if feeInfo != nil {
+				result.finish(tx, output.ProcessingResult.TransactionError)
+			}
+		}()
+	}
+	if metadata != nil {
+		defer func() {
+			if feeInfo == nil {
+				return
+			}
+			capture.Err = metadata.finish(slotCtx, tx, output, feeInfo.TotalFee, capture.budget)
+			if capture.Err == nil {
+				capture.Record = metadata
+			}
+		}()
 	}
 
 	execCtx := output.ExecCtx

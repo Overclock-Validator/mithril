@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -12,11 +13,41 @@ func TestMemAccountMissingErrorRetainsLookupKey(t *testing.T) {
 	key := [32]byte{}
 	_, lockedErr := mem.GetAccount(&key)
 	_, unlockedErr := mem.GetAccountWithoutLock(solana.PublicKey(key))
+	overlay := NewOverlayAccounts(mem)
+	_, overlayErr := overlay.GetAccount(&key)
+	_, overlayUnlockedErr := overlay.GetAccountWithoutLock(solana.PublicKey(key))
 	key[0] = 99 // Lookup callers may reuse their key storage before reporting an error.
-	for _, err := range []error{lockedErr, unlockedErr} {
+	for _, err := range []error{lockedErr, unlockedErr, overlayErr, overlayUnlockedErr} {
 		if err == nil || err.Error() != "no such account 11111111111111111111111111111111 found" {
 			t.Fatalf("missing error lost its original key: %v", err)
 		}
+		if !errors.Is(err, ErrAccountNotFound) {
+			t.Fatalf("missing error does not wrap ErrAccountNotFound: %v", err)
+		}
+	}
+}
+
+func TestStoredNilAndTombstonesAreNotMissing(t *testing.T) {
+	for name, store := range map[string]Accounts{
+		"memory":  NewMemAccounts(),
+		"overlay": NewOverlayAccounts(NewMemAccounts()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			key := [32]byte{1}
+			for _, want := range []*Account{nil, {Key: key}} {
+				if err := store.SetAccount(&key, want); err != nil {
+					t.Fatal(err)
+				}
+				got, err := store.GetAccount(&key)
+				if err != nil || got != want {
+					t.Fatalf("locked read: got (%p, %v), want (%p, nil)", got, err, want)
+				}
+				got, err = store.GetAccountWithoutLock(solana.PublicKey(key))
+				if err != nil || got != want {
+					t.Fatalf("unlocked read: got (%p, %v), want (%p, nil)", got, err, want)
+				}
+			}
+		})
 	}
 }
 

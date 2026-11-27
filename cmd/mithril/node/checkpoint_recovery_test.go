@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,7 +45,11 @@ func testDurableStatusContext(t *testing.T, accountsDbPath string, root uint64) 
 	require.NoError(t, err)
 	return &state.ResumeContext{
 		Slot:                        root,
-		Bankhash:                    fmt.Sprintf("bank-%d", root),
+		Bankhash:                    tipID.String(),
+		Blockhash:                   tipID.String(),
+		AcctsLtHash:                 base64.StdEncoding.EncodeToString(make([]byte, 2048)),
+		RecentBlockhashes:           []state.BlockhashEntry{{Blockhash: tipID.String()}},
+		EvictedBlockhash:            solana.Hash{0xee}.String(),
 		AlpenglowBlockID:            tipID.String(),
 		AlpenglowChainedMerkleRoot:  solana.Hash{0xcc}.String(),
 		TransactionStatusCheckpoint: ref,
@@ -132,6 +137,34 @@ func TestRecoveredManifestContextAdvancesStaleStateBeforeIntegrity(t *testing.T)
 	assert.Equal(t, uint64(5), s.LastRootedSlot)
 	assert.Equal(t, uint64(5), s.LastSlot)
 	assert.Equal(t, manifestCtx, s.LastRootedContext)
+}
+
+type recordingRPCBankState struct {
+	slot             uint64
+	blockHeight      uint64
+	transactionCount uint64
+}
+
+func (state *recordingRPCBankState) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	state.slot = slot
+	state.blockHeight = blockHeight
+	state.transactionCount = transactionCount
+}
+
+func TestPublishRPCBankStateUsesRecoveredRoot(t *testing.T) {
+	transactionCount := uint64(789)
+	server := new(recordingRPCBankState)
+	publishRPCBankState(server, &state.MithrilState{
+		ManifestParentSlot:       10,
+		ManifestBlockHeight:      20,
+		ManifestTransactionCount: 30,
+		LastRootedContext: &state.ResumeContext{
+			Slot:             123,
+			BlockHeight:      456,
+			TransactionCount: &transactionCount,
+		},
+	})
+	assert.Equal(t, recordingRPCBankState{slot: 123, blockHeight: 456, transactionCount: 789}, *server)
 }
 
 func writeCheckpointManifest(t *testing.T, accountsDbPath, manifestsDir string, seq, root, fileID uint64, suffix string) *state.TransactionStatusCheckpointRef {

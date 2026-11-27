@@ -238,6 +238,17 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (stats CompactStats, err
 	db.compactCycles++
 	queue := newCompactCandidateQueue(candidates, db.sparseCursor, db.compactCursor, db.resparseNext, db.compactCycles%8 == 0)
 
+	// A source manifest may be the only durable copy of its bankhashes.
+	// Flush their WAL before this cycle can remove any such recovery record.
+	for _, c := range candidates {
+		if c.manifestPath != "" {
+			if err := db.BankHashStore.LogData(nil, pebble.Sync); err != nil {
+				return stats, fmt.Errorf("accountsdb: sync bankhashes before compaction: %w", err)
+			}
+			break
+		}
+	}
+
 	// This cache is private to the foldMu-protected cycle. Sparse reclamation
 	// never changes index locations; relocation below invalidates it.
 	var indexCache sparseIndexCache
@@ -530,7 +541,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return false, 0, err
 	}
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
+	pubkeys, idxEntries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
 	if err != nil {
 		return false, 0, err
 	}

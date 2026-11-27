@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // RecoveryResult reports the durable fold state derived from the store itself
@@ -54,6 +56,9 @@ type RecoveryResult struct {
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	db.foldMu.LockAs("recovery")
 	defer db.foldMu.Unlock()
+	finish := db.beginAccountChange()
+	success := false
+	defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
@@ -101,6 +106,9 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 			}
 			continue
 		}
+		if _, exists := bySeq[h.BatchSeq]; exists {
+			return res, fmt.Errorf("accountsdb: duplicate active fold sequence %d", h.BatchSeq)
+		}
 		bySeq[h.BatchSeq] = h
 	}
 
@@ -108,6 +116,30 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	frontier := foldMeta{}
 	if haveMeta {
 		frontier = meta
+	}
+
+	// The account index can survive while the separate bankhash WAL loses its
+	// buffered writes. Restore retained committed manifests without replaying
+	// account rows or requiring segments that compaction may have removed.
+	var previousThrough uint64
+	havePrevious := false
+	for _, hdr := range headers {
+		if hdr.BatchSeq == 0 || hdr.BatchSeq > frontier.BatchSeq {
+			continue
+		}
+		manifest, err := ReadSegmentManifest(hdr.Path)
+		if err != nil {
+			return res, fmt.Errorf("accountsdb: read committed fold sequence %d: %w", hdr.BatchSeq, err)
+		}
+		if manifest.ThroughSlot > frontier.ThroughSlot ||
+			(havePrevious && manifest.ThroughSlot <= previousThrough) ||
+			(havePrevious && len(manifest.Bankhashes) > 0 && manifest.Bankhashes[0].Slot <= previousThrough) {
+			return res, fmt.Errorf("accountsdb: inconsistent committed fold range at sequence %d", hdr.BatchSeq)
+		}
+		if err := db.storeManifestBankhashes(manifest); err != nil {
+			return res, err
+		}
+		previousThrough, havePrevious = manifest.ThroughSlot, true
 	}
 
 	// Replay the contiguous run above the frontier.
@@ -122,10 +154,18 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 			mlog.Log.Warnf("accountsdb: fold manifest seq %d failed verification (%v); treating batch and everything above as undecided", seq, verr)
 			break
 		}
+		// Vote membership is derived from the CRC-checked segment, keeping the
+		// durable manifest compatible with pre-vote-index binaries. A read or
+		// metadata error must leave this decided batch intact for diagnosis/retry.
+		if err := db.restoreManifestVoteFlags(manifest); err != nil {
+			return res, fmt.Errorf("accountsdb: restore vote candidates for fold seq %d: %w", seq, err)
+		}
 		if err := db.applyManifestToIndex(manifest); err != nil {
 			return res, fmt.Errorf("accountsdb: replay fold manifest seq %d: %w", seq, err)
 		}
-		db.storeManifestBankhashes(manifest)
+		if err := db.storeManifestBankhashes(manifest); err != nil {
+			return res, err
+		}
 		res.ReplayedBatches = append(res.ReplayedBatches, seq)
 		stopSeq = seq
 	}
@@ -198,8 +238,19 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	// reconciliation instead of condemning the store as data loss.
 	res.RewindInProgress = hasParkedRewindManifests(db.AcctsDir)
 
+	// Recovery can also run in-process after a partial fold. Discard cached
+	// account bytes before rebuilding any derived view against the repaired index.
+	db.readCacheEpochMu.Lock()
+	db.readCacheEpoch++
+	db.pendingFold = nil
+	if db.commonAdmission != nil {
+		db.resetReadCachesLocked()
+	}
+	db.readCacheEpochMu.Unlock()
+
 	db.lastBatchSeq = res.BatchSeq
 	db.durableThrough.Store(res.DurableThrough)
+	success = true
 	return res, nil
 }
 
@@ -224,14 +275,22 @@ func (db *AccountsDb) verifyAndReadManifest(hdr ManifestHeader) (*SegmentManifes
 	return manifest, nil
 }
 
-func (db *AccountsDb) storeManifestBankhashes(m *SegmentManifest) {
+func (db *AccountsDb) storeManifestBankhashes(m *SegmentManifest) error {
+	for i, bh := range m.Bankhashes {
+		if bh.Slot > m.ThroughSlot || (i > 0 && bh.Slot <= m.Bankhashes[i-1].Slot) {
+			return fmt.Errorf("accountsdb: invalid bankhash range in fold sequence %d", m.BatchSeq)
+		}
+	}
 	for _, bh := range m.Bankhashes {
 		var slotBytes [8]byte
 		binary.LittleEndian.PutUint64(slotBytes[:], bh.Slot)
-		if err := db.BankHashStore.Set(slotBytes[:], bh.Bankhash[:], nil); err != nil {
-			mlog.Log.Warnf("accountsdb: recovery bankhash store slot %d: %v", bh.Slot, err)
+		// A rewind can leave a durable row from the old fork. The active
+		// committed manifest, not that advisory row, determines its replacement.
+		if err := db.BankHashStore.Set(slotBytes[:], bh.Bankhash[:], pebble.NoSync); err != nil {
+			return fmt.Errorf("accountsdb: restore bankhash at slot %d: %w", bh.Slot, err)
 		}
 	}
+	return nil
 }
 
 // bootstrapHighFileId reads the write-once sidecar recorded by snapshot build.
@@ -334,4 +393,40 @@ func (db *AccountsDb) removeStaleTmpManifests() ([]string, error) {
 		removed = append(removed, p)
 	}
 	return removed, nil
+}
+
+// restoreManifestVoteFlags reconstructs the transient vote-index hints before
+// replaying a durable manifest. Normal commits already have these hints from
+// the accounts being written and do not reread the segment. Read fixed headers
+// only, without loading account payloads or consulting the possibly stale index.
+// The caller must first verify the segment length and CRC.
+func (db *AccountsDb) restoreManifestVoteFlags(m *SegmentManifest) error {
+	if len(m.Records) == 0 {
+		return nil
+	}
+	f, err := os.Open(filepath.Join(db.AcctsDir, SegmentDataName(m.ThroughSlot, m.FileId)))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var header [hdrLen]byte
+	for i := range m.Records {
+		r := &m.Records[i]
+		if r.Offset > m.DataLen || m.DataLen-r.Offset < hdrLen || r.Offset > uint64(1<<63-1)-hdrLen {
+			return fmt.Errorf("account %x: header offset %d outside segment", r.Pubkey, r.Offset)
+		}
+		if _, err := f.ReadAt(header[:], int64(r.Offset)); err != nil {
+			return err
+		}
+		if [32]byte(header[pubkeyOffset:pubkeyOffset+32]) != r.Pubkey {
+			return fmt.Errorf("account %x: segment pubkey mismatch", r.Pubkey)
+		}
+		dataLen := binary.LittleEndian.Uint64(header[dataLenOffset : dataLenOffset+8])
+		if dataLen > m.DataLen-r.Offset-hdrLen {
+			return fmt.Errorf("account %x: payload outside segment", r.Pubkey)
+		}
+		r.Vote = binary.LittleEndian.Uint64(header[lamportsOffset:lamportsOffset+8]) > 0 &&
+			[32]byte(header[ownerOffset:ownerOffset+32]) == addresses.VoteProgramAddr
+	}
+	return nil
 }

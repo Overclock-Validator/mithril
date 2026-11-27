@@ -49,7 +49,7 @@ func TestForkUnwindAcrossEpochRestoresBankOwnedState(t *testing.T) {
 	active := &rewards.PartitionedRewardDistributionInfo{NumRewardPartitionsRemaining: 3}
 	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 10, LeaderScheduleSlotOffset: 10}
 	snapshot := tail.retainedForkState(10)
-	rs, bank, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 10}, tail, &state.MithrilState{LastRootedSlot: 9}, schedule, 1, active)
+	rs, bank, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 10}, tail, &state.MithrilState{LastRootedSlot: 9}, schedule, 1, active, nil)
 	require.Empty(t, reason)
 	require.Equal(t, uint64(9), rs.ParentSlot)
 	require.Equal(t, uint64(9), bank.Slot())

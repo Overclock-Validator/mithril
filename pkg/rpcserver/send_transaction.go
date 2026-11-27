@@ -3,6 +3,7 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -73,42 +74,66 @@ var errInvalidSanitizedTransaction = &InvalidParamsError{
 }
 
 func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawParams) (string, error) {
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {
 		return "", &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
 	}
-	if len(params) < 1 {
+	if len(params) < 1 || len(params) > 2 {
 		return "", &InvalidParamsError{Message: "sendTransaction requires a transaction string as first parameter"}
 	}
 
-	txStr, ok := params[0].(string)
-	if !ok {
+	var txStr *string
+	if err := json.Unmarshal(params[0], &txStr); err != nil || txStr == nil {
 		return "", &InvalidParamsError{Message: "sendTransaction requires a transaction string as first parameter"}
 	}
 
-	conf := parseSendTransactionConfig(params)
-
-	tx, wire, err := decodeSendTransaction(txStr, conf.encoding)
+	conf, err := parseSendTransactionConfig(params)
 	if err != nil {
 		return "", err
 	}
 
-	if err := validateSendTransactionSanitize(tx, featuresForSendValidation(rpcServer.getSlotCtx())); err != nil {
+	tx, wire, err := decodeSendTransaction(*txStr, conf.encoding)
+	if err != nil {
 		return "", err
 	}
 
-	if conf.minContextSlot != nil && global.Slot() < *conf.minContextSlot {
-		return "", &MinContextSlotNotReachedError{ContextSlot: *conf.minContextSlot}
+	if err := validateSendTransactionSanitize(tx, nil); err != nil {
+		return "", err
+	}
+	release, err := rpcServer.acquireSimulation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	commitment := conf.preflightCommitment
+	if conf.skipPreflight {
+		commitment = "processed"
+	}
+	slotCtx, resolved, view, _, lookupErr, err := rpcServer.prepareSimulation(ctx, tx, commitment, conf.minContextSlot, nil, !conf.skipPreflight)
+	if err != nil {
+		return "", err
+	}
+	if lookupErr != nil {
+		return "", &InvalidParamsError{Message: fmt.Sprintf("invalid transaction: %s", sendTransactionErrorMessage(lookupErr))}
+	}
+	tx = resolved
+	if err := validateSendTransactionSanitize(tx, slotCtx.Features); err != nil {
+		return "", err
 	}
 
 	if !conf.skipPreflight {
-		slotCtx := rpcServer.getSlotCtx()
-		if slotCtx == nil {
-			return "", fmt.Errorf("node is not ready for transaction preflight")
-		}
 		if err := rpcServer.preflightSendTransaction(ctx, tx, slotCtx); err != nil {
+			if view.err != nil {
+				return "", view.err
+			}
 			return "", err
 		}
+	}
+	if view.err != nil {
+		return "", view.err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	signature, err := firstSignature(tx)
@@ -123,38 +148,40 @@ func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawPa
 	return signature.String(), nil
 }
 
-func parseSendTransactionConfig(params []interface{}) sendTransactionConfig {
+func parseSendTransactionConfig(params []json.RawMessage) (sendTransactionConfig, error) {
 	conf := sendTransactionConfig{
 		encoding: "base58",
 	}
 	if len(params) < 2 {
-		return conf
+		return conf, nil
 	}
 
-	confMap, ok := params[1].(map[string]interface{})
-	if !ok {
-		return conf
+	var options struct {
+		Encoding            *string `json:"encoding"`
+		SkipPreflight       *bool   `json:"skipPreflight"`
+		PreflightCommitment *string `json:"preflightCommitment"`
+		MaxRetries          *uint   `json:"maxRetries"`
+		MinContextSlot      *uint64 `json:"minContextSlot"`
+	}
+	if err := json.Unmarshal(params[1], &options); err != nil {
+		return conf, &InvalidParamsError{Message: fmt.Sprintf("invalid sendTransaction config: %v", err)}
 	}
 
-	if encoding, ok := confMap["encoding"].(string); ok {
-		conf.encoding = encoding
+	if options.Encoding != nil {
+		conf.encoding = *options.Encoding
 	}
-	if skipPreflight, ok := confMap["skipPreflight"].(bool); ok {
-		conf.skipPreflight = skipPreflight
+	if options.SkipPreflight != nil {
+		conf.skipPreflight = *options.SkipPreflight
 	}
-	if preflightCommitment, ok := confMap["preflightCommitment"].(string); ok {
-		conf.preflightCommitment = preflightCommitment
+	if options.PreflightCommitment != nil {
+		if err := validateTransactionCommitment(*options.PreflightCommitment); err != nil {
+			return conf, err
+		}
+		conf.preflightCommitment = *options.PreflightCommitment
 	}
-	if maxRetries, ok := confMap["maxRetries"].(float64); ok && maxRetries >= 0 {
-		v := uint(maxRetries)
-		conf.maxRetries = &v
-	}
-	if minContextSlot, ok := confMap["minContextSlot"].(float64); ok && minContextSlot >= 0 {
-		v := uint64(minContextSlot)
-		conf.minContextSlot = &v
-	}
-
-	return conf
+	conf.maxRetries = options.MaxRetries
+	conf.minContextSlot = options.MinContextSlot
+	return conf, nil
 }
 
 func decodeSendTransaction(txStr string, encoding string) (*solana.Transaction, []byte, error) {
@@ -233,13 +260,6 @@ func base64TransactionSizeLimits(encoded string) (maxEncoded int, maxRaw int) {
 	return maxBase64LegacyTxSize, legacyTransactionSize
 }
 
-func featuresForSendValidation(slotCtx *sealevel.SlotCtx) *features.Features {
-	if slotCtx != nil && slotCtx.Features != nil {
-		return slotCtx.Features
-	}
-	return nil
-}
-
 func validateSendTransactionSanitize(tx *solana.Transaction, feats *features.Features) error {
 	if err := txverify.SanitizeTransaction(tx); err != nil {
 		return errInvalidSanitizedTransaction
@@ -262,7 +282,7 @@ func firstSignature(tx *solana.Transaction) (solana.Signature, error) {
 }
 
 func (rpcServer *RpcServer) preflightSendTransaction(ctx context.Context, tx *solana.Transaction, slotCtx *sealevel.SlotCtx) error {
-	if err := rpcServer.resolveAddressTablesForPreflight(ctx, tx, slotCtx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -281,6 +301,9 @@ func (rpcServer *RpcServer) preflightSendTransaction(ctx context.Context, tx *so
 		IsSimulation:            true,
 		RecordInnerInstructions: false,
 	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if output.ProcessingResult.TransactionError == nil {
 		return nil
@@ -294,19 +317,6 @@ func (rpcServer *RpcServer) preflightSendTransaction(ctx context.Context, tx *so
 		Message: fmt.Sprintf("Transaction simulation failed: %s", sendTransactionErrorMessage(txErr)),
 		Result:  sendTransactionFailureResultFromOutput(output),
 	}
-}
-
-func (rpcServer *RpcServer) resolveAddressTablesForPreflight(ctx context.Context, tx *solana.Transaction, slotCtx *sealevel.SlotCtx) error {
-	if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
-		return nil
-	}
-	if rpcServer.acctsDb == nil {
-		return &InvalidParamsError{Message: "invalid transaction: address lookup table resolution unavailable"}
-	}
-	if err := replay.ResolveAddrTableLookupsForTx(ctx, rpcServer.acctsDb, slotCtx.Slot, tx); err != nil {
-		return &InvalidParamsError{Message: fmt.Sprintf("invalid transaction: %s", err.Error())}
-	}
-	return nil
 }
 
 func signaturePreflightFailure() *SendTransactionPreflightFailureError {

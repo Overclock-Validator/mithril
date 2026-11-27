@@ -65,7 +65,7 @@ func TestRenderInnerInstructions_AgaveWireShape(t *testing.T) {
 	require.Len(t, out[0].Instructions, 1)
 	got := out[0].Instructions[0]
 	assert.Equal(t, uint8(4), got.ProgramIdIndex)
-	assert.Equal(t, []uint8{1, 2}, got.Accounts)
+	assert.Equal(t, []uint16{1, 2}, got.Accounts)
 	assert.Equal(t, "Ldp", got.Data, "data must be base58-encoded, not base64")
 	require.NotNil(t, got.StackHeight)
 	assert.Equal(t, uint32(2), *got.StackHeight, "stackHeight must serialize as Option<u32> per Agave wire format")
@@ -73,7 +73,7 @@ func TestRenderInnerInstructions_AgaveWireShape(t *testing.T) {
 	// JSON shape sanity: round-trip and confirm keys.
 	raw, err := json.Marshal(out)
 	require.NoError(t, err)
-	for _, want := range []string{`"index":0`, `"programIdIndex":4`, `"data":"Ldp"`, `"stackHeight":2`} {
+	for _, want := range []string{`"index":0`, `"programIdIndex":4`, `"accounts":[1,2]`, `"data":"Ldp"`, `"stackHeight":2`} {
 		assert.Contains(t, string(raw), want)
 	}
 }
@@ -84,28 +84,46 @@ func TestRenderInnerInstructions_EmptyReturnsEmptyArray(t *testing.T) {
 	assert.Len(t, out, 0)
 }
 
-func TestParseSimulateConfig_MinContextSlot(t *testing.T) {
-	params := []interface{}{
-		"unused-tx-string",
-		map[string]interface{}{"minContextSlot": float64(417500000)},
+func TestRenderInnerInstructionsAccountIndices(t *testing.T) {
+	for _, indices := range [][]uint8{nil, {}, {0, 255}} {
+		out := renderInnerInstructions([]replay.InnerInstructionsList{{Instructions: []replay.CompiledInstruction{{Accounts: indices}}}})
+		raw, err := json.Marshal(out[0].Instructions[0])
+		require.NoError(t, err)
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &fields))
+		if len(indices) == 0 {
+			require.JSONEq(t, `[]`, string(fields["accounts"]))
+		} else {
+			require.JSONEq(t, `[0,255]`, string(fields["accounts"]))
+		}
 	}
-	conf := parseSimulateConfig(params)
+}
+
+func TestParseSimulateConfig_MinContextSlot(t *testing.T) {
+	params := []json.RawMessage{
+		json.RawMessage(`"unused-tx-string"`),
+		json.RawMessage(`{"minContextSlot":417500000}`),
+	}
+	conf, err := parseSimulateConfig(params)
+	require.NoError(t, err)
 	if assert.NotNil(t, conf.minContextSlot) {
 		assert.Equal(t, uint64(417500000), *conf.minContextSlot)
 	}
 }
 
 func TestParseSimulateConfig_Commitment(t *testing.T) {
-	params := []interface{}{
-		"unused-tx-string",
-		map[string]interface{}{"commitment": "confirmed"},
+	params := []json.RawMessage{
+		json.RawMessage(`"unused-tx-string"`),
+		json.RawMessage(`{"commitment":"confirmed"}`),
 	}
-	conf := parseSimulateConfig(params)
+	conf, err := parseSimulateConfig(params)
+	require.NoError(t, err)
 	assert.Equal(t, "confirmed", conf.commitment)
 }
 
 func TestParseSimulateConfig_DefaultsOmitOptional(t *testing.T) {
-	conf := parseSimulateConfig([]interface{}{"unused", map[string]interface{}{}})
+	conf, err := parseSimulateConfig([]json.RawMessage{json.RawMessage(`"unused"`), json.RawMessage(`{}`)})
+	require.NoError(t, err)
 	assert.Nil(t, conf.minContextSlot)
 	assert.Empty(t, conf.commitment)
 }
