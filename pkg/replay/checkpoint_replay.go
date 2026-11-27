@@ -226,6 +226,7 @@ func (r *CheckpointReplay) Next(block *b.Block) (*sealevel.SlotCtx, error) {
 	if block == nil || block.Slot <= r.parent.Slot {
 		return nil, fmt.Errorf("checkpoint replay at slot %d cannot take this block", r.parent.Slot)
 	}
+	block.PrivateReplay = true
 	block.Epoch = r.epochSchedule.GetEpoch(block.Slot)
 	if block.Epoch != r.epoch {
 		return nil, ErrCheckpointReplayCrossesEpoch

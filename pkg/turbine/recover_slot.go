@@ -56,3 +56,39 @@ func RecoverSlotDataShreds(slot uint64, packets [][]byte) ([][]byte, error) {
 	}
 	return nil, fmt.Errorf("slot %d does not assemble from its %d packets", slot, len(packets))
 }
+
+// BlockFromSpooledPackets assembles one slot's block from its spooled packets
+// (data and coding shreds, in any order, duplicates allowed), as replay
+// assembled it when the shreds arrived. The packets must come from this
+// node's own spool: neither shred nor transaction signatures are checked
+// again, and the block is marked accordingly.
+func BlockFromSpooledPackets(slot uint64, packets [][]byte) (*block.Block, error) {
+	a := NewSlotAssembler()
+	a.verifyTransactions = func(context.Context, *block.Block) error { return nil }
+	var lastErr error
+	for _, wantType := range []ShredType{ShredTypeData, ShredTypeCode} {
+		for _, packet := range packets {
+			shred, err := ParseShred(packet)
+			if err != nil || shred.Slot != slot || shred.Type != wantType {
+				continue
+			}
+			blk, err := a.AddShred(shred)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if blk != nil {
+				blk.MarkTransactionSignaturesVerified()
+				return blk, nil
+			}
+		}
+	}
+	if blk, err := a.CompleteSlot(slot); err == nil && blk != nil {
+		blk.MarkTransactionSignaturesVerified()
+		return blk, nil
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("slot %d does not assemble: %w", slot, lastErr)
+	}
+	return nil, fmt.Errorf("slot %d does not assemble from its %d packets", slot, len(packets))
+}

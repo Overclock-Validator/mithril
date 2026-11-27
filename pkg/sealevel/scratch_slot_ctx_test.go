@@ -54,6 +54,7 @@ var derivedSlotCtxFields = map[string]string{
 	"bankSysvars":               "shared",
 	"TraceCtx":                  "shared",
 	"DeferVoteCachePublication": "private",
+	"PrivateReplay":             "private", // a derived context publishes nothing in any case
 	"PendingVoteCacheMu":        "private",
 	"PendingVoteCache":          "private",
 	"PendingVoteCacheDeletes":   "private",

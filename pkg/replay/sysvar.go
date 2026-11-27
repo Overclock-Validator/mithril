@@ -274,7 +274,7 @@ func finalizeBankSysvars(slotCtx *sealevel.SlotCtx) error {
 
 	// The legacy singleton remains an ordered-replay bootstrap/checkpoint aid.
 	// Never publish speculative producer state into it.
-	if slotCtx.Replay {
+	if slotCtx.Replay && !slotCtx.PrivateReplay {
 		recentForLegacy := append(sealevel.SysvarRecentBlockhashes(nil), recent...)
 		historyForLegacy := history
 		historyForLegacy.Bits.Bits.Blocks = append([]uint64(nil), history.Bits.Bits.Blocks...)

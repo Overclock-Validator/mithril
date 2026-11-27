@@ -333,7 +333,7 @@ type workAhead struct {
 func newWorkAhead(slotCtx *sealevel.SlotCtx, view *b.Block, execute []bool, dbgOpts *DebugOptions) *workAhead {
 	// A locally produced block is never executed early: the producer's own
 	// execution is its bank, and nothing checks it against another footer.
-	if !workAheadEnabled || workAheadTripped.Load() || slotCtx == nil || view == nil || view.FromLocalProduction || !schedulingOnFor(slotCtx.Slot) {
+	if !workAheadEnabled || workAheadTripped.Load() || slotCtx == nil || view == nil || view.FromLocalProduction || view.PrivateReplay || !schedulingOnFor(slotCtx.Slot) {
 		return nil
 	}
 	overlay, ok := slotCtx.Accounts.(*accounts.OverlayAccounts)

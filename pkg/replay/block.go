@@ -756,8 +756,10 @@ func loadBlockAccountsAndUpdateSysvars(
 
 			newClockBytes := clock.MustMarshal()
 			copy(clockAcct.Data, newClockBytes)
-			sealevel.SysvarCache.Clock.Sysvar = &clock
-			sealevel.SysvarCache.Clock.Acct = clockAcct
+			if !block.PrivateReplay {
+				sealevel.SysvarCache.Clock.Sysvar = &clock
+				sealevel.SysvarCache.Clock.Acct = clockAcct
+			}
 			err = accts.SetAccountWithoutLock(sealevel.SysvarClockAddr, clockAcct)
 			if err != nil {
 				panic("unable to set clock sysvar to accts")
@@ -823,8 +825,10 @@ func loadBlockAccountsAndUpdateSysvars(
 			slotHashes.Update(block.Slot, block.ParentSlot, block.ParentBankhash)
 			newSlotHashesBytes := slotHashes.MustMarshal()
 			slotHashesAcct.Data = newSlotHashesBytes
-			sealevel.SysvarCache.SlotHashes.Sysvar = &slotHashes
-			sealevel.SysvarCache.SlotHashes.Acct = slotHashesAcct
+			if !block.PrivateReplay {
+				sealevel.SysvarCache.SlotHashes.Sysvar = &slotHashes
+				sealevel.SysvarCache.SlotHashes.Acct = slotHashesAcct
+			}
 			err = accts.SetAccountWithoutLock(sealevel.SysvarSlotHashesAddr, slotHashesAcct)
 			if err != nil {
 				panic("unable to set slothashes sysvar to accountsdb")
@@ -1619,8 +1623,10 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 			if err := clock.UnmarshalWithDecoder(bin.NewBinDecoder(clockAcct.Data)); err != nil {
 				return fmt.Errorf("cannot resume: failed to decode restored clock sysvar: %w", err)
 			}
-			sealevel.SysvarCache.Clock.Sysvar = &clock
-			sealevel.SysvarCache.Clock.Acct = clockAcct
+			if !block.PrivateReplay {
+				sealevel.SysvarCache.Clock.Sysvar = &clock
+				sealevel.SysvarCache.Clock.Acct = clockAcct
+			}
 		}
 	} else {
 		// No blockhash context in state file - this should not happen with new state files,
@@ -2827,6 +2833,7 @@ func ReplayBlocks(
 	benchLoadCtx, stopBenchLoad := context.WithCancel(context.Background())
 	defer stopBenchLoad()
 	startBenchCheckpointLoad(benchLoadCtx, acctsDb)
+	startBenchCheckpointReplay(benchLoadCtx, acctsDb, mithrilState)
 	var prefetcher *accountPrefetcher
 	if accountPrefetchEnabled {
 		var src blockAccountSource = acctsDb
@@ -4661,6 +4668,13 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 
 		SerializedParameterArena: SerializedParameterArena,
 	}
+	if block.PrivateReplay {
+		// No shared arena (parameters go to the heap), and vote cache and stake
+		// index changes stay in the bank; nothing ever publishes them.
+		slotCtx.SerializedParameterArena = nil
+		slotCtx.PrivateReplay = true
+		slotCtx.DeferVoteCachePublication = true
+	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
 	if tail := normalizeUnrootedState(tail); tail != nil {
@@ -4984,7 +4998,7 @@ func parallelTxLoop(
 				executed = nil // a captured transaction executes here, not early
 			}
 			execStart := time.Now()
-			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures, executed, timings.at(worker), metadata.transaction(idx), results.transaction(idx))
+			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, borrowedAccountArena(block, int(worker)), shouldVerifySignatures, executed, timings.at(worker), metadata.transaction(idx), results.transaction(idx))
 			execElapsed := time.Since(execStart)
 			release()
 			if writableBefore != nil {
@@ -5101,7 +5115,7 @@ func parallelTxLoop(
 					if int(idx) < len(block.TxMetas) {
 						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures, nil, nil, metadata.transaction(int(idx)), results.transaction(int(idx)))
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, borrowedAccountArena(block, int(workerIdx)), shouldVerifySignatures, nil, nil, metadata.transaction(int(idx)), results.transaction(int(idx)))
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -5312,7 +5326,9 @@ func processBlockWithResults(
 	exec.results = results
 	defer exec.close()
 	exec.setReplayStage("parameter_arena")
-	resetSerializedParameterArena()
+	if !block.PrivateReplay {
+		resetSerializedParameterArena()
+	}
 	exec.setReplayStage("prepare_dependency_planner")
 
 	plannerPreparationStart := time.Now()
@@ -5402,4 +5418,14 @@ func recordFullToReplayed(block *b.Block) time.Time {
 	metrics.GlobalBlockReplay.FullToReplayed.AddTiming(fullToReplayed)
 	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
 	return now
+}
+
+// borrowedAccountArena is worker's arena for executing block's transactions.
+// The arenas belong to the node's own replay workers, so a private replay,
+// whose workers run at the same time, takes none and allocates on the heap.
+func borrowedAccountArena(block *b.Block, worker int) *arena.Arena[sealevel.BorrowedAccount] {
+	if (block != nil && block.PrivateReplay) || worker < 0 || worker >= len(sealevel.BorrowedAccountArenas) {
+		return nil
+	}
+	return sealevel.BorrowedAccountArenas[worker]
 }

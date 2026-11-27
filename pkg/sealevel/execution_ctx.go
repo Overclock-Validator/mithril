@@ -147,11 +147,14 @@ type SlotCtx struct {
 	// Ordered replay acceptance publishes them together; discarded banks cannot
 	// affect global execution state or another bank at the same slot.
 	DeferVoteCachePublication bool
-	PendingVoteCacheMu        sync.Mutex
-	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
-	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
-	PendingStakePubkeys       map[solana.PublicKey]struct{}
-	VoteStakeDirty            bool
+	// PrivateReplay marks a bank replayed on the side from an earlier
+	// checkpoint (see block.Block.PrivateReplay): it publishes nothing.
+	PrivateReplay           bool
+	PendingVoteCacheMu      sync.Mutex
+	PendingVoteCache        map[solana.PublicKey]*VoteStateVersions
+	PendingVoteCacheDeletes map[solana.PublicKey]struct{}
+	PendingStakePubkeys     map[solana.PublicKey]struct{}
+	VoteStakeDirty          bool
 	// TrackProgramCacheAdds records every program-cache insertion made while
 	// executing this bank so a discarded bank can evict them again (eviction
 	// only forces a reload from account data, so it is always safe).

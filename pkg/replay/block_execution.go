@@ -11,7 +11,6 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
-	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/bankhash"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
@@ -119,7 +118,7 @@ func newBlockExecution(
 	// Block accounts/sysvars load through the unrooted tail (overlay→durable)
 	// so execution sees confirmed-but-unrooted state.
 	exec.blockSrc = tail
-	if block != nil {
+	if block != nil && !block.PrivateReplay {
 		clearWorkAheadRan(block.Slot) // this attempt's early executions set it again
 	}
 
@@ -156,6 +155,10 @@ func newBlockExecution(
 			now := time.Now()
 			stageTimes[stageName] += now.Sub(stageStart)
 			stageStart = now
+		}
+		if block.PrivateReplay {
+			clear(stageTimes)
+			return
 		}
 		if metrics.GlobalBlockReplay.ReplayStages == nil {
 			metrics.GlobalBlockReplay.ReplayStages = make(map[string]metrics.Timing, len(stageTimes))
@@ -274,7 +277,9 @@ func (exec *blockExecution) open() error {
 	defer exec.captureAccountLoader()()
 	block := exec.block
 	exec.setReplayStage("parameter_arena")
-	resetSerializedParameterArena()
+	if !block.PrivateReplay {
+		resetSerializedParameterArena()
+	}
 
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
@@ -427,6 +432,9 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 // Only the replay goroutine may enter this scope; loader workers are joined
 // before it exits. Discarded streams never publish their retained totals.
 func (exec *blockExecution) captureAccountLoader() func() {
+	if exec.block != nil && exec.block.PrivateReplay {
+		return func() {}
+	}
 	previous := metrics.GlobalBlockReplay.AccountLoader
 	metrics.GlobalBlockReplay.AccountLoader = metrics.AccountLoader{}
 	return func() {
@@ -558,10 +566,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		if !execute[idx] {
 			return
 		}
-		var workerArena *arena.Arena[sealevel.BorrowedAccount]
-		if workerIdx < len(sealevel.BorrowedAccountArenas) {
-			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
-		}
+		workerArena := borrowedAccountArena(exec.block, workerIdx)
 		executed, release := workAhead.claim(idx)
 		if metadata.transaction(idx) != nil {
 			executed = nil // a captured transaction executes here, not early
@@ -662,7 +667,10 @@ func unprocessableTransactionError(index int, err error) error {
 // it writes the block's timing row. A bank whose tail fails is abandoned, so
 // its measurement is joined here, before the caller discards the bank.
 func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
-	chain := blockLongestChain.start(exec.slotCtx, exec.executedTransactions(), exec.computeUnits)
+	var chain *longestChainPass
+	if !exec.block.PrivateReplay {
+		chain = blockLongestChain.start(exec.slotCtx, exec.executedTransactions(), exec.computeUnits)
+	}
 	slotCtx, err := exec.finalizeTail()
 	if err != nil {
 		blockLongestChain.abandon(chain)
@@ -719,7 +727,7 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	var voteVersions votePublicationVersions
 	if alpenglowClock {
 		footerClockStart := time.Now()
-		if err := applyAlpenglowFooterClock(slotCtx, block, bankEpochSchedule); err != nil {
+		if err := applyAlpenglowFooterClockWithCache(slotCtx, block, bankEpochSchedule, !block.PrivateReplay); err != nil {
 			metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
 			return nil, fmt.Errorf("apply alpenglow footer clock at slot %d: %w", block.Slot, err)
 		}
@@ -770,17 +778,21 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	}
 	// The replay of a slot the footer shutoff refused: the verdict compares
 	// the hashes itself, which matters when the clock mode above did not.
-	if err := workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil); err != nil {
-		writeFooterBankhashMismatchArtifact(err, block, slotCtx, writableAccts, modifiedAccts)
-		return nil, err
-	}
-	// Early executions are only ever accepted in a block whose computed bank
-	// hash was just compared with its footer's (work_ahead_guard.go).
-	if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
-		return nil, err
-	}
-	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
-		return nil, err
+	// A private replay runs no early executions and answers to its caller,
+	// which holds the bank hash the node computed for this slot.
+	if !block.PrivateReplay {
+		if err := workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil); err != nil {
+			writeFooterBankhashMismatchArtifact(err, block, slotCtx, writableAccts, modifiedAccts)
+			return nil, err
+		}
+		// Early executions are only ever accepted in a block whose computed bank
+		// hash was just compared with its footer's (work_ahead_guard.go).
+		if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
+			return nil, err
+		}
+		if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
+			return nil, err
+		}
 	}
 
 	// Bankhash consensus enforcement is handled in the replay loop (not here)
@@ -807,7 +819,9 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 		return nil, fmt.Errorf("commit transaction statuses for slot %d after bank state commit: %w", block.Slot, statusErr)
 	}
 
-	global.IncrTransactionCount(executionPlan.processedTxCount)
+	if !block.PrivateReplay {
+		global.IncrTransactionCount(executionPlan.processedTxCount)
+	}
 	setReplayStage("done")
 	if exec.metadata != nil || exec.results != nil {
 		exec.sigverifyWg.Wait()
