@@ -154,3 +154,84 @@ func TestCompactedFoldsRecordExactHistory(t *testing.T) {
 		require.True(t, history.Same(HistoryVersion(accts[0]), HistoryVersion(truth[last][k])), "durable %s", k)
 	}
 }
+
+// After the store rewinds to an earlier fold, the next folds re-record those
+// slots: history drops the overlap and matches the new chain.
+func TestHistoryFollowsRewind(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	k := solana.PublicKey{7}
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: 100, Delta: []*accounts.Account{{Key: k, Lamports: 1}}}}, 100, nil, nil)
+	require.NoError(t, err)
+	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	db.SetHistory(hs)
+	fold := func(slot, lamports uint64) {
+		_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: []*accounts.Account{{Key: k, Lamports: lamports}}}}, slot, nil, nil)
+		require.NoError(t, err)
+	}
+	fold(110, 2)
+	fold(120, 3)
+	fold(130, 4)
+	_, err = db.RewindToBatchBoundary(110)
+	require.NoError(t, err)
+	fold(125, 30) // a different chain after 110
+	_, through, ok := hs.Range()
+	require.True(t, ok)
+	require.EqualValues(t, 125, through)
+	for _, tc := range []struct{ slot, want uint64 }{{105, 1}, {110, 2}, {124, 2}, {125, 30}} {
+		v, _, err := hs.AccountAt([32]byte(k), tc.slot)
+		require.NoError(t, err, "slot %d", tc.slot)
+		require.EqualValues(t, tc.want, v.Lamports, "slot %d", tc.slot)
+	}
+	require.EqualValues(t, 1, db.HistoryStats().Truncations)
+}
+
+// Reads run while folds append history (run with -race).
+func TestHistoryReadsDuringFolds(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	hs, err := history.Open(t.TempDir(), history.Options{SegmentChunks: 3})
+	require.NoError(t, err)
+	db.SetHistory(hs)
+	keys := []solana.PublicKey{{1}, {2}, {3}}
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 1, Delta: []*accounts.Account{{Key: keys[0], Lamports: 1}}}}, 1, nil, nil)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		defer close(readErr)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			first, last, ok := hs.Range()
+			if !ok {
+				continue
+			}
+			for s := first; s <= last; s++ {
+				for _, k := range keys {
+					v, _, err := hs.AccountAt([32]byte(k), s)
+					if err != nil && !errors.Is(err, history.ErrUnchanged) && !errors.Is(err, history.ErrBeforeHistory) && !errors.Is(err, history.ErrAfterHistory) {
+						readErr <- err
+						return
+					}
+					if err == nil && !v.Absent && v.Lamports != s && v.Lamports > s {
+						readErr <- errors.New("read a version from the future")
+						return
+					}
+				}
+			}
+		}
+	}()
+	for slot := uint64(2); slot < 200; slot++ {
+		var delta []*accounts.Account
+		for _, k := range keys {
+			delta = append(delta, &accounts.Account{Key: k, Lamports: slot})
+		}
+		_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: delta}}, slot, nil, nil)
+		require.NoError(t, err)
+	}
+	close(done)
+	require.NoError(t, <-readErr)
+}
