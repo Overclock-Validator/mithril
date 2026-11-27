@@ -2384,7 +2384,7 @@ func ReplayBlocks(
 	var unrootedTailState *unrootedTail
 	var promoter *asyncPromoter
 	var applyFoldOutcome func(res *foldResult) // assigned below, used by the exit drain
-	unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
+	unrootedTailState = newUnrootedTail(acctsDb, acctsDb, tailHaltCap(FoldBatchSlots), FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
 	trackedStakeTotals = unrootedTailState.durableStakeTotals
 	defer func() { trackedStakeTotals = nil }()
 	if bankViews != nil {
@@ -2447,7 +2447,7 @@ func ReplayBlocks(
 		}
 		promoter.stop()
 	}()
-	mlog.Log.Infof("rooted-durable: fold targets %d slots / %d MiB; retained-state budget %d MiB / %d slots", FoldBatchSlots, FoldMaxBytes>>20, WorkingSetMaxBytes>>20, unrootedTailHaltCap)
+	mlog.Log.Infof("rooted-durable: fold targets %d slots / %d MiB; retained-state budget %d MiB / %d slots", FoldBatchSlots, FoldMaxBytes>>20, WorkingSetMaxBytes>>20, tailHaltCap(FoldBatchSlots))
 	// Any stake-index entries still pending from a previous in-process replay
 	// attempt (rooted-checkpoint re-replay after a fork switch or finality
 	// mismatch) belong to slots this run re-executes — or to a discarded wrong
@@ -2674,6 +2674,9 @@ func ReplayBlocks(
 			// block-identity gate.
 			bankViews.MarkFinalized(promoteThrough)
 		}
+		// Older versions inside that prefix can never be unwound, so they can
+		// be held as differences until the fold (off the replay goroutine).
+		compactWorkingSet(unrootedTailState.overlay, promoteThrough)
 		if rpcIndex != nil {
 			rpcIndex.Finalized(promoteThrough)
 		}

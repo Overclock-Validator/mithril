@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/history"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -25,6 +26,15 @@ type WorkingSet struct {
 	// key had at an already held slot. Readers outside the lock use it as a
 	// seqlock to detect that a fork switch replaced slots they may have read.
 	generation atomic.Uint64
+
+	// Compaction: once a key has two finalized versions, the older one is kept
+	// as the XOR difference from the next newer version instead of a full
+	// copy. Values are unchanged (readers rebuild them), so revision and
+	// generation do not move. compactedThrough is the highest slot compacted;
+	// lastFinal maps each key to the newest compacted-range layer holding it
+	// in full.
+	compactedThrough uint64
+	lastFinal        map[[32]byte]uint64
 }
 
 type flatEntry struct {
@@ -35,6 +45,7 @@ type flatEntry struct {
 type slotLayer struct {
 	slot          uint64
 	writes        map[[32]byte]*Account
+	compacted     map[[32]byte]compactedVersion // versions kept as differences; disjoint from writes
 	retainedBytes uint64
 	// undo records, one per FIRST write of a key in this slot: what the flat
 	// entry pointed at before this slot overwrote it. Applying a suffix's
@@ -50,6 +61,23 @@ const workingSetVersionOverhead = 512
 // RetainedAccountBytes estimates the cost of one immutable working-set version.
 func RetainedAccountBytes(a *Account) uint64 {
 	return uint64(cap(a.Data)) + workingSetVersionOverhead
+}
+
+// compactedVersion is an account version stored as the XOR difference that
+// turns the next newer held version of the same key back into it.
+type compactedVersion struct {
+	diff []byte
+	slot uint64 // the account's Slot field
+}
+
+// compactedVersionOverhead budgets the map entry and slice header of one
+// compacted version.
+const compactedVersionOverhead = 128
+
+func compactedBytes(c compactedVersion) uint64 { return uint64(cap(c.diff)) + compactedVersionOverhead }
+
+func historyVersion(a *Account) *history.Version {
+	return &history.Version{Lamports: a.Lamports, Owner: a.Owner, Executable: a.Executable, RentEpoch: a.RentEpoch, Data: a.Data}
 }
 
 type undoPtr struct {
@@ -163,11 +191,83 @@ func (w *WorkingSet) LookupAt(pubkey [32]byte, maxSlot uint64) (*Account, bool) 
 		if slot > maxSlot {
 			continue
 		}
-		if a, ok := w.bySlot[slot].writes[pubkey]; ok {
+		layer := w.bySlot[slot]
+		if a, ok := layer.writes[pubkey]; ok {
 			return a, true
+		}
+		if _, ok := layer.compacted[pubkey]; ok {
+			return w.rebuildLocked(i, pubkey), true
 		}
 	}
 	return nil, false
+}
+
+// rebuildLocked returns the version of key held compacted in the layer at
+// order[i], by applying differences backward from the next full version.
+func (w *WorkingSet) rebuildLocked(i int, key [32]byte) *Account {
+	var chain []compactedVersion
+	var base *Account
+	for j := i; j < len(w.order) && base == nil; j++ {
+		layer := w.bySlot[w.order[j]]
+		if a, ok := layer.writes[key]; ok {
+			base = a
+		} else if c, ok := layer.compacted[key]; ok {
+			chain = append(chain, c)
+		}
+	}
+	if base == nil {
+		panic("working set: compacted version without a newer full version")
+	}
+	v := historyVersion(base).Clone()
+	for k := len(chain) - 1; k >= 0; k-- {
+		if err := history.ApplyXor(v, chain[k].diff, false); err != nil {
+			panic("working set: corrupt compacted version: " + err.Error())
+		}
+	}
+	return &Account{Key: solana.PublicKey(key), Lamports: v.Lamports, Data: v.Data, Owner: v.Owner, Executable: v.Executable, RentEpoch: v.RentEpoch, Slot: chain[0].slot}
+}
+
+// layerVersionsLocked returns every version held in the layers order[lo:hi],
+// rebuilding compacted ones in a single newest-to-oldest pass per key.
+func (w *WorkingSet) layerVersionsLocked(lo, hi int) [][]*Account {
+	out := make([][]*Account, hi-lo)
+	need := make(map[[32]byte]bool)
+	for i := lo; i < hi; i++ {
+		layer := w.bySlot[w.order[i]]
+		out[i-lo] = make([]*Account, 0, len(layer.writes)+len(layer.compacted))
+		for _, a := range layer.writes {
+			out[i-lo] = append(out[i-lo], a)
+		}
+		for k := range layer.compacted {
+			need[k] = true
+		}
+	}
+	if len(need) == 0 {
+		return out
+	}
+	cur := make(map[[32]byte]*history.Version, len(need))
+	for i := len(w.order) - 1; i >= lo; i-- {
+		layer := w.bySlot[w.order[i]]
+		for k := range need {
+			if a, ok := layer.writes[k]; ok {
+				cur[k] = historyVersion(a)
+				continue
+			}
+			c, ok := layer.compacted[k]
+			if !ok {
+				continue
+			}
+			v := cur[k].Clone()
+			if err := history.ApplyXor(v, c.diff, false); err != nil {
+				panic("working set: corrupt compacted version: " + err.Error())
+			}
+			cur[k] = v
+			if i < hi {
+				out[i-lo] = append(out[i-lo], &Account{Key: solana.PublicKey(k), Lamports: v.Lamports, Data: v.Data, Owner: v.Owner, Executable: v.Executable, RentEpoch: v.RentEpoch, Slot: c.slot})
+			}
+		}
+	}
+	return out
 }
 
 // Generation returns the eviction seqlock counter (odd while an eviction is
@@ -182,9 +282,9 @@ func (w *WorkingSet) Generation() uint64 {
 func (w *WorkingSet) RangeVersions(fn func(slot uint64, a *Account)) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	for _, slot := range w.order {
-		for _, a := range w.bySlot[slot].writes {
-			fn(slot, a)
+	for i, versions := range w.layerVersionsLocked(0, len(w.order)) {
+		for _, a := range versions {
+			fn(w.order[i], a)
 		}
 	}
 }
@@ -259,13 +359,8 @@ func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, maxBytes
 		return nil
 	}
 	batch := make([]SlotDelta, count)
-	for i, slot := range w.order[:count] {
-		layer := w.bySlot[slot]
-		delta := make([]*Account, 0, len(layer.writes))
-		for _, a := range layer.writes {
-			delta = append(delta, a)
-		}
-		batch[i] = SlotDelta{Slot: slot, Delta: delta}
+	for i, versions := range w.layerVersionsLocked(0, count) {
+		batch[i] = SlotDelta{Slot: w.order[i], Delta: versions}
 	}
 	return batch
 }
@@ -296,6 +391,11 @@ func (w *WorkingSet) PromotePrefix(through uint64) {
 		delete(w.bySlot, slot)
 	}
 	w.order = kept
+	for k, s := range w.lastFinal {
+		if s <= through {
+			delete(w.lastFinal, k)
+		}
+	}
 	// Undo records pointing into the promoted prefix now dangle; surviving
 	// layers' undos are rewritten to "restore = fall through to durable",
 	// which is exactly right: the promoted value IS the durable value.
@@ -332,6 +432,11 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 	w.revision++
 	w.generation.Add(1) // odd: the suffix is being rewritten
 	defer w.generation.Add(1)
+	if slot <= w.compactedThrough {
+		// Compaction covers only finalized slots, so this is unexpected: keep
+		// it correct by restoring every compacted version in full first.
+		w.expandLocked()
+	}
 
 	// Apply undos newest layer first: for keys written in several evicted
 	// layers, the OLDEST layer's undo applies last and wins — restoring the
@@ -360,6 +465,126 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 	w.order = w.order[:cut]
 }
 
+// expandLocked turns every compacted version back into a full one.
+func (w *WorkingSet) expandLocked() {
+	versions := w.layerVersionsLocked(0, len(w.order))
+	for i, slot := range w.order {
+		layer := w.bySlot[slot]
+		if len(layer.compacted) == 0 {
+			continue
+		}
+		for _, a := range versions[i] {
+			k := [32]byte(a.Key)
+			c, ok := layer.compacted[k]
+			if !ok {
+				continue
+			}
+			layer.writes[k] = a
+			cost := RetainedAccountBytes(a)
+			old := compactedBytes(c)
+			layer.retainedBytes += cost - old
+			w.retainedBytes += cost - old
+		}
+		layer.compacted = nil
+	}
+	w.compactedThrough = 0
+	w.lastFinal = nil
+}
+
+// CompactThrough keeps older versions of finalized slots (<= through) as
+// differences from the next newer finalized version. Finalized slots are never
+// evicted, so differences never point into a suffix a fork switch removes.
+// Differences are computed under the read lock; the swap takes the write lock
+// briefly. It returns the number of versions compacted.
+func (w *WorkingSet) CompactThrough(through uint64) int {
+	type swap struct {
+		slot uint64
+		key  [32]byte
+		full *Account
+		c    compactedVersion
+	}
+	w.mu.RLock()
+	from := w.compactedThrough
+	gen := w.generation.Load()
+	if through <= from || gen&1 == 1 {
+		w.mu.RUnlock()
+		return 0
+	}
+	last := make(map[[32]byte]uint64)
+	lookupLast := func(k [32]byte) (uint64, bool) {
+		if s, ok := last[k]; ok {
+			return s, true
+		}
+		s, ok := w.lastFinal[k]
+		return s, ok
+	}
+	var swaps []swap
+	for _, slot := range w.order {
+		if slot <= from {
+			continue
+		}
+		if slot > through {
+			break
+		}
+		layer := w.bySlot[slot]
+		for k, cur := range layer.writes {
+			if cur.IsDummy {
+				continue
+			}
+			if p, ok := lookupLast(k); ok {
+				if prevLayer := w.bySlot[p]; prevLayer != nil {
+					if full, ok := prevLayer.writes[k]; ok && !full.IsDummy {
+						d := history.AppendXor(nil, historyVersion(full), historyVersion(cur))
+						swaps = append(swaps, swap{slot: p, key: k, full: full, c: compactedVersion{diff: d, slot: full.Slot}})
+					}
+				}
+			}
+			last[k] = slot
+		}
+	}
+	w.mu.RUnlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.compactedThrough != from || w.generation.Load() != gen {
+		return 0 // a fork switch or another compaction ran; try again later
+	}
+	done := 0
+	for _, sw := range swaps {
+		layer := w.bySlot[sw.slot]
+		if layer == nil || layer.writes[sw.key] != sw.full {
+			continue // promoted meanwhile
+		}
+		delete(layer.writes, sw.key)
+		if layer.compacted == nil {
+			layer.compacted = make(map[[32]byte]compactedVersion)
+		}
+		layer.compacted[sw.key] = sw.c
+		freed := RetainedAccountBytes(sw.full)
+		added := compactedBytes(sw.c)
+		layer.retainedBytes = layer.retainedBytes - freed + added
+		w.retainedBytes = w.retainedBytes - freed + added
+		done++
+	}
+	if w.lastFinal == nil {
+		w.lastFinal = make(map[[32]byte]uint64, len(last))
+	}
+	for k, s := range last {
+		if _, held := w.bySlot[s]; held {
+			w.lastFinal[k] = s
+		}
+	}
+	w.compactedThrough = through
+	return done
+}
+
+// CompactedThrough returns the highest slot compaction has covered.
+func (w *WorkingSet) CompactedThrough() uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.compactedThrough
+}
+
 // CheckInvariants verifies flat ≡ fold(bySlot in order) — test hook (I6).
 func (w *WorkingSet) CheckInvariants() error {
 	w.mu.RLock()
@@ -372,6 +597,13 @@ func (w *WorkingSet) CheckInvariants() error {
 		for key, acct := range w.bySlot[slot].writes {
 			want[key] = flatEntry{slot: slot, acct: acct}
 			layerBytes += RetainedAccountBytes(acct)
+		}
+		for key, c := range w.bySlot[slot].compacted {
+			if _, both := w.bySlot[slot].writes[key]; both {
+				return errInvariant("version both full and compacted", key, slot)
+			}
+			delete(want, key) // a newer layer must hold it in full
+			layerBytes += compactedBytes(c)
 		}
 		if layerBytes != w.bySlot[slot].retainedBytes {
 			return errInvariant("slot retained bytes", w.bySlot[slot].retainedBytes, layerBytes)

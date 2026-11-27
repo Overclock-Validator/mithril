@@ -111,8 +111,15 @@ name = "mithril"
     # time as ONE union-deduped sequential segment with ONE fsync. Larger K =
     # fewer, larger writes (less NVMe wear: hot accounts written once per K
     # slots instead of once per slot) but more RAM for the unrooted tail and a
-    # longer bounded re-execution window after a hard crash. Range 32..512.
+    # longer bounded re-execution window after a hard crash. Range 32..2048;
+    # above 512, enable working_set_compaction so the unfolded tail stays small.
     fold_batch_slots = 128
+
+    # Keep superseded versions of finalized, not yet folded slots as XOR
+    # differences from the next newer version instead of full copies. Values
+    # are unchanged; the unfolded tail then holds about one full copy per
+    # account, which is what makes larger folds affordable in RAM.
+    # working_set_compaction = false
 
     # Fold sooner when retained account versions reach this byte target (MiB).
     # Slot versions are indivisible, so the final slot may overshoot the target.

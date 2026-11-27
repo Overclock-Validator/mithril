@@ -2441,11 +2441,12 @@ postBootstrap:
 	replay.TrailingVerifierCfg = vcfg
 
 	if foldBatch := config.GetInt("storage.fold_batch_slots"); foldBatch > 0 {
-		replay.FoldBatchSlots = min(max(foldBatch, 32), 512)
+		replay.FoldBatchSlots = min(max(foldBatch, 32), 2048)
 		if replay.FoldBatchSlots != foldBatch {
-			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..512)", foldBatch, replay.FoldBatchSlots)
+			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..2048)", foldBatch, replay.FoldBatchSlots)
 		}
 	}
+	replay.WorkingSetCompaction = config.GetBool("storage.working_set_compaction")
 
 	// [storage] rewind horizon + compaction. The horizon bounds how far back
 	// RewindToBatchBoundary can restore durable state AND pins the files the
@@ -2716,22 +2717,6 @@ postBootstrap:
 			retentionSlots := schedule.SlotsPerEpoch * 2
 			if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
 				klog.Fatalf("enable RPC block history: %v", err)
-			}
-		}
-		if rpcAccountHistory {
-			dir := rpcAccountHistoryDir
-			if dir == "" {
-				dir = filepath.Join(accountsPath, "rpc-account-history")
-			}
-			hs, err := history.Open(dir, history.Options{KeepSegments: rpcAccountHistorySegments})
-			if err != nil {
-				klog.Fatalf("open account history: %v", err)
-			}
-			accountsDb.SetHistory(hs)
-			if first, through, ok := hs.Range(); ok {
-				mlog.Log.Infof("account history: %s holds slots %d to %d", dir, first, through)
-			} else {
-				mlog.Log.Infof("account history: recording into %s from the next fold", dir)
 			}
 		}
 		publishRPCBankState(rpcServer, mithrilState)
@@ -4801,6 +4786,7 @@ func runReplayWithRecovery(
 		}
 	}()
 
+	openAccountHistory(accountsDb, accountsPath)
 	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	if consensusOpts == nil {
 		return result
@@ -5027,4 +5013,27 @@ func defaultVerifierConfigForBlockSource(source string, rpcFallback bool) replay
 		cfg.ValidatorFooterHash = true
 	}
 	return cfg
+}
+
+// openAccountHistory attaches the account history store when
+// rpc.account_history is set, before replay folds anything. It records in
+// backtests too, where the RPC server is off.
+func openAccountHistory(accountsDb *accountsdb.AccountsDb, accountsPath string) {
+	if !rpcAccountHistory || accountsDb == nil || accountsDb.History() != nil {
+		return
+	}
+	dir := rpcAccountHistoryDir
+	if dir == "" {
+		dir = filepath.Join(accountsPath, "rpc-account-history")
+	}
+	hs, err := history.Open(dir, history.Options{KeepSegments: rpcAccountHistorySegments})
+	if err != nil {
+		klog.Fatalf("open account history: %v", err)
+	}
+	accountsDb.SetHistory(hs)
+	if first, through, ok := hs.Range(); ok {
+		mlog.Log.Infof("account history: %s holds slots %d to %d", dir, first, through)
+	} else {
+		mlog.Log.Infof("account history: recording into %s from the next fold", dir)
+	}
 }

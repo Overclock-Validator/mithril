@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -26,6 +27,33 @@ import (
 // window reserves its known bank count in addition to this allowance; the
 // retained-byte budget remains enforced throughout.
 const unrootedTailHaltCap = 512
+
+// tailHaltCap is the held-slot allowance for a fold size: at least the
+// historical 512, and room for a full fold plus finality lag above that.
+func tailHaltCap(foldBatchSlots int) int {
+	return max(unrootedTailHaltCap, foldBatchSlots+foldBatchSlots/2)
+}
+
+// WorkingSetCompaction keeps superseded finalized versions in the unrooted
+// tail as XOR differences instead of full copies (storage.working_set_compaction).
+var WorkingSetCompaction bool
+
+var compactionRunning atomic.Bool
+
+// compactWorkingSet starts one background compaction through the gated
+// finalized prefix if none is running.
+func compactWorkingSet(ws *accounts.WorkingSet, through uint64) {
+	if !WorkingSetCompaction || ws == nil || through <= ws.CompactedThrough() {
+		return
+	}
+	if !compactionRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer compactionRunning.Store(false)
+		ws.CompactThrough(through)
+	}()
+}
 
 // batchCommitter durably folds a batch of rooted slots into the canonical
 // store as one sequential segment (union-deduped, one fsync, atomic index
