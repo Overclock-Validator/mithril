@@ -104,6 +104,7 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 		db.disableHistory(err)
 		return
 	}
+	benchHistorySample(keys.keys)
 	if err := s.AppendKeys(from, throughSlot, keys.keys); err != nil {
 		db.disableHistory(err)
 		return

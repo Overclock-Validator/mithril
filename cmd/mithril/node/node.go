@@ -4787,6 +4787,7 @@ func runReplayWithRecovery(
 	}()
 
 	openAccountHistory(accountsDb, accountsPath)
+	accountsDb.StartBenchHistoryQueries(ctx)
 	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	if consensusOpts == nil {
 		return result
