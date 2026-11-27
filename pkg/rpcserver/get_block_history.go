@@ -80,6 +80,11 @@ func (rpcServer *RpcServer) GetBlock(ctx context.Context, p jsonrpc.RawParams) (
 		if config.details != "full" {
 			return GetBlockResp{}, &InvalidParamsError{Message: "transaction history supports full and none transactionDetails"}
 		}
+		// Recorded blocks then hold only watched transactions, and must not
+		// be presented as whole blocks.
+		if rpcServer.historyWatched.Load() != 0 {
+			return GetBlockResp{}, &InvalidParamsError{Message: "getBlock transactionDetails: full is not supported because this node records only transactions naming a watched address; use transactionDetails none or getTransaction"}
+		}
 		if config.encoding != "json" && config.encoding != "base64" {
 			return GetBlockResp{}, &InvalidParamsError{Message: "transaction history supports json and base64 encoding"}
 		}

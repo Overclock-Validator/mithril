@@ -61,18 +61,18 @@ func TestTransactionHistoryNodeOwnership(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "accounts")
 	cfg := transactionHistoryConfig{Enabled: true, RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}
 	genesis := solana.Hash{1}
-	store, session, err := openNodeTransactionHistory(transactionHistoryConfig{}, "validator", 0, dir, "invalid")
+	store, session, err := openNodeTransactionHistory(transactionHistoryConfig{}, false, "validator", 0, dir, "invalid")
 	require.NoError(t, err)
 	require.Nil(t, store)
 	require.Nil(t, session)
-	_, _, err = openNodeTransactionHistory(cfg, "validator", 8899, dir, genesis.String())
+	_, _, err = openNodeTransactionHistory(cfg, false, "validator", 8899, dir, genesis.String())
 	require.Error(t, err)
-	_, _, err = openNodeTransactionHistory(cfg, "verifying", 8899, dir, "invalid")
+	_, _, err = openNodeTransactionHistory(cfg, false, "verifying", 8899, dir, "invalid")
 	require.Error(t, err)
 	_, err = os.Stat(dir)
 	require.ErrorIs(t, err, os.ErrNotExist, "disabled or rejected history must not create files")
 
-	store, session, err = openNodeTransactionHistory(cfg, "verifying", 8899, dir, genesis.String())
+	store, session, err = openNodeTransactionHistory(cfg, false, "verifying", 8899, dir, genesis.String())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		joined, err := session.Stop(context.Background())

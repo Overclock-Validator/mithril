@@ -40,6 +40,9 @@ type TransactionCoverage struct {
 	LastSlot     uint64 `json:"lastSlot"`
 	Blocks       uint64 `json:"blocks"`
 	LogicalBytes uint64 `json:"logicalBytes"`
+	// WatchedAddresses is nonzero when only transactions naming a watched
+	// address are recorded. A recorded block then holds a subset.
+	WatchedAddresses int64 `json:"watchedAddresses"`
 	// Recording is false once the recorder has stopped; StoppedReason says why.
 	Recording     bool   `json:"recording"`
 	StoppedReason string `json:"stoppedReason,omitempty"`
@@ -57,6 +60,12 @@ func (rpcServer *RpcServer) SetHistoryRecorderStatus(status func() (recording bo
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.historyRecorderStatus = status
 	rpcServer.slotCtxMu.Unlock()
+}
+
+// SetHistoryWatch records how many addresses limit transaction history; zero
+// means every transaction is recorded.
+func (rpcServer *RpcServer) SetHistoryWatch(addresses int) {
+	rpcServer.historyWatched.Store(int64(addresses))
 }
 
 func (rpcServer *RpcServer) GetHistoryCoverage(ctx context.Context, p jsonrpc.RawParams) (HistoryCoverageResp, error) {
@@ -86,7 +95,7 @@ func (rpcServer *RpcServer) GetHistoryCoverage(ctx context.Context, p jsonrpc.Ra
 	}
 	coverage := &TransactionCoverage{
 		FirstSlot: stats.FirstSlot, LastSlot: stats.LastSlot, Blocks: stats.Blocks, LogicalBytes: stats.LogicalBytes,
-		Recording: true, MissingSlots: []uint64{},
+		Recording: true, MissingSlots: []uint64{}, WatchedAddresses: rpcServer.historyWatched.Load(),
 	}
 	rpcServer.slotCtxMu.RLock()
 	status := rpcServer.historyRecorderStatus

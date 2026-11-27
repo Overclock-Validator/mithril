@@ -31,6 +31,15 @@ needs, so `serve = "wallet"` is enough for send and confirm, and `serve = "histo
 for `getTransaction`. The individual switches below still work and can add a
 feature to a lower level.
 
+`watch` (`--rpc-watch`) lists addresses. With it, history records only the
+transactions that name one of them, and every other transaction in a block is
+executed with no capture cost. `getTransaction` then answers for those
+transactions only, and `getBlock` serves `transactionDetails: "none"` but refuses
+`full`, because a recorded block holds a subset. Watched history lives in its own
+store, so switching between watched and whole-block recording starts a fresh one;
+changing the address list keeps the store, and earlier blocks keep what was
+recorded under the earlier list.
+
 `getHistoryCoverage` (no parameters) reports what the node holds: the retained
 block range, the recorded transaction range and size, whether the recorder is
 still running and why not, and which rooted blocks in that range have no recorded

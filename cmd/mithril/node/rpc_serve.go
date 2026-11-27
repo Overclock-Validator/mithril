@@ -93,7 +93,7 @@ func resolveRPCServe(name string, blockHistory, signatureStatuses, transactionHi
 }
 
 // summary is the one startup line stating what the node serves.
-func (plan rpcServePlan) summary(history transactionHistoryConfig) string {
+func (plan rpcServePlan) summary(history transactionHistoryConfig, watched int) string {
 	if plan.Level == rpcServeNone {
 		return "RPC: not serving"
 	}
@@ -107,6 +107,9 @@ func (plan rpcServePlan) summary(history transactionHistoryConfig) string {
 	if plan.TransactionHistory {
 		parts = append(parts, fmt.Sprintf("transaction history %d slots, budget %d MiB, free reserve %d MiB",
 			history.RetentionSlots, history.MaxMiB, history.ReserveMiB))
+		if watched > 0 {
+			parts = append(parts, fmt.Sprintf("only transactions naming %d watched address(es)", watched))
+		}
 	}
 	if plan.SignatureStatuses || plan.TransactionHistory {
 		parts = append(parts, "HTTP only")

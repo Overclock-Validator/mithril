@@ -95,6 +95,7 @@ type RpcServer struct {
 	voteRecords                 rootedVoteRecordCache
 	transactionHistory          *transactionhistory.Store
 	historyRecorderStatus       func() (bool, string)
+	historyWatched              atomic.Int64
 	transactionHistoryReads     chan struct{}
 	transactionHistoryResponses chan struct{}
 	queryResponses              chan struct{}

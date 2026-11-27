@@ -23,8 +23,18 @@ type TransactionHistorySession struct {
 	pending *transactionHistoryWrite
 	stopped bool
 	err     error
+	// watch limits capture to transactions naming a watched address.
+	watch *TransactionWatchSet
 	// stoppedReason mirrors err for readers outside the replay goroutine.
 	stoppedReason atomic.Pointer[string]
+}
+
+// SetWatch limits recording to transactions that name a watched address. Call
+// it before replay starts; a nil set records every transaction.
+func (w *TransactionHistorySession) SetWatch(watch *TransactionWatchSet) {
+	if w != nil {
+		w.watch = watch
+	}
 }
 
 // Status reports whether the session is still recording and, if not, why.
@@ -83,7 +93,7 @@ func (w *TransactionHistorySession) begin() *blockMetadataCapture {
 		return nil
 	}
 	statsd.Count(statsd.TransactionHistoryCaptures, 1, []string{"started"})
-	w.current = &blockMetadataCapture{}
+	w.current = &blockMetadataCapture{watch: w.watch}
 	return w.current
 }
 

@@ -1,6 +1,7 @@
 package rpcserver
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
@@ -59,4 +60,17 @@ func TestGetHistoryCoverage(t *testing.T) {
 
 	_, err = server.GetHistoryCoverage(t.Context(), jsonrpc.RawParams(`[1]`))
 	require.Error(t, err)
+
+	// With a watch set, recorded blocks hold a subset: coverage says so, and
+	// getBlock will not present one as a whole block.
+	_, err = server.GetBlock(t.Context(), jsonrpc.RawParams(`[20]`))
+	require.NotContains(t, fmt.Sprint(err), "watched address")
+	server.SetHistoryWatch(2)
+	got, err = server.GetHistoryCoverage(t.Context(), jsonrpc.RawParams(nil))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), got.Transactions.WatchedAddresses)
+	_, err = server.GetBlock(t.Context(), jsonrpc.RawParams(`[20]`))
+	require.ErrorContains(t, err, "watched address")
+	_, err = server.GetBlock(t.Context(), jsonrpc.RawParams(`[20, {"transactionDetails": "none"}]`))
+	require.NotContains(t, fmt.Sprint(err), "watched address", "block summaries are still served")
 }

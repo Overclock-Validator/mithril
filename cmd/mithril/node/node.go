@@ -157,6 +157,8 @@ var (
 	rpcSignatureStatuses  bool
 	rpcBlockHistory       bool
 	rpcServeName          string
+	rpcWatchAddresses     []string
+	rpcWatch              *replay.TransactionWatchSet
 	rpcServe              rpcServePlan
 
 	// Lightbringer sidecar config
@@ -555,6 +557,7 @@ func init() {
 	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
 	Run.Flags().BoolVar(&rpcTransactionHistory.Enabled, "rpc-transaction-history", false, "Retain full transaction history on an Alpenglow verifying node; RPC becomes HTTP-only")
 	Run.Flags().StringVar(&rpcServeName, "rpc-serve", "", "What the RPC answers: none, accounts (default with an RPC port), blocks, wallet (adds signature outcomes) or history (adds full transaction history). Each level includes the ones before it")
+	Run.Flags().StringSliceVar(&rpcWatchAddresses, "rpc-watch", nil, "Record transaction history only for transactions naming one of these addresses; without it every transaction is recorded")
 	Run.Flags().BoolVar(&rpcBlockHistory, "rpc-block-history", false, "Retain two epochs of rooted block summaries for getBlock, getBlocks and getFirstAvailableBlock; implied by transaction history and signature statuses")
 	Run.Flags().BoolVar(&rpcSignatureStatuses, "rpc-signature-statuses", false, "Serve bounded recent signature outcomes on an Alpenglow verifying node; RPC becomes HTTP-only")
 	Run.Flags().Int64Var(&rpcTransactionHistory.RetentionSlots, "rpc-transaction-history-slots", 16384, "Maximum transaction history age in slots")
@@ -961,6 +964,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	if err := rpcTransactionHistory.validate(consensusMode, rpcPort); err != nil {
 		return err
+	}
+	rpcWatchAddresses = getStringSlice("rpc-watch", "rpc.watch")
+	var watchErr error
+	if rpcWatch, watchErr = replay.NewTransactionWatchSet(rpcWatchAddresses); watchErr != nil {
+		return fmt.Errorf("rpc.watch: %w", watchErr)
+	}
+	if rpcWatch != nil && !rpcServe.TransactionHistory {
+		return errors.New("rpc.watch selects what transaction history records; set rpc.serve to history")
 	}
 	resolvedTxParallelism := txParallelismForMode(consensusMode, txParallelism, txParallelismExplicit, runtime.NumCPU())
 	if resolvedTxParallelism != txParallelism {
@@ -2657,7 +2668,7 @@ postBootstrap:
 	if resultErr != nil {
 		klog.Fatalf("unable to initialize signature statuses: %v", resultErr)
 	}
-	historyStore, historySession, historyErr := openNodeTransactionHistory(rpcTransactionHistory,
+	historyStore, historySession, historyErr := openNodeTransactionHistory(rpcTransactionHistory, rpcWatch != nil,
 		consensusMode, rpcPort, accountsPath, networkGenesisHash)
 	if historyErr != nil {
 		klog.Fatalf("unable to open transaction history: %v", historyErr)
@@ -2673,7 +2684,9 @@ postBootstrap:
 		}
 		rpcServer.InitTransactionHistory(historyStore)
 		if historySession != nil {
+			historySession.SetWatch(rpcWatch)
 			rpcServer.SetHistoryRecorderStatus(historySession.Status)
+			rpcServer.SetHistoryWatch(rpcWatch.Len())
 		}
 		if err := rpcServer.InitTransactionResults(resultCache); err != nil {
 			klog.Fatalf("configure signature statuses: %v", err)
@@ -2700,7 +2713,7 @@ postBootstrap:
 			klog.Fatalf("start RPC server: %v", err)
 		}
 		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
-		mlog.Log.Infof("%s", rpcServe.summary(rpcTransactionHistory))
+		mlog.Log.Infof("%s", rpcServe.summary(rpcTransactionHistory, rpcWatch.Len()))
 	}
 
 	// The Alpenglow observer is forkchoice authority in both consensus modes.

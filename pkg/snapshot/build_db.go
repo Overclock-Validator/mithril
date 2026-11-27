@@ -67,6 +67,10 @@ func CleanAccountsDbDirs(accountsPaths []string) {
 		"transaction-status-checkpoints",
 		"rpc-epoch-rewards",
 		"rpc-block-history",
+		// Transaction history is selected through block history, so what a
+		// rebuild leaves behind could never be served again.
+		"rpc-transaction-history",
+		"rpc-watched-transaction-history",
 		"mithril_db",
 		"mithril_db_log_shards",
 		"bankhash_db",

@@ -66,7 +66,7 @@ func TestSignatureStatusesNodeShutdown(t *testing.T) {
 			require.False(t, joined)
 			require.Error(t, err)
 			store, writer, err := openNodeTransactionHistory(transactionHistoryConfig{Enabled: history,
-				RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}, "verifying", 8899, t.TempDir(), (solana.Hash{1}).String())
+				RetentionSlots: 16, MaxMiB: 80, ReserveMiB: 1}, false, "verifying", 8899, t.TempDir(), (solana.Hash{1}).String())
 			require.NoError(t, err)
 			server := rpcserver.NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32}, solana.Hash{1})
 			server.InitTransactionHistory(store)

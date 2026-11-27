@@ -18,6 +18,9 @@ type blockMetadata struct {
 	ParentBankhash    [32]byte
 	Bankhash          [32]byte
 	Transactions      []*transactionMetadata
+	// Watched is set when a watch set selected Transactions: they are then a
+	// subset of the block, in block order.
+	Watched bool
 }
 
 // blockMetadataCapture collects one candidate's bounded execution metadata.
@@ -27,11 +30,17 @@ type blockMetadataCapture struct {
 	Err     error
 	records []*transactionMetadata
 	budget  metadataBudget
+	// watch selects the transactions to capture; nil captures all. seen and
+	// expected count the block's transactions and the selected ones.
+	watch          *TransactionWatchSet
+	seen, expected int
 }
 
 type transactionMetadataGroup struct {
 	captures []transactionMetadataCapture
 	tokens   *transactionTokenGroup
+	// selected marks the captured transactions; nil means all.
+	selected []bool
 }
 
 func (capture *blockMetadataCapture) beginGroup(ctx *sealevel.SlotCtx, txs []*solana.Transaction, workers int) *transactionMetadataGroup {
@@ -42,16 +51,21 @@ func (capture *blockMetadataCapture) beginGroup(ctx *sealevel.SlotCtx, txs []*so
 		capture.fail(errMetadataBudget)
 		return nil
 	}
-	if err := metadataGroupCharge(txs, len(capture.records)); err != nil {
+	// Unselected transactions cost nothing below: no charge, no token
+	// hydration, and no capture slot handed to execution.
+	selected, captured := capture.watch.selection(txs)
+	if err := metadataGroupCharge(captured, len(capture.records)); err != nil {
 		capture.fail(err)
 		return nil
 	}
-	tokens, err := prepareTransactionTokenGroup(ctx, txs)
+	tokens, err := prepareTransactionTokenGroup(ctx, captured)
 	if err != nil {
 		capture.fail(err)
 		return nil
 	}
-	group := &transactionMetadataGroup{captures: make([]transactionMetadataCapture, len(txs)), tokens: tokens}
+	capture.seen += len(txs)
+	capture.expected += len(captured)
+	group := &transactionMetadataGroup{captures: make([]transactionMetadataCapture, len(txs)), tokens: tokens, selected: selected}
 	for i := range group.captures {
 		group.captures[i].budget = &capture.budget
 	}
@@ -59,7 +73,7 @@ func (capture *blockMetadataCapture) beginGroup(ctx *sealevel.SlotCtx, txs []*so
 }
 
 func (group *transactionMetadataGroup) transaction(index int) *transactionMetadataCapture {
-	if group == nil {
+	if group == nil || (group.selected != nil && !group.selected[index]) {
 		return nil
 	}
 	return &group.captures[index]
@@ -70,6 +84,9 @@ func (capture *blockMetadataCapture) finishGroup(group *transactionMetadataGroup
 		return
 	}
 	for i := range group.captures {
+		if group.selected != nil && !group.selected[i] {
+			continue
+		}
 		result := &group.captures[i]
 		if result.Err != nil {
 			capture.fail(fmt.Errorf("transaction %d metadata: %w", len(capture.records), result.Err))
@@ -95,7 +112,7 @@ func (capture *blockMetadataCapture) seal(block *b.Block, ctx *sealevel.SlotCtx)
 	if capture == nil || capture.Err != nil {
 		return
 	}
-	if len(capture.records) != len(block.Transactions) || len(ctx.FinalBankhash) != 32 {
+	if capture.seen != len(block.Transactions) || len(capture.records) != capture.expected || len(ctx.FinalBankhash) != 32 {
 		capture.fail(errors.New("block metadata is incomplete"))
 		return
 	}
@@ -105,6 +122,7 @@ func (capture *blockMetadataCapture) seal(block *b.Block, ctx *sealevel.SlotCtx)
 		Slot: block.Slot, ParentSlot: block.ParentSlot, Blockhash: block.Blockhash,
 		PreviousBlockhash: block.LastBlockhash,
 		ParentBankhash:    block.ParentBankhash, Bankhash: bankhash, Transactions: capture.records,
+		Watched: capture.watch != nil,
 	}
 	capture.records = nil
 }

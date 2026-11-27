@@ -53,10 +53,16 @@ func TestResolveRPCServe(t *testing.T) {
 
 func TestRPCServeSummary(t *testing.T) {
 	history := transactionHistoryConfig{RetentionSlots: 16384, MaxMiB: 1024, ReserveMiB: 2048}
-	require.Equal(t, "RPC: not serving", rpcServePlan{}.summary(history))
-	require.Equal(t, "RPC serves accounts", rpcServePlan{Level: rpcServeAccounts}.summary(history))
+	require.Equal(t, "RPC: not serving", rpcServePlan{}.summary(history, 0))
+	require.Equal(t, "RPC serves accounts", rpcServePlan{Level: rpcServeAccounts}.summary(history, 0))
 	full, err := resolveRPCServe("history", false, false, false, "verifying", 8899)
 	require.NoError(t, err)
 	require.Equal(t, "RPC serves history; block history 2 epochs; recent signature outcomes; "+
-		"transaction history 16384 slots, budget 1024 MiB, free reserve 2048 MiB; HTTP only", full.summary(history))
+		"transaction history 16384 slots, budget 1024 MiB, free reserve 2048 MiB; HTTP only", full.summary(history, 0))
+	require.Contains(t, full.summary(history, 3), "only transactions naming 3 watched address(es)")
+}
+
+func TestWatchedHistoryUsesItsOwnStore(t *testing.T) {
+	require.NotEqual(t, transactionHistoryDir(false), transactionHistoryDir(true),
+		"a watched subset must never be opened as whole-block history")
 }

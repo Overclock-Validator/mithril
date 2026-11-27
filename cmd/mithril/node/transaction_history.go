@@ -44,7 +44,7 @@ func (cfg transactionHistoryConfig) validate(mode string, port int) error {
 	return nil
 }
 
-func openNodeTransactionHistory(cfg transactionHistoryConfig, mode string, port int, accountsDir, genesisText string) (*transactionhistory.Store, *replay.TransactionHistorySession, error) {
+func openNodeTransactionHistory(cfg transactionHistoryConfig, watched bool, mode string, port int, accountsDir, genesisText string) (*transactionhistory.Store, *replay.TransactionHistorySession, error) {
 	if err := cfg.validate(mode, port); err != nil {
 		return nil, nil, err
 	}
@@ -55,7 +55,7 @@ func openNodeTransactionHistory(cfg transactionHistoryConfig, mode string, port 
 	if err != nil || accountsDir == "" || genesis == (solana.Hash{}) {
 		return nil, nil, errors.New("RPC transaction history requires an accounts directory and genesis hash")
 	}
-	store, err := transactionhistory.OpenWithRetention(filepath.Join(accountsDir, "rpc-transaction-history"),
+	store, err := transactionhistory.OpenWithRetention(filepath.Join(accountsDir, transactionHistoryDir(watched)),
 		genesis, transactionhistory.DefaultLimits(), transactionhistory.Retention{
 			Slots: uint64(cfg.RetentionSlots), MaxBytes: uint64(cfg.MaxMiB) << 20, MinFreeBytes: uint64(cfg.ReserveMiB) << 20,
 		})
@@ -67,6 +67,16 @@ func openNodeTransactionHistory(cfg transactionHistoryConfig, mode string, port 
 		return nil, nil, errors.Join(err, store.Close())
 	}
 	return store, session, nil
+}
+
+// transactionHistoryDir keeps whole-block history and watched-only history in
+// separate stores. A recorded block is then always one or the other, and a
+// node that changes mode can never serve a watched subset as a whole block.
+func transactionHistoryDir(watched bool) string {
+	if watched {
+		return "rpc-watched-transaction-history"
+	}
+	return "rpc-transaction-history"
 }
 
 // stopNodeOptionalRPC runs after replay returns. A timeout leaves the borrowed
