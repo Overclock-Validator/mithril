@@ -181,6 +181,15 @@ func benchReplayFoldRun(ctx context.Context, db *accountsdb.AccountsDb, persiste
 	}
 	replay.Preload(fold.Keys, loaded.accounts)
 	load = time.Since(loadStart)
+	var cone *coneFold
+	if hints && os.Getenv("MITHRIL_BENCH_CONE") == "1" {
+		cone = &coneFold{}
+		defer func() {
+			if replayed == len(fold.Bankhashes) {
+				benchConeReport(boundary, cone)
+			}
+		}()
+	}
 	for _, want := range fold.Bankhashes {
 		if err := ctx.Err(); err != nil {
 			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
@@ -202,6 +211,10 @@ func benchReplayFoldRun(ctx context.Context, db *accountsdb.AccountsDb, persiste
 			return replayed, wrong, load, elapsed, replay.HintedBlocks, replay.SkippedFailures, err
 		}
 		replayed++
+		if cone != nil {
+			// After the replay the block's address-table lookups are resolved.
+			cone.addBlock(block.Transactions, hintsFor(block))
+		}
 		if !bytes.Equal(slotCtx.FinalBankhash, want.Bankhash[:]) {
 			wrong++
 			if wrong <= 3 {
