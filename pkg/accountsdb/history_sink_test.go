@@ -111,11 +111,11 @@ func TestCompactedFoldsRecordExactHistory(t *testing.T) {
 				if rng.Intn(2) != 0 {
 					continue
 				}
-				a := &accounts.Account{Key: k, Lamports: uint64(rng.Intn(5)), Data: make([]byte, 40)}
+				a := &accounts.Account{Key: k, Lamports: uint64(rng.Intn(5)), Data: make([]byte, 600)}
 				if prev := live[k]; prev != nil {
 					copy(a.Data, prev.Data)
 				}
-				a.Data[rng.Intn(40)] = byte(rng.Intn(256))
+				a.Data[rng.Intn(600)] = byte(rng.Intn(256))
 				delta = append(delta, a)
 				live[k] = a
 			}
@@ -127,7 +127,7 @@ func TestCompactedFoldsRecordExactHistory(t *testing.T) {
 			truth[slot] = m
 			slot++
 		}
-		ws.CompactThrough(slot - 2) // everything but the newest slot is final
+		require.Positive(t, ws.CompactThrough(slot-2)+round, "compaction runs") // everything but the newest slot is final
 		chunk := ws.PromotionChunk(slot-3, 8, true)
 		through := chunk[len(chunk)-1].Slot
 		_, err := db.CommitBatch(chunk, through, nil, nil)

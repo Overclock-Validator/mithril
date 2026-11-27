@@ -70,6 +70,10 @@ type compactedVersion struct {
 	slot uint64 // the account's Slot field
 }
 
+// compactMinData is the smallest account data compacted; below it a full copy
+// costs little more than a difference.
+const compactMinData = 512
+
 // compactedVersionOverhead budgets the map entry and slice header of one
 // compacted version.
 const compactedVersionOverhead = 128
@@ -616,7 +620,8 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 			}
 			if p, ok := lookupLast(k); ok {
 				if prevLayer := w.bySlot[p]; prevLayer != nil {
-					if full, ok := prevLayer.writes[k]; ok && !full.IsDummy {
+					// Small accounts save too little to be worth a difference.
+					if full, ok := prevLayer.writes[k]; ok && !full.IsDummy && len(full.Data) >= compactMinData {
 						pairs = append(pairs, pair{slot: p, key: k, full: full, cur: cur})
 					}
 				}
@@ -629,9 +634,17 @@ func (w *WorkingSet) CompactThrough(through uint64) int {
 		return 0
 	}
 	// Account values are immutable once added, so this needs no lock.
+	// Differences share slabs: one allocation per 256 KiB instead of one per
+	// version, which keeps garbage collection work down.
 	swaps := make([]swap, len(pairs))
+	var slab []byte
 	for i, p := range pairs {
-		d := history.AppendXor(nil, historyVersion(p.full), historyVersion(p.cur))
+		if cap(slab)-len(slab) < len(p.cur.Data)+128 {
+			slab = make([]byte, 0, max(256<<10, len(p.cur.Data)+128))
+		}
+		start := len(slab)
+		slab = history.AppendXor(slab, historyVersion(p.full), historyVersion(p.cur))
+		d := slab[start:len(slab):len(slab)]
 		swaps[i] = swap{slot: p.slot, key: p.key, full: p.full, c: compactedVersion{diff: d, slot: p.full.Slot}}
 	}
 

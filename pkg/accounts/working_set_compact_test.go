@@ -40,7 +40,7 @@ func TestWorkingSetCompactionPreservesVersions(t *testing.T) {
 			}
 			a.Owner = prev.Owner
 		} else {
-			a.Data = make([]byte, 50+rng.Intn(200))
+			a.Data = make([]byte, 500+rng.Intn(400))
 			rng.Read(a.Data[:20])
 		}
 		return a
@@ -174,10 +174,10 @@ func sortDelta(d []*Account) {
 func TestWorkingSetCompactionFinalityAhead(t *testing.T) {
 	w := NewWorkingSet()
 	k := solana.PublicKey{1}
-	w.Add(10, []*Account{{Key: k, Lamports: 1, Data: make([]byte, 100)}})
+	w.Add(10, []*Account{{Key: k, Lamports: 1, Data: make([]byte, 600)}})
 	require.Equal(t, 0, w.CompactThrough(20)) // 11..20 not held yet
 	require.EqualValues(t, 10, w.CompactedThrough())
-	w.Add(11, []*Account{{Key: k, Lamports: 2, Data: make([]byte, 100)}})
+	w.Add(11, []*Account{{Key: k, Lamports: 2, Data: make([]byte, 600)}})
 	require.Equal(t, 1, w.CompactThrough(20))
 	require.EqualValues(t, 11, w.CompactedThrough())
 	a, ok := w.LookupAt([32]byte(k), 10)

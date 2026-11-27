@@ -142,6 +142,10 @@ func AppendXor(dst []byte, prev, cur *Version) []byte {
 	ranges := 0
 	last, i := 0, 0
 	for i < m {
+		// Skip equal regions fast: 64-byte compares use the SIMD memcmp.
+		for i+64 <= m && bytes.Equal(p[i:i+64], c[i:i+64]) {
+			i += 64
+		}
 		for i+8 <= m && binary.LittleEndian.Uint64(p[i:]) == binary.LittleEndian.Uint64(c[i:]) {
 			i += 8
 		}
