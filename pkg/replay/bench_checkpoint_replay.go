@@ -38,10 +38,11 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 		defer close(finished)
 		if path := os.Getenv("MITHRIL_BENCH_CHECKPOINT_REPLAY_PROFILE"); path != "" {
 			if file, err := os.Create(path); err == nil {
+				// Deferred calls run last first: stop the profile, then close.
+				defer file.Close()
 				if pprof.StartCPUProfile(file) == nil {
 					defer pprof.StopCPUProfile()
 				}
-				defer file.Close()
 			}
 		}
 		var folds, blocks, mismatches, failures int
