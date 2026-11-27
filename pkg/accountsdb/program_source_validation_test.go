@@ -112,7 +112,7 @@ func TestImmutableProgramSourceDoesNotRetainAccount(t *testing.T) {
 	entry := sourceWithOnlyWeakReference(t)
 	runtime.GC()
 	runtime.GC()
-	if entry.validatedSource.Load().start.Value() != nil {
+	if entry.validatedSource.Load().starts[0].Value() != nil {
 		t.Fatal("validation memo retained borrowed source")
 	}
 	runtime.KeepAlive(entry)

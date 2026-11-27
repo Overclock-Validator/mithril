@@ -20,9 +20,20 @@ type Program struct {
 	// `call imm` slot at pc (non-static-syscall versions), or -1.
 	CallTargets []int64
 
-	// callCheck remembers the last answer of unshadowedCallTargets.
-	callCheck atomic.Pointer[callCheck]
+	// callChecks remembers the last few answers of unshadowedCallTargets.
+	callChecks atomic.Pointer[callChecks]
 }
+
+// callChecks holds answers for several registries, newest first: banks with
+// separately built feature sets (the node's replay, a replay from a
+// checkpoint, a simulation) run the same cached program at once, and a single
+// remembered answer would make each rescan the program on every invocation.
+type callChecks struct {
+	checks [maxCallChecks]callCheck
+	count  int
+}
+
+const maxCallChecks = 4
 
 // callCheck is the result of checking a program's internal call targets
 // against one syscall registry, identified by (id, gen).
@@ -45,20 +56,35 @@ func (p *Program) unshadowedCallTargets(id any, gen uint64, registry SyscallRegi
 	if id == nil || registry == nil || len(p.CallTargets) == 0 || len(p.CallTargets) != len(p.Text) {
 		return nil
 	}
-	c := p.callCheck.Load()
-	if c == nil || c.gen != gen || c.id != id {
-		c = &callCheck{id: id, gen: gen, clean: true}
-		for pc, target := range p.CallTargets {
-			if target < 0 {
-				continue
-			}
-			if _, isSyscall := registry(p.Text[pc].Uimm()); isSyscall {
-				c.clean = false
-				break
+	known := p.callChecks.Load()
+	if known != nil {
+		for i := 0; i < known.count; i++ {
+			if c := &known.checks[i]; c.gen == gen && c.id == id {
+				if !c.clean {
+					return nil
+				}
+				return p.CallTargets
 			}
 		}
-		p.callCheck.Store(c)
 	}
+	c := callCheck{id: id, gen: gen, clean: true}
+	for pc, target := range p.CallTargets {
+		if target < 0 {
+			continue
+		}
+		if _, isSyscall := registry(p.Text[pc].Uimm()); isSyscall {
+			c.clean = false
+			break
+		}
+	}
+	// A lost race between two checkers drops one answer, which only costs
+	// that registry one more scan.
+	next := &callChecks{count: 1}
+	next.checks[0] = c
+	if known != nil {
+		next.count += copy(next.checks[1:], known.checks[:known.count])
+	}
+	p.callChecks.Store(next)
 	if !c.clean {
 		return nil
 	}

@@ -104,7 +104,7 @@ func TestLegacyCallsFollowRegistryIdentity(t *testing.T) {
 
 	// A table that does not cover the text exactly is never used.
 	p.CallTargets = p.CallTargets[:len(p.Text)-1]
-	p.callCheck.Store(nil)
+	p.callChecks.Store(nil)
 	if p.unshadowedCallTargets(id{3}, 0, clean) != nil {
 		t.Fatal("a call table shorter than the text was accepted")
 	}
