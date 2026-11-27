@@ -241,9 +241,10 @@ func TestTransactionTokenUnavailableAndNativeMint(t *testing.T) {
 	post := snapshot
 	post.Balances = append([]transactionTokenFact(nil), snapshot.Balances...)
 	post.Balances[0].Mint = solana.PublicKey{99}
-	_, _, err = group.resolve(snapshot, post)
-	require.ErrorContains(t, err, "unavailable", "unknown post-only mint must not trigger a live lookup")
-	require.Equal(t, uint8(9), group.mints[solana.WrappedSol].Decimals, "failed resolution leaves shadow unchanged")
+	_, unknown, err := group.resolve(snapshot, post)
+	require.NoError(t, err)
+	require.Empty(t, unknown, "an unknown post-only mint has no balance and triggers no live lookup")
+	require.Equal(t, uint8(9), group.mints[solana.WrappedSol].Decimals, "resolution leaves the known mint unchanged")
 	group.mints[solana.WrappedSol] = decodeTokenMint(tokenCaptureMint(solana.WrappedSol, solana.Token2022ProgramID, 9, 166))
 	pre, postBalances, err = group.resolve(snapshot, snapshot)
 	require.NoError(t, err)

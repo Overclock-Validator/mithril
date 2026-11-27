@@ -105,16 +105,15 @@ func TestBoundedInnerInstructionsFailedPushDoesNotChangeExecution(t *testing.T) 
 			require.Equal(t, uint64(1), ctx.StackHeight())
 			require.Zero(t, ctx.ComputeMeter.Used())
 			if bounded {
-				require.ErrorIs(t, ctx.InnerInstructionsCaptureError, InstrErrCallDepth)
-				require.Nil(t, ctx.InnerInstrs, "even the first failed push makes capture unavailable")
+				require.NoError(t, ctx.InnerInstructionsCaptureError)
+				require.Empty(t, ctx.InnerInstrs, "an invocation that never started is not listed")
+				require.Zero(t, ctx.innerInstructionBytes)
 			}
 		}
 		if bounded {
-			require.ErrorIs(t, ctx.InnerInstructionsCaptureError, InstrErrCallDepth)
-			require.Nil(t, ctx.InnerInstrs)
 			require.Equal(t, baseline, txCtx.Accounts)
-			ctx.recordInnerInstruction(nil, nil, 0)
-			require.Nil(t, ctx.InnerInstrs, "later recording cannot revive a failed capture")
+			require.True(t, ctx.recordInnerInstruction(nil, nil, 0), "a failed push leaves capture usable")
+			require.Len(t, ctx.InnerInstrs, 1)
 		} else {
 			require.Len(t, ctx.InnerInstrs, maxRecordedInnerInstructions+2)
 			require.NoError(t, ctx.InnerInstructionsCaptureError)
@@ -147,11 +146,11 @@ func TestBoundedInnerInstructionsExecutionFailureRemainsRecorded(t *testing.T) {
 		require.Equal(t, []RecordedInnerInstr{{StackHeight: 2, ProgramIdIndex: 0, Accounts: []uint8{}, Data: []byte{255}}}, ctx.InnerInstrs)
 		if bounded {
 			require.Equal(t, baseline, txCtx.Accounts)
-			// A later rejected push invalidates the earlier, otherwise valid CPI.
+			// A later rejected push leaves the earlier CPI recorded.
 			txCtx.InstructionTraceCapacity = txCtx.InstructionTraceLength()
 			require.ErrorIs(t, ctx.ProcessInstruction([]byte{255}, nil, []uint64{0}), InstrErrCallDepth)
-			require.ErrorIs(t, ctx.InnerInstructionsCaptureError, InstrErrCallDepth)
-			require.Nil(t, ctx.InnerInstrs)
+			require.NoError(t, ctx.InnerInstructionsCaptureError)
+			require.Equal(t, []RecordedInnerInstr{{StackHeight: 2, ProgramIdIndex: 0, Accounts: []uint8{}, Data: []byte{255}}}, ctx.InnerInstrs)
 		} else {
 			baseline = txCtx.Accounts
 		}

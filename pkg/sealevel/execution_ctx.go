@@ -331,16 +331,19 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	// Capture this invocation as an inner instruction when nested under
 	// an active top-level frame and recording is enabled. Stack height
 	// before Push reflects parent depth: 0 = top-level, >=1 = CPI.
+	recordedInner := false
 	if execCtx.RecordInnerInstructions && len(programIndices) > 0 && execCtx.StackHeight() >= 1 {
-		execCtx.recordInnerInstruction(instrData, instructionAccts, uint8(programIndices[0]))
+		recordedInner = execCtx.recordInnerInstruction(instrData, instructionAccts, uint8(programIndices[0]))
 	}
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = execCtx.Push()
 	if err != nil {
-		// Failed pushes have different trace-retention semantics across failure
-		// paths. Do not publish an attempted invocation as complete metadata.
-		execCtx.invalidateInnerInstructionCapture(err)
+		// A bounded capture lists only invocations that started. The
+		// unbounded simulation capture keeps its attempted entry.
+		if recordedInner && execCtx.boundedInnerInstructions {
+			execCtx.dropLastInnerInstruction()
+		}
 		return err
 	}
 	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionIxPush, start)

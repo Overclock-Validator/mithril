@@ -10,17 +10,23 @@ import (
 
 // These limits govern optional metadata availability, not valid block sizes.
 // Charges include conservative slice/map overhead, not allocator or process RSS.
+//
+// The per-key charge covers what a key can retain: the key and its two lamport
+// balances (48 bytes), a token balance before and after (about 110 bytes
+// each), and the token snapshots held until the group resolves. The block and
+// group ceilings are sized so a full mainnet block (several thousand
+// transactions, over 100,000 declared keys) stays inside them.
 const (
 	metadataRecordLimit      = 1 << 20
-	metadataBlockLimit       = 64 << 20
-	metadataGroupLimit       = 32 << 20
+	metadataBlockLimit       = 128 << 20
+	metadataGroupLimit       = 64 << 20
 	metadataTransactionLimit = 16_384
 	metadataGroupKeyLimit    = 131_072
-	metadataWorkerLimit      = 16
+	metadataWorkerLimit      = 128
 	metadataAccountDataLimit = 64 << 10
 	metadataHydrationLimit   = 16 << 20
 	metadataRecordBaseCharge = 8192
-	metadataRecordKeyCharge  = 1024
+	metadataRecordKeyCharge  = 512
 	metadataErrorTextLimit   = 256
 )
 

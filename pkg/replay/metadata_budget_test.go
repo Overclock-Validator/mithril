@@ -70,11 +70,11 @@ func TestMetadataBudgetGroupPreflight(t *testing.T) {
 	require.NoError(t, metadataGroupCharge(txs[:1], metadataTransactionLimit-1))
 	require.ErrorIs(t, metadataGroupCharge(txs[:2], metadataTransactionLimit-1), errMetadataBudget)
 
+	// The declared-key limit governs: its charge fits the group ceiling.
 	keys := make([]solana.PublicKey, metadataGroupKeyLimit+1)
-	exactKeys := (metadataGroupLimit - 128) / 384
-	require.Equal(t, metadataGroupLimit, exactKeys*384+128)
-	require.NoError(t, metadataGroupCharge([]*solana.Transaction{{Message: solana.Message{AccountKeys: keys[:exactKeys]}}}, 0))
-	require.ErrorIs(t, metadataGroupCharge([]*solana.Transaction{{Message: solana.Message{AccountKeys: keys[:exactKeys+1]}}}, 0), errMetadataBudget)
+	require.LessOrEqual(t, metadataGroupKeyLimit*384+128, metadataGroupLimit)
+	require.NoError(t, metadataGroupCharge([]*solana.Transaction{{Message: solana.Message{AccountKeys: keys[:metadataGroupKeyLimit]}}}, 0))
+	require.ErrorIs(t, metadataGroupCharge([]*solana.Transaction{{Message: solana.Message{AccountKeys: keys}}}, 0), errMetadataBudget)
 
 	validTx := transferTransactions(t, 1, 7)[0]
 	for _, tc := range []struct {
@@ -84,7 +84,6 @@ func TestMetadataBudgetGroupPreflight(t *testing.T) {
 	}{
 		{"transaction count", txs, 0},
 		{"key count", []*solana.Transaction{{Message: solana.Message{AccountKeys: keys}}}, 0},
-		{"group charge", []*solana.Transaction{{Message: solana.Message{AccountKeys: keys[:exactKeys+1]}}}, 0},
 		{"worker profile", []*solana.Transaction{validTx}, metadataWorkerLimit + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

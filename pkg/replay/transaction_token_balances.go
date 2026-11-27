@@ -153,10 +153,9 @@ func (group *transactionTokenGroup) resolveBalances(facts []transactionTokenFact
 		if !ok {
 			mint, ok = group.mints[fact.Mint]
 		}
-		if !ok {
-			return nil, fmt.Errorf("token mint %s is unavailable for program %s", fact.Mint, fact.ProgramID)
-		}
-		if !mint.Valid || mint.ProgramID != fact.ProgramID {
+		// An account can carry the token layout and name a mint the block
+		// never loaded. Like an invalid mint, it has no reportable balance.
+		if !ok || !mint.Valid || mint.ProgramID != fact.ProgramID {
 			continue
 		}
 		balances = append(balances, transactionTokenBalance{

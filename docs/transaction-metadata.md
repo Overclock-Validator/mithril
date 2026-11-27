@@ -23,11 +23,11 @@ The collector refuses incomplete records rather than publish partial history.
 | Budget | Limit |
 | --- | ---: |
 | Reserved metadata per transaction | 1 MiB |
-| Reserved metadata per block | 64 MiB |
-| Group preflight charge | 32 MiB |
+| Reserved metadata per block | 128 MiB |
+| Group preflight charge | 64 MiB |
 | Transactions per block capture | 16,384 |
 | Declared keys per group | 131,072 |
-| Concurrent capture workers | 16 |
+| Concurrent capture workers | 128 |
 | Data per backing-account read | 64 KiB |
 | Backing data hydrated per group | 16 MiB |
 

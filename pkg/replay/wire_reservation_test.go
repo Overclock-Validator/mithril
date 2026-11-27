@@ -49,8 +49,8 @@ func TestMetadataWireReservationExact(t *testing.T) {
 			ctx, tx, _ := accountingFixture(t, profile)
 			wireSize, err := txverify.TransactionWireSize(tx)
 			require.NoError(t, err)
-			want := uint64(4096 + wireSize + len(tx.Message.AccountKeys)*1024)
-			old := uint64(8192 + len(tx.Message.AccountKeys)*1024)
+			want := uint64(4096 + wireSize + len(tx.Message.AccountKeys)*metadataRecordKeyCharge)
+			old := uint64(8192 + len(tx.Message.AccountKeys)*metadataRecordKeyCharge)
 			var budget metadataBudget
 			budget.used.Store(metadataBlockLimit - want)
 			record, err := prepareTransactionMetadata(ctx, tx, &budget)
@@ -177,9 +177,11 @@ func TestMetadataWireReservationCombinedRefusal(t *testing.T) {
 	var budget metadataBudget
 	record, err := prepareTransactionMetadata(ctx, tx, &budget)
 	require.NoError(t, err)
+	// Leave the record less headroom than 32 large CPI copies and logs need,
+	// so finishing it exceeds the 1-MiB record cap. A nil context makes any
+	// late post-state read fail loudly.
+	require.NoError(t, record.reserve(&budget, metadataRecordLimit/4))
 	before := record.charge
-	// Maximum keys plus 32 large CPI copies/logs exceed the unchanged 1-MiB
-	// record cap. A nil context makes any late post-state read fail loudly.
 	require.ErrorIs(t, record.finish(nil, tx, output, 0, &budget), errMetadataBudget)
 	require.Equal(t, before, record.charge)
 	require.Equal(t, before, budget.used.Load())

@@ -22,16 +22,17 @@ func (execCtx *ExecutionCtx) EnableBoundedInnerInstructions() {
 	execCtx.boundedInnerInstructions = true
 }
 
-func (execCtx *ExecutionCtx) recordInnerInstruction(data []byte, instructionAccts []InstructionAccount, programIndex uint8) {
+// recordInnerInstruction reports whether it appended an entry.
+func (execCtx *ExecutionCtx) recordInnerInstruction(data []byte, instructionAccts []InstructionAccount, programIndex uint8) bool {
 	if execCtx.boundedInnerInstructions {
 		if execCtx.InnerInstructionsCaptureError != nil {
-			return
+			return false
 		}
 		remaining := maxRecordedInnerInstructionBytes - execCtx.innerInstructionBytes
 		if len(data) > MaxCpiInstructionDataLen || len(instructionAccts) > MaxCpiInstructionAccounts ||
 			len(execCtx.InnerInstrs) >= maxRecordedInnerInstructions || len(data) > remaining || len(instructionAccts) > remaining-len(data) {
 			execCtx.invalidateInnerInstructionCapture(errInnerInstructionCaptureLimit)
-			return
+			return false
 		}
 		execCtx.innerInstructionBytes += len(data) + len(instructionAccts)
 	}
@@ -49,6 +50,22 @@ func (execCtx *ExecutionCtx) recordInnerInstruction(data []byte, instructionAcct
 		Accounts:       acctIdxs,
 		Data:           dataCopy,
 	})
+	return true
+}
+
+// dropLastInnerInstruction removes the entry of an invocation that never
+// started. Such a call fails its transaction, so the list still names every
+// invocation that ran. (Agave keeps the entry when the failure is the call
+// depth limit; that one case differs.)
+func (execCtx *ExecutionCtx) dropLastInnerInstruction() {
+	last := len(execCtx.InnerInstrs) - 1
+	if last < 0 {
+		return
+	}
+	if execCtx.boundedInnerInstructions {
+		execCtx.innerInstructionBytes -= len(execCtx.InnerInstrs[last].Data) + len(execCtx.InnerInstrs[last].Accounts)
+	}
+	execCtx.InnerInstrs = execCtx.InnerInstrs[:last]
 }
 
 func (execCtx *ExecutionCtx) invalidateInnerInstructionCapture(err error) {
