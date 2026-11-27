@@ -264,15 +264,36 @@ func (c *chunkReader) block(i int) ([]byte, error) {
 	return raw, nil
 }
 
+// blockCache keeps decompressed blocks for the duration of one batch read.
+type blockCache map[blockKey][]byte
+
+type blockKey struct {
+	path  string
+	block int
+}
+
 // lookup returns the record for key, or nil if the chunk does not hold it.
 func (c *chunkReader) lookup(key [32]byte) (*Record, error) {
+	return c.lookupCached(key, nil)
+}
+
+func (c *chunkReader) lookupCached(key [32]byte, cache blockCache) (*Record, error) {
 	i := sort.Search(len(c.blocks), func(i int) bool { return bytes.Compare(c.blocks[i].first[:], key[:]) > 0 }) - 1
 	if i < 0 {
 		return nil, nil
 	}
-	raw, err := c.block(i)
-	if err != nil {
-		return nil, err
+	var raw []byte
+	if cache != nil {
+		raw = cache[blockKey{c.path, i}]
+	}
+	if raw == nil {
+		var err error
+		if raw, err = c.block(i); err != nil {
+			return nil, err
+		}
+		if cache != nil {
+			cache[blockKey{c.path, i}] = raw
+		}
 	}
 	for len(raw) > 0 {
 		r, rest, err := readRecord(raw, c.from)

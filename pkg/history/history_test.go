@@ -207,3 +207,105 @@ func TestAppendRejectsGap(t *testing.T) {
 	require.NoError(t, s.Append(21, 30, nil, none))
 	_ = bytes.MinRead
 }
+
+func TestBankRecords(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	none := func(keys [][32]byte) ([]*Version, error) { return make([]*Version, len(keys)), nil }
+	_ = none
+	appendFold := func(from, to uint64, slots ...uint64) {
+		b := &BankData{}
+		for _, sl := range slots {
+			r := SlotBank{Slot: sl, BlockHeight: sl - 100, LamportsPerSignature: 5000, NumSignatures: sl % 7}
+			r.Blockhash[0], r.Bankhash[0] = byte(sl), byte(sl+1)
+			b.Slots = append(b.Slots, r)
+		}
+		top := &ChunkBank{Slot: slots[len(slots)-1], AccountsLtHash: make([]byte, 2048), RecentBlockhashes: []BlockhashFee{{LamportsPerSignature: 5000}}}
+		top.AccountsLtHash[0] = byte(to)
+		b.Top = top
+		require.NoError(t, s.AppendKeys(from, to, nil, b))
+	}
+	appendFold(201, 210, 201, 203, 210)
+	appendFold(211, 220, 212, 219)
+	appendFold(221, 230, 225)
+
+	r, err := s.BankAt(203)
+	require.NoError(t, err)
+	require.EqualValues(t, 201, r.Parent)
+	require.EqualValues(t, 103, r.BlockHeight)
+	require.EqualValues(t, 203, r.Blockhash[0])
+	r, err = s.BankAt(212)
+	require.NoError(t, err)
+	require.EqualValues(t, 210, r.Parent, "parent crosses chunks")
+	_, err = s.BankAt(202)
+	require.ErrorIs(t, err, ErrNoBank, "skipped slot")
+
+	top, err := s.ChunkBankAtOrBefore(218)
+	require.NoError(t, err)
+	require.EqualValues(t, 210, top.Slot, "chunk 211..220 ends at 219, after 218")
+	top, err = s.ChunkBankAtOrBefore(219)
+	require.NoError(t, err)
+	require.EqualValues(t, 219, top.Slot)
+	require.EqualValues(t, 220, top.AccountsLtHash[0])
+
+	// Truncation removes bank records with their chunks; parents continue.
+	require.NoError(t, s.TruncateFrom(221))
+	_, err = s.BankAt(225)
+	require.ErrorIs(t, err, ErrNoBank)
+	appendFold(221, 230, 226)
+	r, err = s.BankAt(226)
+	require.NoError(t, err)
+	require.EqualValues(t, 219, r.Parent)
+
+	// Reopen keeps them.
+	require.NoError(t, s.Close())
+}
+
+func TestAccountsAtMatchesAccountAt(t *testing.T) {
+	rng := rand.New(rand.NewSource(4))
+	s, err := Open(t.TempDir(), Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	keys := make([][32]byte, 40)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	cur := map[[32]byte]*Version{}
+	prev := func(ks [][32]byte) ([]*Version, error) {
+		out := make([]*Version, len(ks))
+		for i, k := range ks {
+			out[i] = cur[k]
+		}
+		return out, nil
+	}
+	slot := uint64(10)
+	for f := 0; f < 6; f++ {
+		var sw []SlotWrites
+		next := map[[32]byte]*Version{}
+		for k, v := range cur {
+			next[k] = v
+		}
+		for s2 := slot; s2 < slot+3; s2++ {
+			w := SlotWrites{Slot: s2}
+			for _, k := range keys[:rng.Intn(len(keys))] {
+				v := randomVersion(rng)
+				w.Keys = append(w.Keys, k)
+				w.Versions = append(w.Versions, v)
+				next[k] = v
+			}
+			sw = append(sw, w)
+		}
+		require.NoError(t, s.Append(slot, slot+2, sw, prev))
+		cur = next
+		slot += 3
+	}
+	for sl := uint64(10); sl < slot; sl++ {
+		vs, errs, _ := s.AccountsAt(keys, sl)
+		for i, k := range keys {
+			v, _, err := s.AccountAt(k, sl)
+			require.Equal(t, err, errs[i])
+			if err == nil {
+				require.True(t, Same(v, vs[i]))
+			}
+		}
+	}
+}

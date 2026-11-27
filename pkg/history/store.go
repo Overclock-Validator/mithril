@@ -267,13 +267,14 @@ func (s *Store) Append(from, to uint64, slots []SlotWrites, prev func(keys [][32
 		}
 		keys = append(keys, kh)
 	}
-	return s.AppendKeys(from, to, keys)
+	return s.AppendKeys(from, to, keys, nil)
 }
 
 // AppendKeys records one fold covering slots [from, to] from per-key changes
-// the caller has already turned into differences. Keys without differences
-// are skipped. It must follow the previous call's range without a gap.
-func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory) error {
+// the caller has already turned into differences, with the fold's bank
+// context when bank is not nil. Keys without differences are skipped. It must
+// follow the previous call's range without a gap.
+func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) error {
 	if from > to {
 		return fmt.Errorf("history: empty range %d..%d", from, to)
 	}
@@ -282,9 +283,20 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory) error {
 	if n := len(s.segments); n > 0 {
 		last = s.segments[n-1]
 	}
+	parent := s.lastBankSlot()
 	s.mu.RUnlock()
 	if last != nil && from != last.to()+1 {
 		return fmt.Errorf("history: append %d..%d does not follow %d", from, to, last.to())
+	}
+	if bank != nil {
+		for i := range bank.Slots {
+			r := &bank.Slots[i]
+			if r.Slot < from || r.Slot > to || (i > 0 && r.Slot <= bank.Slots[i-1].Slot) {
+				return fmt.Errorf("history: bank record for slot %d out of order in %d..%d", r.Slot, from, to)
+			}
+			r.Parent = parent
+			parent = r.Slot
+		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return lessKey(keys[i].Key, keys[j].Key) })
 
@@ -321,6 +333,11 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory) error {
 		segDir = last.dir
 	}
 	path := filepath.Join(segDir, chunkFileName(from, to))
+	if bank != nil {
+		if err := writeFileSync(filepath.Join(segDir, bankFileName(from, to)), encodeBank(bank)); err != nil {
+			return err
+		}
+	}
 	if err := writeChunk(path, from, to, records); err != nil {
 		return err
 	}
@@ -388,6 +405,25 @@ func lessKey(a, b [32]byte) bool {
 func (s *Store) AccountAt(key [32]byte, slot uint64) (*Version, uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.accountAtLocked(key, slot, nil)
+}
+
+// AccountsAt is AccountAt for several keys at one slot, sharing decompressed
+// blocks between them. errs[i] is nil, ErrUnchanged, ErrBeforeHistory,
+// ErrAfterHistory or a read error, with the same meaning as AccountAt's.
+func (s *Store) AccountsAt(keys [][32]byte, slot uint64) (versions []*Version, errs []error, through uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	versions = make([]*Version, len(keys))
+	errs = make([]error, len(keys))
+	cache := blockCache{}
+	for i, k := range keys {
+		versions[i], through, errs[i] = s.accountAtLocked(k, slot, cache)
+	}
+	return versions, errs, through
+}
+
+func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*Version, uint64, error) {
 	n := len(s.segments)
 	if n == 0 {
 		return nil, 0, ErrAfterHistory
@@ -415,7 +451,7 @@ func (s *Store) AccountAt(key [32]byte, slot uint64) (*Version, uint64, error) {
 			if c >= len(seg.chunks) {
 				break
 			}
-			r, err := seg.chunks[c].reader.lookup(key)
+			r, err := seg.chunks[c].reader.lookupCached(key, cache)
 			if err != nil {
 				return nil, through, err
 			}
@@ -565,6 +601,9 @@ func (s *Store) TruncateFrom(slot uint64) error {
 		}
 		for _, c := range seg.chunks[keep:] {
 			if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Remove(c.bankPath()); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		}

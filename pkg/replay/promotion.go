@@ -1,11 +1,15 @@
 package replay
 
 import (
+	"encoding/base64"
+
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Overclock-Validator/mithril/pkg/history"
+	"github.com/mr-tron/base58"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -593,6 +597,50 @@ type foldJob struct {
 	checkpointBytes                        int
 	installTransactionStatusCheckpoint     func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error)
 	afterTransactionStatusCheckpointCommit func(selected *state.TransactionStatusCheckpointRef) error
+	historyBank                            *history.BankData // per-slot bank context for account history; nil when off
+}
+
+// historyBankStager is the committer side of account history's bank context.
+type historyBankStager interface {
+	HistoryEnabled() bool
+	StageHistoryBank(*history.BankData)
+}
+
+func decode32(s string) (out [32]byte) {
+	if b, err := base58.Decode(s); err == nil {
+		copy(out[:], b)
+	}
+	return out
+}
+
+// foldHistoryBank turns the chunk's per-slot resume contexts into history bank
+// records, with the chunk top's heavier context.
+func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, through uint64) *history.BankData {
+	b := &history.BankData{}
+	for _, sd := range chunk {
+		ctx := contexts[sd.Slot]
+		if ctx == nil {
+			continue
+		}
+		r := history.SlotBank{Slot: sd.Slot, BlockHeight: ctx.BlockHeight, LamportsPerSignature: ctx.LamportsPerSignature,
+			PrevLamportsPerSignature: ctx.PrevLamportsPerSig, NumSignatures: ctx.NumSignatures}
+		r.Bankhash = decode32(ctx.Bankhash)
+		r.Blockhash = decode32(ctx.Blockhash)
+		b.Slots = append(b.Slots, r)
+	}
+	if ctx := contexts[through]; ctx != nil {
+		top := &history.ChunkBank{Slot: through}
+		top.AccountsLtHash, _ = base64.StdEncoding.DecodeString(ctx.AcctsLtHash)
+		for _, e := range ctx.RecentBlockhashes {
+			var f history.BlockhashFee
+			f.Blockhash = decode32(e.Blockhash)
+			f.LamportsPerSignature = e.LamportsPerSignature
+			top.RecentBlockhashes = append(top.RecentBlockhashes, f)
+		}
+		top.EvictedBlockhash = decode32(ctx.EvictedBlockhash)
+		b.Top = top
+	}
+	return b
 }
 
 type foldResult struct {
@@ -667,7 +715,12 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 			bankhashes[sd.Slot] = bh
 		}
 	}
+	var historyBank *history.BankData
+	if hb, ok := t.committer.(historyBankStager); ok && hb.HistoryEnabled() {
+		historyBank = foldHistoryBank(chunk, t.contexts, through)
+	}
 	return &foldJob{
+		historyBank:                            historyBank,
 		chunk:                                  append([]accounts.SlotDelta(nil), chunk...),
 		slotCount:                              len(chunk),
 		retainedBytes:                          retainedBytes,
@@ -781,6 +834,9 @@ func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	}
 	stakeFlush = time.Since(step)
 	step = time.Now()
+	if hb, ok := committer.(historyBankStager); ok && job.historyBank != nil {
+		hb.StageHistoryBank(job.historyBank)
+	}
 	result, err = committer.CommitBatch(job.chunk, job.through, job.bankhashes, job.ctxJSON)
 	commit = time.Since(step)
 	if err != nil {

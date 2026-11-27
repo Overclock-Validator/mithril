@@ -235,3 +235,25 @@ func TestHistoryReadsDuringFolds(t *testing.T) {
 	close(done)
 	require.NoError(t, <-readErr)
 }
+
+// The fold job's staged bank context lands with the batch's history chunk.
+func TestStagedBankReachesHistory(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	hs, err := history.Open(t.TempDir(), history.Options{})
+	require.NoError(t, err)
+	db.SetHistory(hs)
+	require.True(t, db.HistoryEnabled())
+	k := solana.PublicKey{4}
+	bank := &history.BankData{Slots: []history.SlotBank{{Slot: 5, BlockHeight: 3, LamportsPerSignature: 5000}}, Top: &history.ChunkBank{Slot: 5}}
+	db.StageHistoryBank(bank)
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 5, Delta: []*accounts.Account{{Key: k, Lamports: 9}}}}, 5, nil, nil)
+	require.NoError(t, err)
+	r, err := hs.BankAt(5)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, r.BlockHeight)
+	// A later fold without a staged bank records none for its slots.
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 6, Delta: []*accounts.Account{{Key: k, Lamports: 10}}}}, 6, nil, nil)
+	require.NoError(t, err)
+	_, err = hs.BankAt(6)
+	require.ErrorIs(t, err, history.ErrNoBank)
+}

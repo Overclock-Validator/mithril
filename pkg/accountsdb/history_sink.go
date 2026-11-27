@@ -21,6 +21,18 @@ type historyState struct {
 	store  atomic.Pointer[history.Store]
 	failed atomic.Bool
 	stats  HistoryStats
+	bank   *history.BankData // staged by the fold job for its next CommitBatch
+}
+
+// HistoryEnabled reports whether folds record history.
+func (db *AccountsDb) HistoryEnabled() bool { return db.History() != nil }
+
+// StageHistoryBank hands the next CommitBatch the bank context of its slots.
+// The fold worker calls it immediately before CommitBatch.
+func (db *AccountsDb) StageHistoryBank(b *history.BankData) {
+	db.history.mu.Lock()
+	db.history.bank = b
+	db.history.mu.Unlock()
 }
 
 // HistoryStats count the history work done at folds.
@@ -73,8 +85,13 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 	db.history.mu.Lock()
 	defer db.history.mu.Unlock()
 	s := db.history.store.Load()
+	bank := db.history.bank
+	db.history.bank = nil
 	if s == nil || db.history.failed.Load() {
 		return
+	}
+	if bank != nil && len(bank.Slots) > 0 && bank.Slots[len(bank.Slots)-1].Slot > throughSlot {
+		bank = nil // staged for a different batch
 	}
 	start := time.Now()
 	from := db.DurableThrough() + 1
@@ -105,7 +122,7 @@ func (db *AccountsDb) recordHistory(deltas []accounts.SlotDelta, throughSlot uin
 		return
 	}
 	benchHistorySample(keys.keys)
-	if err := s.AppendKeys(from, throughSlot, keys.keys); err != nil {
+	if err := s.AppendKeys(from, throughSlot, keys.keys, bank); err != nil {
 		db.disableHistory(err)
 		return
 	}
