@@ -51,7 +51,13 @@ func decodeFoldMeta(data []byte) (foldMeta, error) {
 // readFoldMeta returns the current fold watermark, or (zero, false) on a fresh
 // (never-folded) store.
 func (db *AccountsDb) readFoldMeta() (foldMeta, bool, error) {
-	val, closer, err := db.Index.Get(metaKeyLastBatch)
+	return readFoldMetaFrom(db.Index)
+}
+
+// readFoldMetaFrom reads the fold commit watermark as reader sees it, a
+// snapshot included.
+func readFoldMetaFrom(reader pebble.Reader) (foldMeta, bool, error) {
+	val, closer, err := reader.Get(metaKeyLastBatch)
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return foldMeta{}, false, nil

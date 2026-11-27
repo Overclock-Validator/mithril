@@ -18,8 +18,11 @@ func encodeCompactionHistoryFloor(m foldMeta) []byte {
 	return binary.LittleEndian.AppendUint32(b, crc32.ChecksumIEEE(b))
 }
 
-func (db *AccountsDb) readCompactionHistoryFloor() (foldMeta, error) {
-	data, closer, err := db.Index.Get(metaKeyCompactionHistoryFloor)
+// readCompactionHistoryFloorFrom decodes the frontier as reader sees it, a
+// snapshot included. The zero value means no history has been expired. It
+// does not check the boundary's manifest; readCompactionHistoryFloor does.
+func readCompactionHistoryFloorFrom(reader pebble.Reader) (foldMeta, error) {
+	data, closer, err := reader.Get(metaKeyCompactionHistoryFloor)
 	if err == pebble.ErrNotFound {
 		return foldMeta{}, nil
 	}
@@ -33,6 +36,14 @@ func (db *AccountsDb) readCompactionHistoryFloor() (foldMeta, error) {
 	m, err := decodeFoldMeta(data[8:32])
 	if err != nil || m.BatchSeq == 0 {
 		return foldMeta{}, fmt.Errorf("accountsdb: invalid compaction history boundary")
+	}
+	return m, nil
+}
+
+func (db *AccountsDb) readCompactionHistoryFloor() (foldMeta, error) {
+	m, err := readCompactionHistoryFloorFrom(db.Index)
+	if err != nil || m.BatchSeq == 0 {
+		return m, err
 	}
 	// Bind the frontier to an intact retained boundary, never to a naked sequence
 	// inferred from missing files. Its manifest remains pinned until superseded.
