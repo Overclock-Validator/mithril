@@ -101,6 +101,11 @@ func TestLegacyCallsFollowRegistryIdentity(t *testing.T) {
 	run("back to the first identity", clean, id{1}, 7, 42, 4, true)
 	run("new generation, registry claims the immediate", shadow, id{1}, 8, 99, 2, false)
 	run("first generation again", clean, id{1}, 7, 42, 4, true)
+	// Registries that alternate (two banks running the program at once) keep
+	// their answers: the first one was not asked again in between.
+	if *cleanLookups != checked {
+		t.Fatalf("the registry was asked %d more times after other registries ran the program", *cleanLookups-checked)
+	}
 
 	// A table that does not cover the text exactly is never used.
 	p.CallTargets = p.CallTargets[:len(p.Text)-1]

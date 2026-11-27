@@ -197,3 +197,40 @@ func TestImmutableProgramSourceDistinguishesRangesWithinAllocation(t *testing.T)
 		t.Fatal("original range no longer matched")
 	}
 }
+
+// Two readers holding their own copy of one program must not evict each
+// other's checked identity: after each has been compared once, neither is
+// compared again.
+func TestImmutableProgramSourceRemembersSeveralReaders(t *testing.T) {
+	first := bytes.Repeat([]byte{7}, 64<<10)
+	second := bytes.Clone(first)
+	entry := &ProgramCacheEntry{}
+	f := features.NewFeaturesDefault()
+	entry.BindSource(first, f)
+	if !entry.MatchesImmutableSource(first, f) || !entry.MatchesImmutableSource(second, f) {
+		t.Fatal("equal sources did not validate")
+	}
+	memo := entry.validatedSource.Load()
+	for range 3 {
+		if !entry.MatchesImmutableSource(first, f) || !entry.MatchesImmutableSource(second, f) {
+			t.Fatal("a remembered source stopped validating")
+		}
+	}
+	if memo != entry.validatedSource.Load() {
+		t.Fatal("alternating readers replaced the memo, so each was compared again")
+	}
+	// A fifth distinct copy pushes out the oldest, and still validates.
+	for range immutableProgramSources {
+		if !entry.MatchesImmutableSource(bytes.Clone(first), f) {
+			t.Fatal("a further copy did not validate")
+		}
+	}
+	if got := entry.validatedSource.Load().count; got != immutableProgramSources {
+		t.Fatalf("memo holds %d identities, want %d", got, immutableProgramSources)
+	}
+	if entry.MatchesImmutableSource(bytes.Repeat([]byte{8}, 64<<10), f) {
+		t.Fatal("a different program validated")
+	}
+	runtime.KeepAlive(first)
+	runtime.KeepAlive(second)
+}
