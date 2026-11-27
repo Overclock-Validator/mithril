@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -49,6 +50,97 @@ type ChunkBank struct {
 type BankData struct {
 	Slots []SlotBank // ascending
 	Top   *ChunkBank
+	// Sidecars are other per-fold records kept with the chunk, by kind (lower
+	// case letters and digits), such as replay hints. Each is stored in its
+	// own file, removed with the chunk, and read back with SidecarAt.
+	Sidecars map[string][]byte
+}
+
+// ErrNoSidecar: no record of that kind for the slot's chunk.
+var ErrNoSidecar = errors.New("history: no sidecar record for the slot")
+
+const sidecarMagic = "MHSIDE01"
+
+func sidecarFileName(kind string, from, to uint64) string {
+	return fmt.Sprintf("%s-%020d-%020d.hsc", kind, from, to)
+}
+
+func validSidecarKind(kind string) bool {
+	if kind == "" || len(kind) > 32 {
+		return false
+	}
+	for _, c := range kind {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeSidecar(data []byte) []byte {
+	out := make([]byte, 0, len(sidecarMagic)+len(data)+4)
+	out = append(out, sidecarMagic...)
+	out = append(out, data...)
+	return binary.LittleEndian.AppendUint32(out, crc32.ChecksumIEEE(out))
+}
+
+func decodeSidecar(b []byte) ([]byte, error) {
+	if len(b) < len(sidecarMagic)+4 || string(b[:len(sidecarMagic)]) != sidecarMagic ||
+		crc32.ChecksumIEEE(b[:len(b)-4]) != binary.LittleEndian.Uint32(b[len(b)-4:]) {
+		return nil, errors.New("history: malformed sidecar file")
+	}
+	return b[len(sidecarMagic) : len(b)-4], nil
+}
+
+// parseSidecarName returns the chunk range of a sidecar file name.
+func parseSidecarName(name string) (from, to uint64, ok bool) {
+	if !strings.HasSuffix(name, ".hsc") {
+		return 0, 0, false
+	}
+	base := strings.TrimSuffix(name, ".hsc")
+	i := strings.LastIndexByte(base, '-')
+	if i < 0 {
+		return 0, 0, false
+	}
+	j := strings.LastIndexByte(base[:i], '-')
+	if j <= 0 {
+		return 0, 0, false
+	}
+	return parseRange(base[j+1:]+".x", "", ".x")
+}
+
+func (c *chunkMeta) sidecarPaths() []string {
+	m, _ := filepath.Glob(filepath.Join(filepath.Dir(c.path), fmt.Sprintf("*-%020d-%020d.hsc", c.from, c.to)))
+	return m
+}
+
+// SidecarAt returns the record of kind kept with the chunk covering slot,
+// and that chunk's slot range.
+func (s *Store) SidecarAt(slot uint64, kind string) (data []byte, from, to uint64, err error) {
+	if !validSidecarKind(kind) {
+		return nil, 0, 0, fmt.Errorf("history: invalid sidecar kind %q", kind)
+	}
+	s.mu.RLock()
+	i, j := s.chunkFor(slot)
+	var path string
+	if i >= 0 {
+		c := s.segments[i].chunks[j]
+		from, to = c.from, c.to
+		path = filepath.Join(filepath.Dir(c.path), sidecarFileName(kind, c.from, c.to))
+	}
+	s.mu.RUnlock()
+	if path == "" {
+		return nil, 0, 0, ErrNoSidecar
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, from, to, ErrNoSidecar
+	}
+	if err != nil {
+		return nil, from, to, err
+	}
+	data, err = decodeSidecar(b)
+	return data, from, to, err
 }
 
 // ErrNoBank: no bank record for that slot (skipped, not folded, or outside history).

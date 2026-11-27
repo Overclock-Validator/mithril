@@ -473,3 +473,39 @@ func TestAccountsAtLimit(t *testing.T) {
 	_, _, _, err = s.AccountsAtLimit(keys, 5, NoLimit)
 	require.NoError(t, err)
 }
+
+func TestSidecars(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	for f := uint64(0); f < 3; f++ {
+		from := 100 + 10*f
+		b := &BankData{Sidecars: map[string][]byte{"hints": {byte(f), 1, 2}}}
+		require.NoError(t, s.AppendKeys(from, from+9, nil, b))
+	}
+	require.Error(t, s.AppendKeys(130, 139, nil, &BankData{Sidecars: map[string][]byte{"Bad-Kind": nil}}))
+	d, from, to, err := s.SidecarAt(115, "hints")
+	require.NoError(t, err)
+	require.Equal(t, []byte{1, 1, 2}, d)
+	require.EqualValues(t, 110, from)
+	require.EqualValues(t, 119, to)
+	_, _, _, err = s.SidecarAt(115, "other")
+	require.ErrorIs(t, err, ErrNoSidecar)
+	require.NoError(t, s.TruncateFrom(120))
+	_, _, _, err = s.SidecarAt(125, "hints")
+	require.ErrorIs(t, err, ErrNoSidecar)
+	m, _ := filepath.Glob(filepath.Join(dir, "*", "*.hsc"))
+	require.Len(t, m, 2, "the dropped chunk's sidecar is removed")
+	// An orphan (a fold interrupted after the sidecar write) goes on reopen.
+	seg := filepath.Dir(m[0])
+	require.NoError(t, os.WriteFile(filepath.Join(seg, sidecarFileName("hints", 120, 129)), encodeSidecar(nil), 0o644))
+	require.NoError(t, s.Close())
+	s, err = Open(dir, Options{SegmentChunks: 2})
+	require.NoError(t, err)
+	m, _ = filepath.Glob(filepath.Join(dir, "*", "*.hsc"))
+	require.Len(t, m, 2)
+	d, _, _, err = s.SidecarAt(105, "hints")
+	require.NoError(t, err)
+	require.Equal(t, []byte{0, 1, 2}, d)
+	require.NoError(t, s.Close())
+}

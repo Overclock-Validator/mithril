@@ -176,7 +176,7 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 			_ = os.Remove(filepath.Join(dir, name))
 		case name == segmentIndexName:
 			hasIndex = true
-		case strings.HasSuffix(name, ".hbk"):
+		case strings.HasSuffix(name, ".hbk"), strings.HasSuffix(name, ".hsc"):
 			banks = append(banks, name)
 		default:
 			if from, to, ok := parseRange(name, "chunk-", ".hst"); ok {
@@ -209,14 +209,18 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 			}
 		}
 	}
-	// Bank files belong to a chunk; any other (a fold interrupted between the
-	// two writes, or a dropped chunk) is removed.
-	kept := make(map[string]bool, len(seg.chunks))
+	// Bank and sidecar files belong to a chunk; any other (a fold interrupted
+	// between the writes, or a dropped chunk) is removed.
+	kept := make(map[[2]uint64]bool, len(seg.chunks))
 	for _, c := range seg.chunks {
-		kept[bankFileName(c.from, c.to)] = true
+		kept[[2]uint64{c.from, c.to}] = true
 	}
 	for _, b := range banks {
-		if !kept[b] {
+		from, to, ok := parseRange(b, "bank-", ".hbk")
+		if !ok {
+			from, to, ok = parseSidecarName(b)
+		}
+		if !ok || !kept[[2]uint64{from, to}] {
 			_ = os.Remove(filepath.Join(dir, b))
 		}
 	}
@@ -419,6 +423,14 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 	}
 	path := filepath.Join(segDir, chunkFileName(from, to))
 	if bank != nil {
+		for kind, data := range bank.Sidecars {
+			if !validSidecarKind(kind) {
+				return fmt.Errorf("history: invalid sidecar kind %q", kind)
+			}
+			if err := writeFileSync(filepath.Join(segDir, sidecarFileName(kind, from, to)), encodeSidecar(data)); err != nil {
+				return err
+			}
+		}
 		if err := writeFileSync(filepath.Join(segDir, bankFileName(from, to)), encodeBank(bank)); err != nil {
 			return err
 		}
@@ -744,6 +756,11 @@ func (s *Store) TruncateFrom(slot uint64) error {
 			}
 			if err := os.Remove(c.bankPath()); err != nil && !os.IsNotExist(err) {
 				return err
+			}
+			for _, p := range c.sidecarPaths() {
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					return err
+				}
 			}
 		}
 		if keep == 0 {
