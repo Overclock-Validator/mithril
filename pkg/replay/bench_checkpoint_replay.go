@@ -70,9 +70,9 @@ func startBenchCheckpointReplay(ctx context.Context, db *accountsdb.AccountsDb, 
 			if err != nil {
 				if ctx.Err() == nil {
 					failures++
-					if failures <= 5 {
-						mlog.Log.Infof("bench checkpoint replay: fold after %d: %v", next, err)
-					}
+				}
+				if failures <= 5 {
+					mlog.Log.Infof("bench checkpoint replay: fold after %d: %d blocks then %v", next, replayed, err)
 				}
 				continue
 			}
@@ -112,6 +112,7 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 		}
 	}
 	loadStart := time.Now()
+	mlog.Log.Infof("bench checkpoint replay: fold after %d: setting up", boundary)
 	replay, err := NewCheckpointReplay(ctx, db, view, persisted, workers)
 	if err != nil {
 		return 0, 0, 0, 0, err
@@ -122,6 +123,7 @@ func benchReplayFold(ctx context.Context, db *accountsdb.AccountsDb, persisted *
 	}
 	replay.Preload(fold.Keys, loaded)
 	load = time.Since(loadStart)
+	mlog.Log.Infof("bench checkpoint replay: fold after %d: set up and loaded %d accounts in %s", boundary, len(fold.Keys), load.Round(time.Millisecond))
 	for _, want := range fold.Bankhashes {
 		if err := ctx.Err(); err != nil {
 			return replayed, wrong, load, elapsed, err
