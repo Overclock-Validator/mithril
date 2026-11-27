@@ -114,6 +114,16 @@ type batchChunkReadStats struct {
 	placeholderObjects    uint64
 }
 
+type passiveReadKey struct{}
+
+// PassiveRead marks reads made with ctx as background reads: they use cached
+// values when present but neither inform cache admission nor publish into the
+// caches, so a bulk background reader (history recording, for one) does not
+// evict what replay reads.
+func PassiveRead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, passiveReadKey{}, true)
+}
+
 func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, error) {
 	out, _, err := db.getAccountsBatchWithStats(ctx, slot, pks)
 	return out, err
@@ -228,7 +238,13 @@ func (db *AccountsDb) getAccountsBatchWithBudget(ctx context.Context, slot uint6
 	}
 
 	phaseStart = time.Now()
-	admitCommon := admission.classifyAndObserve(pks, cold)
+	passive := ctx.Value(passiveReadKey{}) != nil
+	var admitCommon []bool
+	if passive {
+		admitCommon = make([]bool, len(pks))
+	} else {
+		admitCommon = admission.classifyAndObserve(pks, cold)
+	}
 	stats.AdmissionFilterNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
 	phaseStart = time.Now()
 	foldAtStart := db.foldPhase.at(phaseStart)
@@ -335,6 +351,9 @@ func (db *AccountsDb) getAccountsBatchWithBudget(ctx context.Context, slot uint6
 		mlog.Log.Infof("slow account batch read: slot %d, %d keys to storage | index %s (%d found, %d absent, snapshot %s) | appendvec %s (%d accounts, %d files) | fold at start %s, at end %s",
 			slot, len(cold), r(time.Duration(stats.IndexLookupNanoseconds)), stats.IndexHits, stats.IndexMisses, r(time.Duration(snapshotSetupNanoseconds)),
 			r(time.Duration(stats.AppendVecReadNanoseconds)), stats.AppendVecAccounts, stats.UniqueAppendVecs, foldAtStart, foldAtEnd)
+	}
+	if passive {
+		return out, stats, nil
 	}
 	phaseStart = time.Now()
 	db.cacheBatchAbsences(ctx, pks, cold, found, admitCommon, cacheEpoch)

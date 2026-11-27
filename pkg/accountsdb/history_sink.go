@@ -174,7 +174,7 @@ func (db *AccountsDb) historyKeys(deltas []accounts.SlotDelta, from uint64) (his
 		for i, k := range order[lo:hi] {
 			pks[i] = solana.PublicKey(k)
 		}
-		accts, err := db.GetAccountsBatch(context.Background(), from-1, pks)
+		accts, err := db.GetAccountsBatch(PassiveRead(context.Background()), from-1, pks)
 		if err != nil {
 			return out, err
 		}
