@@ -2626,6 +2626,11 @@ postBootstrap:
 		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
+		retentionSlots := schedule.SlotsPerEpoch * 2
+		if err := enableRPCBlockHistory(rpcServer, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("enable RPC block history: %v", err)
+		}
+		publishRPCBankState(rpcServer, mithrilState)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
 	}
@@ -4454,9 +4459,8 @@ func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.Acc
 // rooted checkpoint. Returns false (caller halts) when no boundary below the
 // divergence is retained or the rewind/reconcile fails.
 func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64, rpcServer replay.SlotCtxSetter) bool {
-	historyGate, hasHistoryGate := rpcServer.(interface{ SetHistoryRecoveryPending(bool) })
-	if hasHistoryGate {
-		historyGate.SetHistoryRecoveryPending(true)
+	if gate, ok := rpcServer.(interface{ SetHistoryRecoveryPending(bool) }); ok {
+		gate.SetHistoryRecoveryPending(true)
 	}
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil {
@@ -4489,18 +4493,19 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 				return fmt.Errorf("rewind RPC epoch rewards: %w", err)
 			}
 		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(res.NewThrough); err != nil {
+				return fmt.Errorf("rewind RPC block history: %w", err)
+			}
+		}
 		return persistRewindResult(accountsDbPath, s, res)
 	})
 	if err != nil {
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
-
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
-	if hasHistoryGate {
-		historyGate.SetHistoryRecoveryPending(false)
-	}
 	return true
 }
 
@@ -4730,8 +4735,19 @@ func runReplayWithRecovery(
 		// store to the newest retained fold boundary BELOW the divergence first
 		// (this is exactly why durable state deliberately lags and undo pointers
 		// are retained for a horizon). Beyond the horizon -> fail closed.
-		if divSlot <= mithrilState.LastRootedSlot {
+		rewound := divSlot <= mithrilState.LastRootedSlot
+		if gate, ok := rpcServer.(interface{ SetHistoryRecoveryPending(bool) }); !rewound && ok {
+			gate.SetHistoryRecoveryPending(true)
+		}
+		if rewound {
 			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
+				break
+			}
+		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); !rewound && ok {
+			if err := history.RewindBlockHistory(mithrilState.LastRootedSlot); err != nil {
+				result.Error = fmt.Errorf("fork switch: rewind RPC block history to slot %d: %w", mithrilState.LastRootedSlot, err)
+				mlog.Log.Errorf("%v; halting", result.Error)
 				break
 			}
 		}
@@ -4767,7 +4783,7 @@ func runReplayWithRecovery(
 				stakes[e] = string(b)
 			}
 		}
-		rs, err := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, stakes)
+		rs, err := finishReplayRecovery(rpcServer, mithrilState, stakes)
 		if err != nil {
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break
@@ -4781,6 +4797,43 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, &retryBlockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+// finishReplayRecovery publishes the recovered bank before reopening history.
+func finishReplayRecovery(rpcServer replay.SlotCtxSetter, s *state.MithrilState, stakes map[uint64]string) (*replay.ResumeState, error) {
+	if s == nil || s.LastRootedContext == nil || s.LastRootedContext.Slot != s.LastRootedSlot {
+		return nil, fmt.Errorf("rooted resume context does not match the durable root")
+	}
+	rs, err := replay.ResumeStateFromRootedContext(s.LastRootedContext, stakes)
+	if err != nil {
+		return nil, err
+	}
+	publishRPCBankState(rpcServer, s)
+	if gate, ok := rpcServer.(interface{ SetHistoryRecoveryPending(bool) }); ok {
+		gate.SetHistoryRecoveryPending(false)
+	}
+	return rs, nil
+}
+
+type rpcBankStateSetter interface {
+	PublishRootedBankState(slot, blockHeight uint64, transactionCount *uint64)
+}
+
+func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {
+	if rpcServer == nil || mithrilState == nil {
+		return
+	}
+	rootedSlot := mithrilState.ManifestParentSlot
+	rootedBlockHeight := mithrilState.ManifestBlockHeight
+	rootedTransactionCount := new(mithrilState.ManifestTransactionCount)
+	if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil {
+		rootedSlot = rootedCtx.Slot
+		rootedBlockHeight = rootedCtx.BlockHeight
+		if rootedCtx.TransactionCount != nil || rootedSlot != mithrilState.ManifestParentSlot {
+			rootedTransactionCount = rootedCtx.TransactionCount
+		}
+	}
+	rpcServer.PublishRootedBankState(rootedSlot, rootedBlockHeight, rootedTransactionCount)
 }
 
 func defaultVerifierConfigForBlockSource(source string, rpcFallback bool) replay.VerifierConfig {
