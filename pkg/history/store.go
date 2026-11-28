@@ -23,7 +23,8 @@ const (
 )
 
 var (
-	// ErrBeforeHistory: the slot is older than the oldest retained chunk.
+	// ErrBeforeHistory: the slot is older than the oldest retained chunk (or
+	// than the block before it, when that chunk kept a base bank record).
 	ErrBeforeHistory = errors.New("history: slot is older than retained history")
 	// ErrAfterHistory: the slot is newer than the last chunk written; read
 	// current state instead.
@@ -49,6 +50,20 @@ type segment struct {
 	// sigFiles is the segment's signature index, ascending: once the segment
 	// is closed, one file for all of it; before that, one per chunk.
 	sigFiles []*sigFile
+	// base is the bank record of the block before the segment's first chunk,
+	// kept with that chunk; nil when it was not recorded.
+	base *SlotBank
+}
+
+// readFrom is the oldest slot whose accounts can be read: the segment's base
+// block when it has one. A segment's first record of each account carries
+// the account's full version before the segment, so the version then is
+// known without an older chunk.
+func (s *segment) readFrom() uint64 {
+	if s.base != nil {
+		return s.base.Slot
+	}
+	return s.from()
 }
 
 func (s *segment) from() uint64 { return s.chunks[0].from }
@@ -234,6 +249,7 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 	if len(seg.chunks) == 0 {
 		return nil, damaged, os.RemoveAll(dir)
 	}
+	seg.base = readBase(seg.chunks[0])
 	seg.loadSigs(sigNames)
 	open := last && len(seg.chunks) < s.segmentChunks
 	if !open {
@@ -436,6 +452,22 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 	if last != nil && from != last.to()+1 {
 		return fmt.Errorf("history: append %d..%d does not follow %d", from, to, last.to())
 	}
+	// A new segment starts when the open one is full.
+	newSegment := last == nil || last.masks == nil || len(last.chunks) >= s.segmentChunks
+	if bank != nil && bank.Base != nil {
+		b := bank.Base
+		if b.Slot.Slot >= from || b.Chunk.Slot != b.Slot.Slot {
+			return fmt.Errorf("history: base bank record for slot %d does not precede %d..%d", b.Slot.Slot, from, to)
+		}
+		if !newSegment {
+			// Only a segment's first chunk keeps one.
+			c := *bank
+			c.Base = nil
+			bank = &c
+		} else if b.Slot.Slot > parent {
+			parent = b.Slot.Slot
+		}
+	}
 	if bank != nil {
 		for i := range bank.Slots {
 			r := &bank.Slots[i]
@@ -448,8 +480,6 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 	}
 	sort.Slice(keys, func(i, j int) bool { return lessKey(keys[i].Key, keys[j].Key) })
 
-	// A new segment starts when the open one is full.
-	newSegment := last == nil || last.masks == nil || len(last.chunks) >= s.segmentChunks
 	var since map[[32]byte]sinceFull
 	if !newSegment {
 		since = last.since
@@ -538,6 +568,11 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			}
 		}
 		last = &segment{dir: segDir, masks: make(map[[32]byte]uint64), since: make(map[[32]byte]sinceFull)}
+		if bank != nil && bank.Base != nil {
+			r := bank.Base.Slot
+			r.Parent = 0
+			last.base = &r
+		}
 		s.segments = append(s.segments, last)
 	}
 	bit := uint64(1) << len(last.chunks)
@@ -639,7 +674,7 @@ func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*V
 		return nil, 0, ErrAfterHistory
 	}
 	through := s.segments[n-1].to()
-	if slot < s.segments[0].from() {
+	if slot < s.segments[0].readFrom() {
 		return nil, through, ErrBeforeHistory
 	}
 	if slot > through {

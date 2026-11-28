@@ -195,6 +195,9 @@ func bankWithin(b *history.BankData, from, to uint64) bool {
 			return false
 		}
 	}
+	if b.Base != nil && b.Base.Slot.Slot >= from {
+		return false
+	}
 	return b.Top == nil || (b.Top.Slot >= from && b.Top.Slot <= to)
 }
 

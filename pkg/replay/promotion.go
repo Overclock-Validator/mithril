@@ -644,8 +644,10 @@ func decode32(s string) (out [32]byte, ok bool) {
 // records, with the chunk top's heavier context. A context that does not
 // decode is left out rather than recorded with zero hashes. The chunk's
 // transactions are indexed by signature only when every slot's are known, so
-// the index never claims a slot it lacks.
-func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, sigPrefixes map[uint64][]uint64, through uint64) *history.BankData {
+// the index never claims a slot it lacks. root, the context of the durable
+// block before the chunk, becomes the base record history keeps when the
+// chunk starts a segment.
+func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, sigPrefixes map[uint64][]uint64, through uint64, root *state.ResumeContext) *history.BankData {
 	b := &history.BankData{Signatures: make([]history.SlotSignatures, 0, len(chunk))}
 	for _, sd := range chunk {
 		p, ok := sigPrefixes[sd.Slot]
@@ -660,19 +662,29 @@ func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.Resu
 		if ctx == nil {
 			continue
 		}
-		r := history.SlotBank{Slot: sd.Slot, BlockHeight: ctx.BlockHeight, LamportsPerSignature: ctx.LamportsPerSignature,
-			PrevLamportsPerSignature: ctx.PrevLamportsPerSig, NumSignatures: ctx.NumSignatures}
-		var ok1, ok2 bool
-		r.Bankhash, ok1 = decode32(ctx.Bankhash)
-		r.Blockhash, ok2 = decode32(ctx.Blockhash)
-		if ok1 && ok2 {
+		if r, ok := foldSlotBank(ctx, sd.Slot); ok {
 			b.Slots = append(b.Slots, r)
 		}
 	}
 	if ctx := contexts[through]; ctx != nil {
 		b.Top = foldChunkBank(ctx, through)
 	}
+	if root != nil && len(chunk) > 0 && root.Slot < chunk[0].Slot {
+		r, ok := foldSlotBank(root, root.Slot)
+		if c := foldChunkBank(root, root.Slot); ok && c != nil {
+			b.Base = &history.BaseBank{Slot: r, Chunk: *c}
+		}
+	}
 	return b
+}
+
+func foldSlotBank(ctx *state.ResumeContext, slot uint64) (history.SlotBank, bool) {
+	r := history.SlotBank{Slot: slot, BlockHeight: ctx.BlockHeight, LamportsPerSignature: ctx.LamportsPerSignature,
+		PrevLamportsPerSignature: ctx.PrevLamportsPerSig, NumSignatures: ctx.NumSignatures}
+	var ok1, ok2 bool
+	r.Bankhash, ok1 = decode32(ctx.Bankhash)
+	r.Blockhash, ok2 = decode32(ctx.Blockhash)
+	return r, ok1 && ok2
 }
 
 func foldChunkBank(ctx *state.ResumeContext, through uint64) *history.ChunkBank {
@@ -773,7 +785,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	}
 	var historyBank *history.BankData
 	if hb, ok := t.committer.(historyBankStager); ok && hb.HistoryEnabled() {
-		historyBank = foldHistoryBank(chunk, t.contexts, t.sigPrefixes, through)
+		historyBank = foldHistoryBank(chunk, t.contexts, t.sigPrefixes, through, t.rootContext)
 	}
 	return &foldJob{
 		historyBank:                            historyBank,

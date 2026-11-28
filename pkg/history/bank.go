@@ -46,10 +46,22 @@ type ChunkBank struct {
 	EvictedBlockhash  [32]byte
 }
 
+// BaseBank is the bank as of the block before a fold. It is kept with the
+// first chunk of each segment, so the blocks at the start of history, whose
+// parent no chunk covers, can be replayed like any other: BankAt and
+// ChunkBankAtOrBefore return it, and accounts are read as of its slot.
+type BaseBank struct {
+	Slot  SlotBank  // Parent is 0
+	Chunk ChunkBank // Chunk.Slot == Slot.Slot
+}
+
 // BankData is the bank context of one fold.
 type BankData struct {
 	Slots []SlotBank // ascending
 	Top   *ChunkBank
+	// Base is the bank before the fold's first block; the store keeps it only
+	// when the fold starts a segment.
+	Base *BaseBank
 	// Sidecars are other per-fold records kept with the chunk, by kind (lower
 	// case letters and digits), such as replay hints. Each is stored in its
 	// own file, removed with the chunk, and read back with SidecarAt.
@@ -156,37 +168,92 @@ const (
 
 func bankFileName(from, to uint64) string { return fmt.Sprintf("bank-%020d-%020d.hbk", from, to) }
 
+func appendSlotBank(out []byte, r *SlotBank) []byte {
+	out = binary.LittleEndian.AppendUint64(out, r.Slot)
+	out = binary.LittleEndian.AppendUint64(out, r.Parent)
+	out = binary.LittleEndian.AppendUint64(out, r.BlockHeight)
+	out = binary.LittleEndian.AppendUint64(out, r.LamportsPerSignature)
+	out = binary.LittleEndian.AppendUint64(out, r.PrevLamportsPerSignature)
+	out = binary.LittleEndian.AppendUint64(out, r.NumSignatures)
+	out = append(out, r.Bankhash[:]...)
+	return append(out, r.Blockhash[:]...)
+}
+
+func appendChunkBank(out []byte, t *ChunkBank) []byte {
+	out = binary.LittleEndian.AppendUint64(out, t.Slot)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(t.AccountsLtHash)))
+	out = append(out, t.AccountsLtHash...)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(t.RecentBlockhashes)))
+	for _, e := range t.RecentBlockhashes {
+		out = append(out, e.Blockhash[:]...)
+		out = binary.LittleEndian.AppendUint64(out, e.LamportsPerSignature)
+	}
+	return append(out, t.EvictedBlockhash[:]...)
+}
+
+// encodeBank writes the slot records, then the chunk record and the base
+// record, each behind a presence byte. Files written before base records
+// existed end after the chunk record.
 func encodeBank(b *BankData) []byte {
 	out := []byte(bankMagic)
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(b.Slots)))
-	for _, r := range b.Slots {
-		out = binary.LittleEndian.AppendUint64(out, r.Slot)
-		out = binary.LittleEndian.AppendUint64(out, r.Parent)
-		out = binary.LittleEndian.AppendUint64(out, r.BlockHeight)
-		out = binary.LittleEndian.AppendUint64(out, r.LamportsPerSignature)
-		out = binary.LittleEndian.AppendUint64(out, r.PrevLamportsPerSignature)
-		out = binary.LittleEndian.AppendUint64(out, r.NumSignatures)
-		out = append(out, r.Bankhash[:]...)
-		out = append(out, r.Blockhash[:]...)
+	for i := range b.Slots {
+		out = appendSlotBank(out, &b.Slots[i])
 	}
 	if t := b.Top; t != nil {
 		out = append(out, 1)
-		out = binary.LittleEndian.AppendUint64(out, t.Slot)
-		out = binary.LittleEndian.AppendUint32(out, uint32(len(t.AccountsLtHash)))
-		out = append(out, t.AccountsLtHash...)
-		out = binary.LittleEndian.AppendUint32(out, uint32(len(t.RecentBlockhashes)))
-		for _, e := range t.RecentBlockhashes {
-			out = append(out, e.Blockhash[:]...)
-			out = binary.LittleEndian.AppendUint64(out, e.LamportsPerSignature)
-		}
-		out = append(out, t.EvictedBlockhash[:]...)
+		out = appendChunkBank(out, t)
 	} else {
 		out = append(out, 0)
+	}
+	if base := b.Base; base != nil {
+		out = append(out, 1)
+		out = appendSlotBank(out, &base.Slot)
+		out = appendChunkBank(out, &base.Chunk)
 	}
 	return binary.LittleEndian.AppendUint32(out, crc32.ChecksumIEEE(out))
 }
 
 var errBank = errors.New("history: malformed bank file")
+
+func decodeSlotBank(p []byte, r *SlotBank) {
+	r.Slot = binary.LittleEndian.Uint64(p)
+	r.Parent = binary.LittleEndian.Uint64(p[8:])
+	r.BlockHeight = binary.LittleEndian.Uint64(p[16:])
+	r.LamportsPerSignature = binary.LittleEndian.Uint64(p[24:])
+	r.PrevLamportsPerSignature = binary.LittleEndian.Uint64(p[32:])
+	r.NumSignatures = binary.LittleEndian.Uint64(p[40:])
+	copy(r.Bankhash[:], p[48:80])
+	copy(r.Blockhash[:], p[80:112])
+}
+
+// decodeChunkBank reads one chunk record and returns the bytes after it.
+func decodeChunkBank(p []byte, t *ChunkBank) ([]byte, error) {
+	if len(p) < 12 {
+		return nil, errBank
+	}
+	t.Slot = binary.LittleEndian.Uint64(p)
+	l := int(binary.LittleEndian.Uint32(p[8:]))
+	p = p[12:]
+	if len(p) < l+4 {
+		return nil, errBank
+	}
+	t.AccountsLtHash = append([]byte(nil), p[:l]...)
+	p = p[l:]
+	m := int(binary.LittleEndian.Uint32(p))
+	p = p[4:]
+	if m < 0 || len(p) < m*40+32 {
+		return nil, errBank
+	}
+	t.RecentBlockhashes = make([]BlockhashFee, m)
+	for i := range t.RecentBlockhashes {
+		copy(t.RecentBlockhashes[i].Blockhash[:], p[:32])
+		t.RecentBlockhashes[i].LamportsPerSignature = binary.LittleEndian.Uint64(p[32:])
+		p = p[40:]
+	}
+	copy(t.EvictedBlockhash[:], p[:32])
+	return p[32:], nil
+}
 
 func decodeBank(b []byte) (*BankData, error) {
 	if len(b) < len(bankMagic)+4+1+4 || string(b[:len(bankMagic)]) != bankMagic {
@@ -199,48 +266,33 @@ func decodeBank(b []byte) (*BankData, error) {
 	p := body[len(bankMagic):]
 	n := int(binary.LittleEndian.Uint32(p))
 	p = p[4:]
-	if len(p) < n*slotBankBytes+1 {
+	if n < 0 || len(p) < n*slotBankBytes+1 {
 		return nil, errBank
 	}
 	d := &BankData{Slots: make([]SlotBank, n)}
 	for i := range d.Slots {
-		r := &d.Slots[i]
-		r.Slot = binary.LittleEndian.Uint64(p)
-		r.Parent = binary.LittleEndian.Uint64(p[8:])
-		r.BlockHeight = binary.LittleEndian.Uint64(p[16:])
-		r.LamportsPerSignature = binary.LittleEndian.Uint64(p[24:])
-		r.PrevLamportsPerSignature = binary.LittleEndian.Uint64(p[32:])
-		r.NumSignatures = binary.LittleEndian.Uint64(p[40:])
-		copy(r.Bankhash[:], p[48:80])
-		copy(r.Blockhash[:], p[80:112])
+		decodeSlotBank(p, &d.Slots[i])
 		p = p[slotBankBytes:]
 	}
-	if p[0] == 1 {
+	hasTop := p[0]
+	p = p[1:]
+	var err error
+	if hasTop == 1 {
+		d.Top = &ChunkBank{}
+		if p, err = decodeChunkBank(p, d.Top); err != nil {
+			return nil, err
+		}
+	}
+	if len(p) > 0 && p[0] == 1 {
 		p = p[1:]
-		if len(p) < 12 {
+		if len(p) < slotBankBytes {
 			return nil, errBank
 		}
-		t := &ChunkBank{Slot: binary.LittleEndian.Uint64(p)}
-		l := int(binary.LittleEndian.Uint32(p[8:]))
-		p = p[12:]
-		if len(p) < l+4 {
-			return nil, errBank
+		d.Base = &BaseBank{}
+		decodeSlotBank(p, &d.Base.Slot)
+		if _, err = decodeChunkBank(p[slotBankBytes:], &d.Base.Chunk); err != nil {
+			return nil, err
 		}
-		t.AccountsLtHash = append([]byte(nil), p[:l]...)
-		p = p[l:]
-		m := int(binary.LittleEndian.Uint32(p))
-		p = p[4:]
-		if len(p) < m*40+32 {
-			return nil, errBank
-		}
-		t.RecentBlockhashes = make([]BlockhashFee, m)
-		for i := range t.RecentBlockhashes {
-			copy(t.RecentBlockhashes[i].Blockhash[:], p[:32])
-			t.RecentBlockhashes[i].LamportsPerSignature = binary.LittleEndian.Uint64(p[32:])
-			p = p[40:]
-		}
-		copy(t.EvictedBlockhash[:], p[:32])
-		d.Top = t
 	}
 	return d, nil
 }
@@ -317,6 +369,13 @@ func (s *Store) BankAt(slot uint64) (SlotBank, error) {
 	var path string
 	if i >= 0 {
 		path = s.segments[i].chunks[j].bankPath()
+	} else if len(s.segments) > 0 {
+		// The block before the oldest chunk: its segment's base record.
+		if base := s.segments[0].base; base != nil && base.Slot == slot {
+			r := *base
+			s.mu.RUnlock()
+			return r, nil
+		}
 	}
 	s.mu.RUnlock()
 	if path == "" {
@@ -346,7 +405,8 @@ func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 	for i := len(s.segments) - 1; i >= 0; i-- {
 		seg := s.segments[i]
 		for j := len(seg.chunks) - 1; j >= 0; j-- {
-			if seg.chunks[j].from <= slot {
+			// A segment's first chunk also holds the base record before it.
+			if seg.chunks[j].from <= slot || (j == 0 && seg.base != nil && seg.base.Slot <= slot) {
 				paths = append(paths, seg.chunks[j].bankPath())
 			}
 		}
@@ -360,14 +420,34 @@ func (s *Store) ChunkBankAtOrBefore(slot uint64) (*ChunkBank, error) {
 		if err != nil {
 			return nil, err
 		}
-		if d.Top != nil && d.Top.Slot <= slot {
-			c := *d.Top // a copy: the parsed file is cached
-			c.AccountsLtHash = append([]byte(nil), d.Top.AccountsLtHash...)
-			c.RecentBlockhashes = append([]BlockhashFee(nil), d.Top.RecentBlockhashes...)
-			return &c, nil
+		// A chunk's own record is newer than the base kept before it.
+		for _, t := range []*ChunkBank{d.Top, baseChunk(d)} {
+			if t != nil && t.Slot <= slot {
+				c := *t // a copy: the parsed file is cached
+				c.AccountsLtHash = append([]byte(nil), t.AccountsLtHash...)
+				c.RecentBlockhashes = append([]BlockhashFee(nil), t.RecentBlockhashes...)
+				return &c, nil
+			}
 		}
 	}
 	return nil, ErrNoBank
+}
+
+func baseChunk(d *BankData) *ChunkBank {
+	if d.Base == nil {
+		return nil
+	}
+	return &d.Base.Chunk
+}
+
+// readBase returns the base record kept with a segment's first chunk, or nil.
+func readBase(c *chunkMeta) *SlotBank {
+	d, err := readBankFile(c.bankPath())
+	if err != nil || d.Base == nil || d.Base.Slot.Slot >= c.from {
+		return nil
+	}
+	r := d.Base.Slot
+	return &r
 }
 
 // lastBankSlot returns the slot of the newest bank record, or 0. Caller holds s.mu.
