@@ -425,13 +425,14 @@ func instructionErrorValue(err error) (any, error) {
 	if errors.Is(err, sealevel.InstrErrCustom) {
 		return nil, errors.New("custom instruction error has no code")
 	}
-	name := err.Error()
+	var leaf error
 	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
 		if sealevel.IsCustomErr(cause) {
 			return map[string]uint32{"Custom": uint32(sealevel.TranslateErrToErrCode(cause))}, nil
 		}
-		name = cause.Error()
+		leaf = cause
 	}
+	name := leaf.Error()
 	switch {
 	case strings.HasPrefix(name, "InstrErr"):
 		return strings.TrimPrefix(name, "InstrErr"), nil
@@ -445,6 +446,11 @@ func instructionErrorValue(err error) (any, error) {
 // for unit variants, single-key object for tuple variants such as
 // {"InstructionError":[idx, inner]}.
 func (e *TransactionError) MarshalJSON() ([]byte, error) {
+	return e.marshalJSON(0)
+}
+
+// marshalJSON bounds stored instruction error text after protocol normalization.
+func (e *TransactionError) marshalJSON(maxInstructionErrorText int) ([]byte, error) {
 	if e == nil {
 		return []byte("null"), nil
 	}
@@ -453,6 +459,9 @@ func (e *TransactionError) MarshalJSON() ([]byte, error) {
 		instructionError, err := instructionErrorValue(e.InstructionError)
 		if err != nil {
 			return nil, err
+		}
+		if name, ok := instructionError.(string); ok && maxInstructionErrorText > 0 && len(name) > maxInstructionErrorText {
+			return nil, errMetadataBudget
 		}
 		var idx uint8
 		if e.InstructionIndex != nil {

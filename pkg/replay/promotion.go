@@ -75,6 +75,12 @@ type blockAccountSource interface {
 	GetAccountsBatch(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, error)
 }
 
+// boundedAccountReader rejects oversized data before copying or decoding it.
+// Optional metadata must not fall back to an unbounded read when unavailable.
+type boundedAccountReader interface {
+	GetAccountWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error)
+}
+
 // sharedBlockAccountSource is the read-only fast path used solely to build a
 // block's immutable parent snapshot. Public reads retain their owned-copy
 // semantics; implementations may return cache/WorkingSet-backed pointers here.
@@ -165,9 +171,11 @@ type unrootedTail struct {
 	// its first snapshot from AccountsDB, while an in-loop fork unwind needs the
 	// exact surviving unrooted parent rather than the process-global cache left
 	// by the abandoned suffix.
-	bankSysvars map[uint64]*sealevel.BankSysvars
-	epochCaches map[uint64]*global.EpochCacheSnapshot
-	forkStates  map[uint64]*replayForkState
+	bankSysvars         map[uint64]*sealevel.BankSysvars
+	epochCaches         map[uint64]*global.EpochCacheSnapshot
+	forkStates          map[uint64]*replayForkState
+	executionBanks      map[uint64]*ChainTipSnapshot
+	rootedExecutionBank *ChainTipSnapshot
 	// Keep one durable anchor: routine switches often return exactly to the
 	// latest applied fold, whose account layers have already left the tail.
 	rootContext     *state.ResumeContext
@@ -193,19 +201,20 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		batchSlots = defaultFoldBatchSlots
 	}
 	return &unrootedTail{
-		overlay:      accounts.NewWorkingSet(),
-		durable:      durable,
-		committer:    committer,
-		bankhashes:   make(map[uint64][32]byte),
-		batchSlots:   batchSlots,
-		foldMaxBytes: FoldMaxBytes,
-		maxBytes:     WorkingSetMaxBytes,
-		stakeIdxDir:  stakeIdxDir,
-		contexts:     make(map[uint64]*state.ResumeContext),
-		bankSysvars:  make(map[uint64]*sealevel.BankSysvars),
-		epochCaches:  make(map[uint64]*global.EpochCacheSnapshot),
-		forkStates:   make(map[uint64]*replayForkState),
-		haltCap:      haltCap,
+		overlay:        accounts.NewWorkingSet(),
+		durable:        durable,
+		committer:      committer,
+		bankhashes:     make(map[uint64][32]byte),
+		batchSlots:     batchSlots,
+		foldMaxBytes:   FoldMaxBytes,
+		maxBytes:       WorkingSetMaxBytes,
+		stakeIdxDir:    stakeIdxDir,
+		contexts:       make(map[uint64]*state.ResumeContext),
+		bankSysvars:    make(map[uint64]*sealevel.BankSysvars),
+		epochCaches:    make(map[uint64]*global.EpochCacheSnapshot),
+		forkStates:     make(map[uint64]*replayForkState),
+		executionBanks: make(map[uint64]*ChainTipSnapshot),
+		haltCap:        haltCap,
 	}
 }
 
@@ -229,6 +238,32 @@ func (t *unrootedTail) GetAccount(slot uint64, pubkey solana.PublicKey) (*accoun
 	a, err := t.durable.GetAccount(slot, pubkey)
 	if err != nil || a == nil {
 		return a, err
+	}
+	return a.Clone(), nil
+}
+
+// AccountReadVersion changes with every mutation of this tail's account view.
+func (t *unrootedTail) AccountReadVersion() uint64 { return t.overlay.Revision() }
+
+// GetAccountWithDataLimit preserves unrooted precedence and owned-copy results
+// while checking the data size before either layer can copy or decode it.
+func (t *unrootedTail) GetAccountWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		if uint64(len(a.Data)) > maxDataBytes {
+			return nil, fmt.Errorf("%w: %d bytes exceeds %d", accountsdb.ErrAccountDataLimit, len(a.Data), maxDataBytes)
+		}
+		return a.Clone(), nil
+	}
+	reader, ok := t.durable.(boundedAccountReader)
+	if !ok {
+		return nil, errors.New("durable account reader does not support bounded reads")
+	}
+	a, err := reader.GetAccountWithDataLimit(slot, pubkey, maxDataBytes)
+	if err != nil || a == nil {
+		return a, err
+	}
+	if uint64(len(a.Data)) > maxDataBytes {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", accountsdb.ErrAccountDataLimit, len(a.Data), maxDataBytes)
 	}
 	return a.Clone(), nil
 }
@@ -435,6 +470,7 @@ func (t *unrootedTail) SetContext(slot uint64, ctx *state.ResumeContext, bankSys
 		t.contexts[slot] = ctx
 		t.epochCaches[slot] = global.CaptureEpochCaches()
 		delete(t.bankSysvars, slot)
+		delete(t.executionBanks, slot)
 		if len(bankSysvars) > 0 && bankSysvars[0] != nil {
 			t.bankSysvars[slot] = bankSysvars[0]
 		}
@@ -461,6 +497,7 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 	}
 	ctx := t.contexts[promotedThrough] // context as of the last rooted slot (read before pruning)
 	t.retainRootAnchor(promotedThrough, ctx)
+	t.rootedExecutionBank = t.executionBanks[promotedThrough]
 	for s := range t.contexts {
 		if s <= promotedThrough {
 			delete(t.contexts, s)
@@ -469,6 +506,11 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 	for s := range t.bankSysvars {
 		if s <= promotedThrough {
 			delete(t.bankSysvars, s)
+		}
+	}
+	for s := range t.executionBanks {
+		if s <= promotedThrough {
+			delete(t.executionBanks, s)
 		}
 	}
 	return promotedThrough, ctx, err
@@ -509,6 +551,7 @@ type foldJob struct {
 	through                                uint64
 	bankhashes                             map[uint64][32]byte
 	ctx                                    *state.ResumeContext
+	executionBank                          *ChainTipSnapshot
 	stakeTotals                            map[solana.PublicKey]voteDelegation // the totals ctx carries (nil: none)
 	ctxJSON                                []byte
 	stakeIdxDir                            string
@@ -599,6 +642,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		through:                                through,
 		bankhashes:                             bankhashes,
 		ctx:                                    ctx,
+		executionBank:                          t.executionBanks[through],
 		stakeTotals:                            stakeTotals,
 		stakeIdxDir:                            t.stakeIdxDir,
 		transactionStatusSnapshot:              snapshot,
@@ -727,6 +771,7 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 	t.retainRootAnchor(job.through, job.ctx)
 	t.stakeTotals.commitThrough(job.through, job.stakeTotals)
 	t.overlay.PromotePrefix(job.through)
+	t.rootedExecutionBank = job.executionBank
 	for s := range t.bankhashes {
 		if s <= job.through {
 			delete(t.bankhashes, s)
@@ -740,6 +785,11 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 	for s := range t.bankSysvars {
 		if s <= job.through {
 			delete(t.bankSysvars, s)
+		}
+	}
+	for s := range t.executionBanks {
+		if s <= job.through {
+			delete(t.executionBanks, s)
 		}
 	}
 	return job.ctx
@@ -941,6 +991,7 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 		if slot >= fromSlot {
 			delete(t.contexts, slot)
 			delete(t.bankSysvars, slot)
+			delete(t.executionBanks, slot)
 			delete(t.epochCaches, slot)
 			delete(t.forkStates, slot)
 		}

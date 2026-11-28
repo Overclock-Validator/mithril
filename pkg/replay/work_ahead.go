@@ -273,15 +273,16 @@ func payerLastFailed(payer solana.PublicKey) bool {
 }
 
 type workAhead struct {
-	slotCtx *sealevel.SlotCtx
-	overlay *accounts.OverlayAccounts
-	txs     []*solana.Transaction
-	txMetas []*rpc.TransactionMeta
-	execute []bool
-	access  []atomic.Pointer[plannerTransactionAccounts] // built on demand
-	dbgOpts *DebugOptions
-	entries []atomic.Pointer[workAheadEntry]
-	queue   chan int
+	slotCtx        *sealevel.SlotCtx
+	overlay        *accounts.OverlayAccounts
+	txs            []*solana.Transaction
+	txMetas        []*rpc.TransactionMeta
+	execute        []bool
+	access         []atomic.Pointer[plannerTransactionAccounts] // built on demand
+	dbgOpts        *DebugOptions
+	recordMetadata bool
+	entries        []atomic.Pointer[workAheadEntry]
+	queue          chan int
 	// offers carries the dispatcher's offers to the offer goroutine, which
 	// decides admissibility off the dispatcher's path. offerDone is made when
 	// that goroutine starts and closed when it exits; it stays nil when no
@@ -330,7 +331,7 @@ type workAhead struct {
 }
 
 // newWorkAhead returns nil when work-ahead is off or cannot run for this view.
-func newWorkAhead(slotCtx *sealevel.SlotCtx, view *b.Block, execute []bool, dbgOpts *DebugOptions) *workAhead {
+func newWorkAhead(slotCtx *sealevel.SlotCtx, view *b.Block, execute []bool, dbgOpts *DebugOptions, recordMetadata bool) *workAhead {
 	// A locally produced block is never executed early: the producer's own
 	// execution is its bank, and nothing checks it against another footer.
 	if !workAheadEnabled || workAheadTripped.Load() || slotCtx == nil || view == nil || view.FromLocalProduction || !schedulingOnFor(slotCtx.Slot) {
@@ -351,23 +352,24 @@ func newWorkAhead(slotCtx *sealevel.SlotCtx, view *b.Block, execute []bool, dbgO
 		}
 	})
 	w := &workAhead{
-		slotCtx:   slotCtx,
-		overlay:   overlay,
-		txs:       view.Transactions,
-		txMetas:   view.TxMetas,
-		execute:   execute,
-		access:    make([]atomic.Pointer[plannerTransactionAccounts], len(view.Transactions)),
-		dbgOpts:   dbgOpts,
-		entries:   make([]atomic.Pointer[workAheadEntry], len(view.Transactions)),
-		started:   earlyOfferChannel(len(view.Transactions)),
-		outcome:   make([]atomic.Uint32, len(view.Transactions)),
-		failFee:   make([]atomic.Uint64, len(view.Transactions)),
-		progKey:   make([]atomic.Uint64, len(view.Transactions)),
-		durNs:     make([]atomic.Int64, len(view.Transactions)),
-		assumedBy: make([]atomic.Pointer[[]int32], len(view.Transactions)),
-		acctFails: make(map[solana.PublicKey][2]uint32),
-		offers:    make(chan workAheadOffer, 4*len(view.Transactions)),
-		queue:     make(chan int, 2*len(view.Transactions)),
+		slotCtx:        slotCtx,
+		overlay:        overlay,
+		txs:            view.Transactions,
+		txMetas:        view.TxMetas,
+		execute:        execute,
+		access:         make([]atomic.Pointer[plannerTransactionAccounts], len(view.Transactions)),
+		dbgOpts:        dbgOpts,
+		recordMetadata: recordMetadata,
+		entries:        make([]atomic.Pointer[workAheadEntry], len(view.Transactions)),
+		started:        earlyOfferChannel(len(view.Transactions)),
+		outcome:        make([]atomic.Uint32, len(view.Transactions)),
+		failFee:        make([]atomic.Uint64, len(view.Transactions)),
+		progKey:        make([]atomic.Uint64, len(view.Transactions)),
+		durNs:          make([]atomic.Int64, len(view.Transactions)),
+		assumedBy:      make([]atomic.Pointer[[]int32], len(view.Transactions)),
+		acctFails:      make(map[solana.PublicKey][2]uint32),
+		offers:         make(chan workAheadOffer, 4*len(view.Transactions)),
+		queue:          make(chan int, 2*len(view.Transactions)),
 	}
 	w.slot = slotCtx.Slot
 	if workAheadPressureLog {
@@ -804,7 +806,7 @@ func (w *workAhead) run(idx int) {
 		}
 	}
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
-	input := transactionExecutionInput(sealed, tx, w.txMeta(idx), workerArena, false, captureTx)
+	input := transactionExecutionInput(sealed, tx, w.txMeta(idx), workerArena, false, captureTx, w.recordMetadata)
 	input.Speculative = true
 	if workAheadCancel {
 		input.SpeculativeCancel = &e.cancel
@@ -1055,7 +1057,7 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 		e.verifying = true
 		w.settle(e, false)
 		e.mu.Unlock()
-		input := transactionExecutionInput(w.slotCtx, w.txs[idx], w.txMeta(idx), nil, false, false)
+		input := transactionExecutionInput(w.slotCtx, w.txs[idx], w.txMeta(idx), nil, false, false, w.recordMetadata)
 		input.Speculative = true
 		canonStart := time.Now()
 		canonical, canonicalPanicked, msg := workAheadExecute(input)

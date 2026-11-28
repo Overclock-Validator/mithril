@@ -73,7 +73,8 @@ type LoadAndExecuteTransactionInput struct {
 	CapturePreBalances bool
 	// RecordLogs retains execution logs in lean mode. Rich mode always records
 	// them for RPC compatibility.
-	RecordLogs bool
+	RecordLogs      bool
+	boundedMetadata bool
 }
 
 // LoadAndExecuteTransaction is a pure function that loads and executes a transaction.
@@ -354,7 +355,11 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	var logRecorder *sealevel.LogRecorder
 	var logger sealevel.Logger = discardLogger{}
 	if !input.LeanResult || input.RecordLogs {
-		logRecorder = new(sealevel.LogRecorder)
+		if input.boundedMetadata {
+			logRecorder = sealevel.NewBoundedLogRecorder()
+		} else {
+			logRecorder = new(sealevel.LogRecorder)
+		}
 		logger = logRecorder
 	}
 	execCtx := newExecCtx(slotCtx, transactionAccts, computeBudgetLimits, logger)
@@ -373,6 +378,9 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	execCtx.TimingRecorder = input.TimingRecorder
 	defer func() { execCtx.TimingRecorder = nil }()
 	execCtx.RecordInnerInstructions = input.RecordInnerInstructions
+	if input.RecordInnerInstructions && input.boundedMetadata {
+		execCtx.EnableBoundedInnerInstructions()
+	}
 
 	// Capture pre-balance lamports (before fee deduction)
 	var preBalances []uint64
@@ -701,15 +709,9 @@ func mapLoadErrorType(err error) TransactionErrorType {
 	}
 }
 
-// AssembleInnerInstructions groups CPI captures from execCtx by their
-// top-level instruction index and converts them into the response shape.
-// Returns nil when no captures were recorded (e.g. simulate without
-// innerInstructions=true, or block-replay).
-//
-// Exported so the simulate RPC handler can reach into a partially-executed
-// execCtx on the InstructionError path — Agave wire format keeps captured
-// CPIs on tx failure even though Mithril's bifurcated processing-result
-// type discards them via the TransactionError early-return.
+// AssembleInnerInstructions groups captured CPIs by top-level instruction.
+// It returns nil when no CPIs were recorded. Simulation and optional replay
+// metadata also use it after an instruction fails.
 func AssembleInnerInstructions(execCtx *sealevel.ExecutionCtx) []InnerInstructionsList {
 	if len(execCtx.InnerInstrs) == 0 {
 		return nil
