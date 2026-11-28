@@ -244,6 +244,9 @@ progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
 We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
 
+Use `getIdentity` to read the node's current public identity and `getVersion` to
+read its reported software version.
+
 ### Current Limitations
 
 - **RPC still required**: live near-tip blocks stream from turbine shreds, but RPC `getBlock` is still used for catchup and by the trailing execution verifier (Alpenglow certificates attest block *data*, not execution results, so an external oracle cross-checks execution until peer bankhash cross-checking lands).
