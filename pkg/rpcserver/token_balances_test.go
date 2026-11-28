@@ -2,6 +2,9 @@ package rpcserver
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -17,9 +20,10 @@ func makeTokenAccount(t *testing.T, mint, owner solana.PublicKey, amount uint64)
 	copy(data[tokenAccountMintOffset:], mint[:])
 	copy(data[tokenAccountOwnerOffset:], owner[:])
 	binary.LittleEndian.PutUint64(data[tokenAccountAmountOffset:], amount)
+	data[108] = 1
 	var ownerArr [32]byte
 	copy(ownerArr[:], splTokenProgramID[:])
-	return &accounts.Account{Owner: ownerArr, Data: data}
+	return &accounts.Account{Owner: ownerArr, Lamports: 1, Data: data}
 }
 
 func TestExtractTokenBalances_DecodesMintOwnerAmount(t *testing.T) {
@@ -27,9 +31,9 @@ func TestExtractTokenBalances_DecodesMintOwnerAmount(t *testing.T) {
 	owner := solana.MustPublicKeyFromBase58("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
 	tokenAcct := makeTokenAccount(t, mint, owner, 1234567)
 
-	got := extractTokenBalances(
+	got := tokenBalanceIndices{0}.extractTokenBalances(
 		[]*accounts.Account{tokenAcct},
-		map[solana.PublicKey]uint8{mint: 6},
+		map[solana.PublicKey]tokenMintDecimals{mint: {splTokenProgramID, 6}},
 	)
 	require.Len(t, got, 1)
 	assert.Equal(t, mint.String(), got[0].Mint)
@@ -44,12 +48,12 @@ func TestExtractTokenBalances_DecodesMintOwnerAmount(t *testing.T) {
 
 func TestExtractTokenBalances_SkipsNonTokenAccounts(t *testing.T) {
 	wallet := &accounts.Account{Owner: [32]byte{1, 2, 3}, Data: make([]byte, 165)}
-	got := extractTokenBalances([]*accounts.Account{wallet}, map[solana.PublicKey]uint8{})
+	got := tokenBalanceIndices{0}.extractTokenBalances([]*accounts.Account{wallet}, nil)
 	assert.Empty(t, got)
 }
 
 func TestExtractTokenBalances_EmptyInputReturnsEmpty(t *testing.T) {
-	got := extractTokenBalances(nil, nil)
+	got := tokenBalanceIndices{0}.extractTokenBalances(nil, nil)
 	assert.NotNil(t, got)
 	assert.Empty(t, got)
 }
@@ -58,20 +62,17 @@ func TestExtractTokenBalances_TruncatedDataIsSkipped(t *testing.T) {
 	var ownerArr [32]byte
 	copy(ownerArr[:], splTokenProgramID[:])
 	short := &accounts.Account{Owner: ownerArr, Data: make([]byte, 100)}
-	got := extractTokenBalances([]*accounts.Account{short}, nil)
+	got := tokenBalanceIndices{0}.extractTokenBalances([]*accounts.Account{short}, nil)
 	assert.Empty(t, got)
 }
 
-func TestExtractTokenBalances_MissingDecimalsDefaultsToZero(t *testing.T) {
+func TestExtractTokenBalances_MissingDecimalsOmitted(t *testing.T) {
 	mint := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 	owner := solana.MustPublicKeyFromBase58("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
 	tokenAcct := makeTokenAccount(t, mint, owner, 42)
 
-	got := extractTokenBalances([]*accounts.Account{tokenAcct}, nil)
-	require.Len(t, got, 1)
-	assert.Equal(t, "42", got[0].UiTokenAmount.Amount)
-	assert.Equal(t, uint8(0), got[0].UiTokenAmount.Decimals)
-	assert.Equal(t, "42", got[0].UiTokenAmount.UiAmountString)
+	got := tokenBalanceIndices{0}.extractTokenBalances([]*accounts.Account{tokenAcct}, nil)
+	require.Empty(t, got)
 }
 
 func TestExtractTokenBalances_Token2022ProgramIdDistinguished(t *testing.T) {
@@ -82,7 +83,7 @@ func TestExtractTokenBalances_Token2022ProgramIdDistinguished(t *testing.T) {
 	copy(ownerArr[:], splToken2022ProgramID[:])
 	tokenAcct.Owner = ownerArr
 
-	got := extractTokenBalances([]*accounts.Account{tokenAcct}, map[solana.PublicKey]uint8{mint: 9})
+	got := tokenBalanceIndices{0}.extractTokenBalances([]*accounts.Account{tokenAcct}, map[solana.PublicKey]tokenMintDecimals{mint: {splToken2022ProgramID, 9}})
 	require.Len(t, got, 1)
 	assert.Equal(t, splToken2022ProgramID.String(), got[0].ProgramId)
 }
@@ -126,4 +127,35 @@ func TestUiAmountStringForRaw_LargeAmountModerateDecimals(t *testing.T) {
 	// 9007199254740993 is 2^53 + 1, the first integer not exactly
 	// representable in float64. The string path must still be exact.
 	assert.Equal(t, "9007199254.740993", uiAmountStringForRaw(9007199254740993, 6))
+}
+
+func TestUiAmountForRaw_JSON(t *testing.T) {
+	for _, tc := range []struct {
+		amount   uint64
+		decimals uint8
+		numeric  string
+		text     string
+	}{
+		{0, 0, "0", "0"},
+		{1, 0, "1", "1"},
+		{1, 19, "1e-19", "0.0000000000000000001"},
+		{1, 20, "null", "0.00000000000000000001"},
+		{0, 20, "null", "0"},
+		{^uint64(0), 20, "null", "0.18446744073709551615"},
+		{^uint64(0), 25, "null", "0.0000018446744073709551615"},
+		{1, 255, "null", "0." + strings.Repeat("0", 254) + "1"},
+	} {
+		t.Run(fmt.Sprintf("%d/%d", tc.amount, tc.decimals), func(t *testing.T) {
+			mint := solana.PublicKey{1}
+			balances := tokenBalanceIndices{0}.extractTokenBalances(
+				[]*accounts.Account{makeTokenAccount(t, mint, solana.PublicKey{2}, tc.amount)},
+				map[solana.PublicKey]tokenMintDecimals{mint: {splTokenProgramID, tc.decimals}},
+			)
+			require.Len(t, balances, 1)
+			raw, err := json.Marshal(balances[0].UiTokenAmount)
+			require.NoError(t, err)
+			want := fmt.Sprintf(`{"amount":"%d","decimals":%d,"uiAmount":%s,"uiAmountString":%q}`, tc.amount, tc.decimals, tc.numeric, tc.text)
+			assert.JSONEq(t, want, string(raw))
+		})
+	}
 }

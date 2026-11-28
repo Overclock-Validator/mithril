@@ -41,6 +41,19 @@ func TestEpochLeaderSchedulesCoexist(t *testing.T) {
 	}
 }
 
+func TestScheduleSnapshotDetectsRestore(t *testing.T) {
+	original := CaptureEpochCaches()
+	t.Cleanup(func() { RestoreEpochCaches(original) })
+	SetLeaderSchedule(testLeaderSchedule(testLeader(3), 10))
+	saved := CaptureEpochCaches()
+	view := CaptureLeaderSchedules()
+	SetLeaderSchedule(nil)
+	RestoreEpochCaches(saved)
+	if view.Current() || view.ForEpoch(0) != CaptureLeaderSchedules().ForEpoch(0) {
+		t.Fatal("restoring the same schedule must invalidate the earlier read generation")
+	}
+}
+
 func TestEpochLeaderScheduleConcurrentReadsAndReplacement(t *testing.T) {
 	SetLeaderSchedule(nil)
 	t.Cleanup(func() { SetLeaderSchedule(nil) })

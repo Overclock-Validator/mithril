@@ -296,9 +296,7 @@ type ResumeContext struct {
 	// TransactionCount is the running chain transaction count as of this slot, so
 	// resume and the in-loop fork-switch unwind restore it exactly (getEpochInfo
 	// and future bank metadata must not carry a discarded fork's transactions).
-	// A pointer so presence is explicit: nil = context predates the field
-	// (callers fall back to the snapshot-manifest count and flag the count as
-	// approximate); non-nil is exact even when the value is zero (dev genesis).
+	// Nil means the cumulative count is unknown; zero is a valid known count.
 	TransactionCount *uint64 `json:"transaction_count,omitempty"`
 	// TransactionStatusCheckpoint is durability metadata, not execution state.
 	// Startup and rewind consume it before replay; ResumeState intentionally does

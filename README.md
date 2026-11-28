@@ -225,11 +225,20 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 
 **Currently supported RPC methods:**
 - `getAccountInfo` - Get account data and lamports
+- `getBalance` - Get an account's lamport balance
 - `getBankHash` - Get bankhash for a slot (Mithril extension, not standard Solana RPC)
 - `getBlockHeight` - Get current block height
+- `getBlockProduction` - Get produced and assigned block counts by validator
+- `getBlock` - Get retained block summaries
 - `getEpochInfo` - Get current epoch info
 - `getInflationReward` - Get retained inflation rewards for an epoch
+- `getGenesisHash` - Get the cluster genesis hash
 - `getLatestBlockhash` - Get recent blockhash
+- `getLeaderSchedule` - Get the leader schedule for an epoch
+- `getSlot` - Get the slot at the requested commitment (defaults to finalized)
+- `getVoteAccounts` - Get current and delinquent vote accounts
+- `sendTransaction` - Forward a signed transaction to upcoming leaders. The node sends one round, even when `maxRetries` is set. A returned signature does not confirm the transaction.
+- `simulateTransaction` - Simulate a transaction
 
 On Alpenglow, `getInflationReward` can publish verified canonical rewards before
 the account checkpoint reaches disk. `confirmed` and `finalized` share that view;
@@ -242,7 +251,10 @@ Credited rewards are readable while other staking partitions are still pending.
 Requests for pending partitions return `-32017` with verified distribution
 progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
-We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
+`getSlot` accepts an optional config object with `commitment` and `minContextSlot`.
+On Alpenglow, `processed` uses the live replay slot; `confirmed` and `finalized`
+use the published rooted slot. If that slot is below `minContextSlot`, the request
+returns error `-32016` with the available slot in `data.contextSlot`.
 
 ### Current Limitations
 

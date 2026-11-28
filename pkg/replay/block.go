@@ -47,9 +47,11 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
-// SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
+// SlotCtxSetter is implemented by the RPC server so replay can publish both
+// its live execution bank and the latest bank durably folded into AccountsDB.
 type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
+	PublishRootedBankState(slot, blockHeight uint64, transactionCount *uint64)
 }
 
 type epochRewardPublisher interface {
@@ -62,6 +64,18 @@ type epochRewardPublisher interface {
 type epochRewardReadPublisher interface {
 	PublishEpochRewards(slot uint64)
 	ResetEpochRewardView()
+}
+
+type blockHistoryPublisher interface {
+	RecordBlockHistory(block *b.Block) error
+	RecordSkippedBlockHistory(slot uint64) error
+	PrepareBlockHistory(through uint64) error
+	SetRootedBlockHistorySlot(slot uint64) error
+	DiscardUnrootedBlockHistory(from uint64) error
+}
+
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -232,8 +246,7 @@ type ResumeState struct {
 	InflationTaper          float64
 	InflationFoundation     float64
 	InflationFoundationTerm float64
-	// TransactionCount as of the resume slot. nil = the source context predates
-	// the field (seed from the snapshot manifest, approximate); non-nil is exact.
+	// TransactionCount is nil when there is no exact count for the resume slot.
 	TransactionCount *uint64
 	// DelegatedStake is the delegated stake per vote account in durable state
 	// as of the resume slot, from the rooted context. nil = the context did not
@@ -1846,6 +1859,12 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	// Node startup finishes any rewind and reconciles durable state before
 	// calling ReplayBlocks, so the first block's stake scan can start now and
 	// overlap block-source startup and the wait for the first block.
@@ -2000,16 +2019,12 @@ func ReplayBlocks(
 
 	// Seed the running transaction count. On resume, the checkpoint carries the
 	// exact count as of the last rooted slot; on a fresh start use the snapshot
-	// manifest. Set (not increment) so a re-replay in the same process never
-	// double-counts. A checkpoint from before the field existed can only be
-	// seeded approximately (the folded snapshot→root span is unrecorded) —
-	// warn rather than fail: the count is RPC/metadata, not consensus.
+	// manifest. Older checkpoints may lack the count for their rooted slot.
 	{
-		txCount, exact := resolveInitialTransactionCount(resumeState, mithrilState.ManifestTransactionCount)
+		txCount := resolveInitialTransactionCount(resumeState, mithrilState)
 		global.SetTransactionCount(txCount)
-		if !exact && mithrilState.LastRootedSlot > mithrilState.SnapshotSlot {
-			mlog.Log.Warnf("resume checkpoint at slot %d predates transaction-count tracking: transactionCount seeded from the snapshot (slot %d) and will read LOW by the folded span until the next re-bootstrap",
-				mithrilState.LastRootedSlot, mithrilState.SnapshotSlot)
+		if txCount == nil {
+			mlog.Log.Warnf("resume checkpoint has no cumulative transaction count; RPC will report null")
 		}
 	}
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(startEpoch) == startSlot
@@ -2215,6 +2230,11 @@ func ReplayBlocks(
 			if err != nil {
 				return nil, err
 			}
+			if historyPublisher != nil {
+				if err := historyPublisher.PrepareBlockHistory(through); err != nil {
+					return nil, fmt.Errorf("prepare block history: %w", err)
+				}
+			}
 			if rewardPublisher != nil {
 				if err := rewardPublisher.PrepareEpochRewards(through); err != nil {
 					return nil, fmt.Errorf("prepare epoch rewards: %w", err)
@@ -2224,9 +2244,13 @@ func ReplayBlocks(
 		},
 		AfterCommit: func(ref *state.TransactionStatusCheckpointRef) error {
 			var err error
+			if historyPublisher != nil {
+				// Forced flushes may commit several chunks before replay applies their results.
+				err = historyPublisher.SetRootedBlockHistorySlot(ref.Root)
+			}
 			if rewardPublisher != nil {
 				// Forced flushes may commit several chunks before replay applies their results.
-				err = rewardPublisher.SetRootedEpochRewardsSlot(ref.Root)
+				err = errors.Join(err, rewardPublisher.SetRootedEpochRewardsSlot(ref.Root))
 			}
 			if checkpointAfterCommit != nil {
 				err = errors.Join(err, checkpointAfterCommit(ref))
@@ -2301,10 +2325,18 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if historyPublisher != nil {
+			if err := historyPublisher.SetRootedBlockHistorySlot(promotedThrough); err != nil {
+				mlog.Log.Errorf("block history retention after rooted slot %d: %v", promotedThrough, err)
+			}
+		}
 		if rewardPublisher != nil {
 			if err := rewardPublisher.SetRootedEpochRewardsSlot(promotedThrough); err != nil {
 				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
 			}
+		}
+		if rpcServer != nil {
+			rpcServer.PublishRootedBankState(promotedThrough, rootedCtx.BlockHeight, rootedCtx.TransactionCount)
 		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
@@ -2686,6 +2718,10 @@ func ReplayBlocks(
 	} else {
 		blockStream = blockstream.NewBlockSource(opts)
 	}
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 	// Every state save records the repair peers that served this run well, so
 	// the next start can repair before gossip rediscovers peers.
 	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
@@ -2752,6 +2788,11 @@ func ReplayBlocks(
 	// retaining an already assembled alternate child).
 	handleAlpenglowSwitch := func(sw *CertifiedSwitch, rewindSource func() bool) bool {
 		switchStarted := time.Now()
+		needsUnwind := parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot())
+		if needsUnwind && health != nil {
+			// Stop serving the discarded RPC bank before waiting for durable writes.
+			health.InvalidateHealth()
+		}
 		if rewardReadPublisher != nil {
 			rewardReadPublisher.ResetEpochRewardView()
 		}
@@ -2779,7 +2820,14 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
-		if !parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot()) {
+		if historyPublisher != nil {
+			if err := historyPublisher.DiscardUnrootedBlockHistory(sw.Slot); err != nil {
+				result.Error = fmt.Errorf("%w: discard unrooted block history: %v", sw, err)
+				mlog.Log.Warnf("%v", result.Error)
+				return false
+			}
+		}
+		if !needsUnwind {
 			// Trailing skips advance replay's consumed frontier without creating
 			// account-state layers. Finalized ancestry can later require a block
 			// in that range; re-open its source slot and retain the executed bank.
@@ -2802,7 +2850,7 @@ func ReplayBlocks(
 		// Invalidate producer generations before touching their shared parent
 		// overlay or waiting for abandoned reward-plan readers to drain.
 		ResetChainTip()
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -2858,9 +2906,7 @@ func ReplayBlocks(
 		global.SetSlot(rs.ParentSlot)
 		global.SetEpoch(currentEpoch)
 		global.SetLatestBlockHash(rs.LastBlockhash)
-		if rs.TransactionCount != nil {
-			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
-		}
+		global.SetTransactionCount(resolveInitialTransactionCount(rs, mithrilState))
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
 		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
@@ -3266,6 +3312,13 @@ func ReplayBlocks(
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
 			streamer.discardSlot(block.Slot, "skipped")
+			if historyPublisher != nil {
+				if err := historyPublisher.RecordSkippedBlockHistory(block.Slot); err != nil {
+					result.Error = fmt.Errorf("record skipped block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
+			}
 			// Zero is the explicit locally consumed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
 			// or discovered ancestry require a source rewind and, when necessary,
@@ -3330,8 +3383,15 @@ func ReplayBlocks(
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
-		var configErr error
 		initialBlockConfigured := lastSlotCtx == nil
+		var historyParentBlockhash solana.Hash
+		if historyPublisher != nil && initialBlockConfigured {
+			historyParentBlockhash = initialLastBlockhash
+			if resumeState != nil {
+				historyParentBlockhash = solana.Hash(resumeState.LastBlockhash)
+			}
+		}
+		var configErr error
 		// Use lastSlotCtx == nil to detect first block, not currentSlot == startSlot.
 		// This handles the case where startSlot (or slots after it) are skipped -
 		// the first emitted block might have slot > startSlot.
@@ -3594,6 +3654,15 @@ func ReplayBlocks(
 			global.ClearPendingStakePubkeys()
 			break
 		}
+		if historyPublisher != nil {
+			if historyBlock := blockForHistory(block, historyParentBlockhash); historyBlock != nil {
+				if err := historyPublisher.RecordBlockHistory(historyBlock); err != nil {
+					result.Error = fmt.Errorf("record block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
+			}
+		}
 		if rewardPublisher != nil {
 			if err := rewardPublisher.RecordEpochRewards(block); err != nil {
 				result.Error = fmt.Errorf("record epoch rewards for slot %d: %w", block.Slot, err)
@@ -3664,6 +3733,9 @@ func ReplayBlocks(
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
+			if unrootedTailState == nil {
+				rpcServer.PublishRootedBankState(block.Slot, global.BlockHeight(), global.ExactTransactionCount())
+			}
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
@@ -3673,7 +3745,6 @@ func ReplayBlocks(
 		// promotion, so resume restarts from the last rooted slot not the lost in-RAM replayed tip.
 		if lastSlotCtx != nil {
 			resumeContextStart := time.Now()
-			txCountAtSlot := global.TransactionCount() // ProcessBlock already added this block's txs
 			var recentBlockhashes *sealevel.SysvarRecentBlockhashes
 			var slotHashes *sealevel.SysvarSlotHashes
 			if bankSysvars := lastSlotCtx.BankSysvars(); bankSysvars != nil {
@@ -3701,7 +3772,7 @@ func ReplayBlocks(
 				InflationTaper:          replayCtx.Inflation.Taper,
 				InflationFoundation:     replayCtx.Inflation.FoundationVal,
 				InflationFoundationTerm: replayCtx.Inflation.FoundationTerm,
-				TransactionCount:        &txCountAtSlot,
+				TransactionCount:        global.ExactTransactionCount(),
 			}
 			if block.HasAlpenglowBlockID {
 				resumeCtx.AlpenglowBlockID = solana.Hash(block.AlpenglowBlockID).String()
@@ -4118,6 +4189,11 @@ func ReplayBlocks(
 
 	if rewardReadPublisher != nil {
 		rewardReadPublisher.ResetEpochRewardView()
+	}
+
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
 	}
 
 	// Check if block source stalled (this provides explicit error info)

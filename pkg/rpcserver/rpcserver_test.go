@@ -10,7 +10,7 @@ import (
 
 func TestServeHTTPQuietlyHandlesUnsupportedMethod(t *testing.T) {
 	rpcServer := &RpcServer{}
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","method":"getSlot","id":7}`))
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","method":"unsupportedMethod","id":7}`))
 	rec := httptest.NewRecorder()
 
 	rpcServer.ServeHTTP(rec, req)
@@ -33,7 +33,7 @@ func TestServeHTTPQuietlyHandlesUnsupportedMethod(t *testing.T) {
 	if resp.JSONRPC != "2.0" || resp.ID != 7 {
 		t.Fatalf("unexpected response identity: %+v", resp)
 	}
-	if resp.Error.Code != -32601 || resp.Error.Message != "method 'getSlot' not found" {
+	if resp.Error.Code != -32601 || resp.Error.Message != "method 'unsupportedMethod' not found" {
 		t.Fatalf("unexpected error response: %+v", resp.Error)
 	}
 }

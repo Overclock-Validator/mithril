@@ -86,6 +86,7 @@ func TestEarlyProcessingResultsStillCollectTokenBalances(t *testing.T) {
 	copy(tokenData[tokenAccountMintOffset:], mintKey[:])
 	copy(tokenData[tokenAccountOwnerOffset:], ownerKey[:])
 	binary.LittleEndian.PutUint64(tokenData[tokenAccountAmountOffset:], 42)
+	tokenData[108] = 1
 
 	slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewMemAccounts()}
 	require.NoError(t, slotCtx.SetAccount(payerKey, &accounts.Account{
@@ -106,8 +107,11 @@ func TestEarlyProcessingResultsStillCollectTokenBalances(t *testing.T) {
 	pre, post := simulationAccountSnapshotsForOutput(slotCtx, tx, output)
 	require.Len(t, pre, len(tx.Message.AccountKeys))
 	require.Len(t, post, len(tx.Message.AccountKeys))
-	preTokens := tokenBalancesFromAccounts(pre, nil, 0)
-	postTokens := tokenBalancesFromAccounts(post, nil, 0)
+	mint := &accounts.Account{Key: mintKey, Owner: splTokenProgramID, Lamports: 1, Data: make([]byte, mintAccountSize)}
+	mint.Data[45] = 1
+	reader := responseAccountReader{mintKey: mint}
+	preTokens := simulationTokenBalanceIndices(&tx.Message).tokenBalancesFromAccounts(pre, reader, 0)
+	postTokens := simulationTokenBalanceIndices(&tx.Message).tokenBalancesFromAccounts(post, reader, 0)
 	require.Len(t, preTokens, 1)
 	require.Len(t, postTokens, 1)
 	assert.Equal(t, uint8(1), preTokens[0].AccountIndex)

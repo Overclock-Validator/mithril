@@ -3,12 +3,14 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/DataDog/zstd"
-	"github.com/Overclock-Validator/mithril/pkg/global"
-	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
@@ -28,7 +30,7 @@ type GetAccountInfoDataSlice struct {
 }
 
 type GetAccountInfoRespContext struct {
-	ApiVersion string `json:"apiVersion"`
+	ApiVersion string `json:"apiVersion,omitempty"`
 	Slot       uint64 `json:"slot"`
 }
 
@@ -51,42 +53,65 @@ const (
 	GetAccountEncodingBase64
 	GetAccountEncodingBase64Zstd
 	GetAccountEncodingJson
+	GetAccountEncodingBinary
 )
 
 func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawParams) (GetAccountInfoResp, error) {
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {
-		return GetAccountInfoResp{}, fmt.Errorf("decoding params: %w", err)
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: "invalid getAccountInfo parameters"}
 	}
 
-	if len(params) < 1 {
-		return GetAccountInfoResp{}, fmt.Errorf("getAccountInfo requires a string as first parameter")
+	if len(params) < 1 || len(params) > 2 {
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: "getAccountInfo requires a key and optional config"}
 	}
-
-	pkStr, ok := params[0].(string)
-	if !ok {
-		return GetAccountInfoResp{}, fmt.Errorf("getAccountInfo requires a string as first parameter")
+	var pkStr string
+	if err := json.Unmarshal(params[0], &pkStr); err != nil || len(pkStr) > 44 {
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: "invalid account key"}
 	}
 
 	pk, err := solana.PublicKeyFromBase58(pkStr)
 	if err != nil {
-		return GetAccountInfoResp{}, fmt.Errorf("invalid base58 encoding")
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: "invalid base58 encoding"}
 	}
 
-	acct, err := rpcServer.acctsDb.GetAccount(0, pk)
-	if err != nil {
-		return GetAccountInfoResp{}, nil
-	}
-
-	conf, err := parseGetAccountInfoConfMap(params)
+	conf, err := parseAccountConfig(params, nil)
 	if err != nil {
 		return GetAccountInfoResp{}, err
 	}
+	rooted, acct, err := rpcServer.readRootedAccount(ctx, pk, &conf.MinContextSlot)
+	if _, ok := err.(*MinContextSlotNotReachedError); ok {
+		return GetAccountInfoResp{}, err
+	}
+	if err != nil && !errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{}, fmt.Errorf("read account at rooted slot %d: %w", rooted.Slot, err)
+	}
 
-	var acctData interface{}
-	acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	if errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{Context: GetAccountInfoRespContext{Slot: rooted.Slot}}, nil
+	}
+
+	val, err := accountInfoValue(acct, conf)
 	if err != nil {
 		return GetAccountInfoResp{}, err
+	}
+	return GetAccountInfoResp{Context: GetAccountInfoRespContext{Slot: rooted.Slot}, Value: val}, nil
+}
+
+func accountInfoValue(acct *accounts.Account, conf *GetAccountInfoConfig) (*GetAccountInfoRespValue, error) {
+	if acct == nil || acct.Lamports == 0 {
+		return nil, nil
+	}
+	var acctData any
+	var err error
+	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson && acct.Owner == addresses.VoteProgramAddr {
+		acctData, err = parsedVoteAccountData(acct.Data, acct.Key)
+	}
+	if acctData == nil || err != nil {
+		acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	val := &GetAccountInfoRespValue{
@@ -97,98 +122,57 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		RentEpoch:  acct.RentEpoch,
 		Space:      uint64(len(acct.Data))}
 
-	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: global.Slot()}, Value: val}, nil
+	return val, nil
 }
 
-func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, error) {
-	if len(params) < 2 {
-		return &GetAccountInfoConfig{}, nil
+func parseAccountConfig(params []json.RawMessage, defaultEncoding *int) (*GetAccountInfoConfig, error) {
+	var input struct {
+		Commitment     *string `json:"commitment"`
+		Encoding       *string `json:"encoding"`
+		MinContextSlot *uint64 `json:"minContextSlot"`
+		DataSlice      *struct {
+			Length *uint64 `json:"length"`
+			Offset *uint64 `json:"offset"`
+		} `json:"dataSlice"`
 	}
-
-	var err error
-	confMap, ok := params[1].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid config object")
-	}
-
-	conf := &GetAccountInfoConfig{}
-
-	// commitment is optional
-	commitmentObj, ok := confMap["commitment"]
-	if ok {
-		commitmentStr, ok := commitmentObj.(string)
-		if !ok {
-			return nil, fmt.Errorf("invalid commitment")
-		}
-		conf.Commitment = commitmentStr
-	}
-
-	// encoding type is optional. defaults to base58.
-	encodingObj, ok := confMap["encoding"]
-	if ok {
-		encodingStr, ok := encodingObj.(string)
-		if ok {
-			var encodingType int
-			encodingType, err = parseGetAcctDataEncodingType(encodingStr)
-			if err != nil {
-				return nil, err
-			}
-			conf.EncodingType = &encodingType
-		} else {
-			return nil, fmt.Errorf("invalid encoding type")
+	if len(params) > 1 {
+		if err := json.Unmarshal(params[1], &input); err != nil {
+			return nil, &InvalidParamsError{Message: "invalid account config"}
 		}
 	}
-
-	// dataSlice is optional. if present, it must contain both 'length' and 'offset' fields.
-	dataSliceObj, ok := confMap["dataSlice"]
-	if ok {
-		mlog.Log.Infof("dataSliceObj: %+v, type: %s", dataSliceObj, reflect.TypeOf(dataSliceObj))
-		dsMap, ok := dataSliceObj.(map[string]interface{})
-		if ok {
-			conf.DataSlice, err = parseDataSlice(dsMap)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, fmt.Errorf("invalid dataSlice")
+	conf := &GetAccountInfoConfig{EncodingType: defaultEncoding}
+	if input.Commitment != nil {
+		if err := validateRootedCommitment(*input.Commitment); err != nil {
+			return nil, err
+		}
+		conf.Commitment = *input.Commitment
+	}
+	if input.MinContextSlot != nil {
+		conf.MinContextSlot = *input.MinContextSlot
+	}
+	if input.Encoding != nil {
+		encoding, err := parseGetAcctDataEncodingType(*input.Encoding)
+		if err != nil {
+			return nil, &InvalidParamsError{Message: err.Error()}
+		}
+		conf.EncodingType = &encoding
+	}
+	if input.DataSlice != nil {
+		if input.DataSlice.Length == nil || input.DataSlice.Offset == nil {
+			return nil, &InvalidParamsError{Message: "dataSlice requires length and offset"}
+		}
+		conf.DataSlice = &GetAccountInfoDataSlice{Len: input.DataSlice.Length, Offset: input.DataSlice.Offset}
+		if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson {
+			return nil, &InvalidParamsError{Message: "cannot use jsonParsed with dataSlice"}
 		}
 	}
-
 	return conf, nil
-}
-
-func parseDataSlice(dataSlice map[string]interface{}) (*GetAccountInfoDataSlice, error) {
-	lengthObj, hasLen := dataSlice["length"]
-	offsetObj, hasOffset := dataSlice["offset"]
-
-	if hasLen && !hasOffset {
-		return nil, fmt.Errorf("missing dataSlice field offset")
-	} else if !hasLen && hasOffset {
-		return nil, fmt.Errorf("missing dataSlice field length")
-	}
-
-	ds := &GetAccountInfoDataSlice{}
-	if hasLen == hasOffset && hasLen {
-		length, ok := lengthObj.(float64)
-		if !ok {
-			return nil, fmt.Errorf("invalid dataSlice length, expected usize, got %s", reflect.TypeOf(lengthObj))
-		}
-		offset, ok := offsetObj.(float64)
-		if !ok {
-			return nil, fmt.Errorf("invalid dataSlice offset, expected usize, got %s", reflect.TypeOf(offsetObj))
-		}
-
-		lengthUint := uint64(length)
-		offsetUint := uint64(offset)
-		ds.Len = &lengthUint
-		ds.Offset = &offsetUint
-	}
-
-	return ds, nil
 }
 
 func parseGetAcctDataEncodingType(encodingStr string) (int, error) {
 	switch encodingStr {
+	case "binary":
+		return GetAccountEncodingBinary, nil
 	case "base58":
 		return GetAccountEncodingBase58, nil
 
@@ -199,7 +183,7 @@ func parseGetAcctDataEncodingType(encodingStr string) (int, error) {
 		return GetAccountEncodingBase64Zstd, nil
 
 	case "jsonParsed":
-		return GetAccountEncodingBase64, nil
+		return GetAccountEncodingJson, nil
 
 	default:
 		return 0, fmt.Errorf("invalid data encoding %s", encodingStr)
@@ -220,6 +204,10 @@ func encodeAcctDataWithConfig(data []byte, config *GetAccountInfoConfig) (interf
 			offset = *config.DataSlice.Offset
 		}
 	}
+	selected := extractRequestedAcctData(data, length, offset)
+	if (config.EncodingType == nil || *config.EncodingType == GetAccountEncodingBase58 || *config.EncodingType == GetAccountEncodingBinary) && len(selected) > 128 {
+		return nil, &accountEncodingError{}
+	}
 
 	var encodingTypeStr string
 	var dataStr string
@@ -227,6 +215,8 @@ func encodeAcctDataWithConfig(data []byte, config *GetAccountInfoConfig) (interf
 
 	if config.EncodingType != nil {
 		switch *config.EncodingType {
+		case GetAccountEncodingBinary:
+			return base58.Encode(selected), nil
 		case GetAccountEncodingBase58:
 			{
 				encodingTypeStr = "base58"
@@ -257,20 +247,36 @@ func encodeAcctDataWithConfig(data []byte, config *GetAccountInfoConfig) (interf
 			{
 				encodingTypeStr = "base64+zstd"
 				acctData := extractRequestedAcctData(data, length, offset)
-				compressedBytes, _ := zstd.Compress(nil, acctData)
+				compressedBytes, err := zstd.Compress(nil, acctData)
+				if err != nil {
+					encodingTypeStr = "base64"
+					compressedBytes = acctData
+				}
 				dataStr = base64.StdEncoding.EncodeToString(compressedBytes)
 			}
 		}
 
 		dataObj = []string{dataStr, encodingTypeStr}
 	} else {
-		acctData := extractRequestedAcctData(data, length, offset)
-		if len(acctData) != 0 {
-			dataObj = base58.Encode(acctData)
-		}
+		dataObj = base58.Encode(selected)
 	}
 
 	return dataObj, nil
+}
+
+type accountEncodingError struct{}
+
+func (*accountEncodingError) Error() string {
+	return "Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding."
+}
+func (e *accountEncodingError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: -32600, Message: e.Error()}, nil
+}
+func (*accountEncodingError) FromJSONRPCError(value jsonrpc.JSONRPCError) error {
+	if value.Code != -32600 {
+		return fmt.Errorf("unexpected account encoding error code %d", value.Code)
+	}
+	return nil
 }
 
 func extractRequestedAcctData(data []byte, length uint64, offset uint64) []byte {

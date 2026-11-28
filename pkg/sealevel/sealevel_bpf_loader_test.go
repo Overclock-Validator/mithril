@@ -8,15 +8,59 @@ import (
 
 	"github.com/Overclock-Validator/mithril/fixtures"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // BPF loader tests
+
+func assertLoaderCacheInsertion(t *testing.T, ctx *ExecutionCtx, key solana.PublicKey, previous *accountsdb.ProgramCacheEntry, simulation bool) {
+	t.Helper()
+	entry, present := ctx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(key)
+	assert.True(t, present)
+	if simulation {
+		assert.Same(t, previous, entry)
+		assert.Empty(t, ctx.SlotCtx.TakeProgramCacheAdds())
+	} else {
+		assert.NotSame(t, previous, entry)
+		if assert.NotNil(t, entry) {
+			assert.NotNil(t, entry.Program)
+		}
+		assert.Equal(t, []solana.PublicKey{key}, ctx.SlotCtx.TakeProgramCacheAdds())
+	}
+}
+
+func TestBPFLoaderExecutesLegacyProgramStub(t *testing.T) {
+	for _, simulation := range []bool{false, true} {
+		name := "replay"
+		if simulation {
+			name = "simulation"
+		}
+		t.Run(name, func(t *testing.T) {
+			programKey := solana.PublicKey{9}
+			real := &accounts.Account{Key: programKey, Owner: a.BpfLoader2Addr, Lamports: 10_000_000,
+				Executable: true, Data: fixtures.Load(t, "sbpf", "noop_aligned.so")}
+			stub := accounts.Account{Key: programKey, Owner: real.Owner, Executable: true, IsDummy: true}
+			tx := NewTransactionAccounts([]accounts.Account{stub})
+			ctx := newBenchExecCtx(tx, 100)
+			initializeLegacyBankFixture(t, ctx)
+			ctx.IsSimulation = simulation
+			require.NoError(t, ctx.Accounts.SetAccount((*[32]byte)(&programKey), real))
+			require.NoError(t, ctx.ProcessInstruction(nil, nil, []uint64{0}))
+			require.Zero(t, ctx.TransactionContext.Accounts.Accounts[0].Lamports)
+			require.Empty(t, ctx.TransactionContext.Accounts.Accounts[0].Data)
+			require.False(t, ctx.TransactionContext.Accounts.Touched[0])
+			require.Equal(t, uint64(10_000_000), real.Lamports)
+			require.NotEmpty(t, real.Data)
+		})
+	}
+}
 
 func TestExecute_Tx_BpfLoader_InitializeBuffer_Success(t *testing.T) {
 
@@ -1764,6 +1808,11 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Not_Enough_Accounts(t *testing.T) {
 }
 
 func TestExecute_Tx_BpfLoader_Close_ProgramData_Success(t *testing.T) {
+	t.Run("replay", func(t *testing.T) { testCloseProgramData(t, false) })
+	t.Run("simulation", func(t *testing.T) { testCloseProgramData(t, true) })
+}
+
+func testCloseProgramData(t *testing.T, simulation bool) {
 	// bpf loader acct
 	loaderAcctData := make([]byte, 500, 500)
 	loaderAcct := accounts.Account{Key: a.BpfLoaderUpgradeableAddr, Lamports: 0, Data: loaderAcctData, Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: 100}
@@ -1824,8 +1873,20 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Success(t *testing.T) {
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
 	initializeLegacyBankFixture(t, &execCtx)
+	execCtx.IsSimulation = simulation
+	execCtx.SlotCtx.TrackProgramCacheAdds = true
+	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
+	execCtx.SlotCtx.AccountsDb.AddProgramToCache(bufferPubkey, cached)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
+	entry, present := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(bufferPubkey)
+	if simulation {
+		assert.True(t, present)
+		assert.Same(t, cached, entry)
+	} else {
+		assert.False(t, present)
+	}
+	assert.Empty(t, execCtx.SlotCtx.TakeProgramCacheAdds())
 
 	dstAcctPostInstr, err := txCtx.Accounts.GetAccount(2)
 	assert.NoError(t, err)
@@ -2233,6 +2294,11 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Nonclosable_Account_Failure(t *t
 }
 
 func TestExecute_Tx_BpfLoader_ExtendProgram_Success(t *testing.T) {
+	t.Run("replay", func(t *testing.T) { testExtendProgram(t, false) })
+	t.Run("simulation", func(t *testing.T) { testExtendProgram(t, true) })
+}
+
+func testExtendProgram(t *testing.T, simulation bool) {
 	// bpf loader acct
 	loaderAcctData := make([]byte, 500, 500)
 	loaderAcct := accounts.Account{Key: a.BpfLoaderUpgradeableAddr, Lamports: 0, Data: loaderAcctData, Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: 100}
@@ -2309,11 +2375,16 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_Success(t *testing.T) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
+	execCtx.IsSimulation = simulation
+	execCtx.SlotCtx.TrackProgramCacheAdds = true
+	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
+	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
 	postAcct, err := txCtx.Accounts.GetAccount(1)
 	assert.NoError(t, err)
+	assertLoaderCacheInsertion(t, &execCtx, programDataPubkey, cached, simulation)
 
 	// check that the account size has been incremented by 12
 	assert.Equal(t, origProgramDataLen+12, len(postAcct.Data))
@@ -2621,6 +2692,11 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_With_Rent_Exemption_Payment_Success(
 }
 
 func TestExecute_Tx_BpfLoader_Upgrade_Success(t *testing.T) {
+	t.Run("replay", func(t *testing.T) { testUpgradeProgram(t, false) })
+	t.Run("simulation", func(t *testing.T) { testUpgradeProgram(t, true) })
+}
+
+func testUpgradeProgram(t *testing.T, simulation bool) {
 	// bpf loader acct
 	loaderAcctData := make([]byte, 500, 500)
 	loaderAcct := accounts.Account{Key: a.BpfLoaderUpgradeableAddr, Lamports: 0, Data: loaderAcctData, Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: 100}
@@ -2718,10 +2794,15 @@ func TestExecute_Tx_BpfLoader_Upgrade_Success(t *testing.T) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
+	execCtx.IsSimulation = simulation
+	execCtx.SlotCtx.TrackProgramCacheAdds = true
+	cached := &accountsdb.ProgramCacheEntry{DeploymentSlot: 1337}
+	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
 	// check if program bytes have been written into the ProgramData account
+	assertLoaderCacheInsertion(t, &execCtx, programDataPubkey, cached, simulation)
 	programDataAcctPost, err := txCtx.Accounts.GetAccount(1)
 	assert.NoError(t, err)
 	newProgramBytes := programDataAcctPost.Data[upgradeableLoaderSizeOfProgramDataMetaData:]
@@ -2835,6 +2916,11 @@ func TestExecute_Tx_BpfLoader_Upgrade_Buffer_Wrong_Authority_Failure(t *testing.
 }
 
 func TestExecute_Tx_BpfLoader_DeployWithMaxDataLen_Success(t *testing.T) {
+	t.Run("replay", func(t *testing.T) { testDeployProgram(t, false) })
+	t.Run("simulation", func(t *testing.T) { testDeployProgram(t, true) })
+}
+
+func testDeployProgram(t *testing.T, simulation bool) {
 	// bpf loader acct
 	loaderAcctData := make([]byte, 500, 500)
 	loaderAcct := accounts.Account{Key: a.BpfLoaderUpgradeableAddr, Lamports: 0, Data: loaderAcctData, Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: 100}
@@ -2935,10 +3021,15 @@ func TestExecute_Tx_BpfLoader_DeployWithMaxDataLen_Success(t *testing.T) {
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	initializeLegacyBankFixture(t, &execCtx)
+	execCtx.IsSimulation = simulation
+	execCtx.SlotCtx.TrackProgramCacheAdds = true
+	cached := &accountsdb.ProgramCacheEntry{}
+	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programDataPubkey, cached)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
 	// check programdata account state after instr; does it contain the new program bytes?
+	assertLoaderCacheInsertion(t, &execCtx, programDataPubkey, cached, simulation)
 	programDataPost, err := txCtx.Accounts.GetAccount(2)
 	assert.NoError(t, err)
 	programBytesPost := programDataPost.Data[upgradeableLoaderSizeOfProgramDataMetaData:]

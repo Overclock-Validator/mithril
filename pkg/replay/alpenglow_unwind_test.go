@@ -175,31 +175,20 @@ func TestUnwindReturnsExecutedParentAcrossSkips(t *testing.T) {
 	assert.NotContains(t, tail.bankSysvars, uint64(8), "second discarded suffix snapshot must be evicted")
 }
 
-// The seed for the running transaction count: exact from a checkpoint that
-// recorded one (including a genuine zero — dev genesis), approximate from the
-// snapshot manifest when the checkpoint predates the field (nil pointer).
 func TestResolveInitialTransactionCount(t *testing.T) {
-	// Pre-field checkpoint (nil pointer): manifest fallback, flagged approximate.
-	count, exact := resolveInitialTransactionCount(&ResumeState{}, 5000)
-	assert.Equal(t, uint64(5000), count)
-	assert.False(t, exact, "nil TransactionCount must be treated as absent, not zero")
-
-	// Fresh start (no resume state at all): manifest is exact enough by definition.
-	count, exact = resolveInitialTransactionCount(nil, 5000)
-	assert.Equal(t, uint64(5000), count)
-	assert.False(t, exact)
-
-	// Checkpoint with a recorded count: exact, overrides the manifest.
-	txc := uint64(777777)
-	count, exact = resolveInitialTransactionCount(&ResumeState{TransactionCount: &txc}, 5000)
-	assert.Equal(t, uint64(777777), count)
-	assert.True(t, exact)
-
-	// Present-but-zero is EXACT zero (dev genesis), not "unset".
-	zero := uint64(0)
-	count, exact = resolveInitialTransactionCount(&ResumeState{TransactionCount: &zero}, 5000)
-	assert.Equal(t, uint64(0), count)
-	assert.True(t, exact, "explicit zero must not fall back to the manifest")
+	s := &state.MithrilState{ManifestParentSlot: 20, ManifestTransactionCount: 5000}
+	assert.Equal(t, new(uint64(5000)), resolveInitialTransactionCount(nil, s))
+	assert.Equal(t, new(uint64(5000)), resolveInitialTransactionCount(&ResumeState{ParentSlot: 20}, s))
+	s.LastRootedSlot = 30
+	assert.Nil(t, resolveInitialTransactionCount(nil, s))
+	unknown := resolveInitialTransactionCount(&ResumeState{ParentSlot: 30}, s)
+	assert.Nil(t, unknown)
+	previous := global.ExactTransactionCount()
+	t.Cleanup(func() { global.SetTransactionCount(previous) })
+	global.SetTransactionCount(unknown)
+	global.IncrTransactionCount(3)
+	assert.Nil(t, global.ExactTransactionCount(), "increments cannot recover the missing checkpoint span")
+	assert.Equal(t, new(uint64(0)), resolveInitialTransactionCount(&ResumeState{ParentSlot: 30, TransactionCount: new(uint64(0))}, s))
 }
 
 // The vote/stake dirty watermark is a monotonic max, reset per run.
@@ -252,7 +241,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeMutationUnjournaled(t *testing.T) 
 	// carries the parent's transaction count so the discarded fork's txs can be
 	// dropped from the running count.
 	resetVoteStakeDirty()
-	rs, bankSysvars, _ := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, bankSysvars, _ := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	require.NotNil(t, rs, "clean unwind should succeed in-loop")
 	require.NotNil(t, bankSysvars, "clean unwind returns its exact parent sysvars")
 	assert.Equal(t, uint64(7), bankSysvars.Slot())
@@ -266,7 +255,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeMutationUnjournaled(t *testing.T) 
 	// An explicitly unjournaled mutation in the UNWOUND suffix cannot be
 	// undone. Accepted execution mutations exercise the journal in fork_cache_test.
 	markVoteStakeDirty(8)
-	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	assert.Nil(t, rs, "dirty cache in the unwound suffix must force the rooted re-replay fallback")
 	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
 	resetVoteStakeDirty()
@@ -275,7 +264,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeMutationUnjournaled(t *testing.T) 
 	// Keep the conservative fallback even though journaled retained writes are
 	// now preserved without reloading the cache from durable storage.
 	markVoteStakeDirty(7) // retained slot; rooted watermark is 0
-	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	assert.Nil(t, rs, "dirty cache in the retained suffix must also force the fallback")
 	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
 	resetVoteStakeDirty()
@@ -284,7 +273,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeMutationUnjournaled(t *testing.T) 
 	// durable and reload-from-durable is exact again -> fast path allowed.
 	markVoteStakeDirty(7)
 	rootedPast := &state.MithrilState{LastRootedSlot: 7}
-	rs, _, _ = tryInLoopUnwind(sw, newTail(), rootedPast, sched, epoch, nil)
+	rs, _, _ = tryInLoopUnwind(sw, newTail(), rootedPast, sched, epoch, nil, nil)
 	require.NotNil(t, rs, "dirtiness at/below the rooted watermark is durably folded — fast path is safe")
 	resetVoteStakeDirty()
 }
@@ -356,7 +345,7 @@ func TestTryInLoopUnwindGuardMatrix(t *testing.T) {
 // assertUnwindOK asserts the in-RAM unwind proceeds (no fallback reason).
 func assertUnwindOK(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	require.NotNil(t, rs, "expected in-RAM unwind to proceed, got fallback %q", reason)
 	require.NotNil(t, bankSysvars)
 	assert.Empty(t, reason)
@@ -365,7 +354,7 @@ func assertUnwindOK(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *s
 // assertUnwindFallback asserts the unwind falls back (any reason).
 func assertUnwindFallback(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	assert.Nil(t, rs)
 	assert.Nil(t, bankSysvars)
 	assert.NotEmpty(t, reason, "fallback must carry a reason for the instrumentation")
@@ -375,7 +364,7 @@ func assertUnwindFallback(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail,
 // instrumented reason operators will see.
 func assertUnwindFallbackReason(t *testing.T, want string, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	assert.Nil(t, rs)
 	assert.Nil(t, bankSysvars)
 	assert.Equal(t, want, reason)

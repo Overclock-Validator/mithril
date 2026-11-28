@@ -19,7 +19,7 @@ func TestSimulateTransactionResp_JSONShape_AllSpecFieldsPresent(t *testing.T) {
 	tokenBals := []TokenBalancePayload{}
 
 	resp := SimulateTransactionResp{
-		Context: SimulateTransactionRespContext{ApiVersion: "test", Slot: 42},
+		Context: SimulateTransactionRespContext{Slot: 42},
 		Value: SimulateTransactionRespValue{
 			Err:                    nil,
 			Logs:                   &logs,
@@ -43,6 +43,7 @@ func TestSimulateTransactionResp_JSONShape_AllSpecFieldsPresent(t *testing.T) {
 
 	var decoded map[string]interface{}
 	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.Equal(t, map[string]any{"slot": float64(42)}, decoded["context"])
 
 	value, ok := decoded["value"].(map[string]interface{})
 	require.True(t, ok, "response must contain a value object")

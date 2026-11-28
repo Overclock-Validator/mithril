@@ -62,7 +62,7 @@ func TestForkCacheUnwindMatchesCleanParentClock(t *testing.T) {
 	// Concurrent future production owns its pending updates, not the journal.
 	future := &sealevel.SlotCtx{Slot: 12, DeferVoteCachePublication: true}
 	putVoteCacheItem(future, key, makeVote(12, 9500))
-	rs, sysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil)
+	rs, sysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil, nil)
 	require.Empty(t, reason)
 	require.Equal(t, uint64(7), rs.ParentSlot)
 	require.Equal(t, uint64(7), sysvars.Slot())
@@ -74,7 +74,7 @@ func TestForkCacheUnwindMatchesCleanParentClock(t *testing.T) {
 
 	putVoteCacheItem(&sealevel.SlotCtx{Slot: 8}, key, makeVote(8, 1100))
 	addBank(8)
-	_, _, reason = tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil)
+	_, _, reason = tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil, nil)
 	require.Empty(t, reason)
 	require.Equal(t, int64(1001), global.VoteCacheItem(key).LastTimestamp().Timestamp)
 }
@@ -95,7 +95,7 @@ func TestForkUnwindRetainsDurableParentSnapshot(t *testing.T) {
 	tail.Add(8, []*accounts.Account{testAccount(1, 8)}, testHashBytes(8))
 	tail.SetContext(8, forkTestContext(8), testUnwindBankSysvars(t, 8, 800))
 	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
-	rs, actualSysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{LastRootedSlot: 7}, schedule, 0, nil)
+	rs, actualSysvars, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{LastRootedSlot: 7}, schedule, 0, nil, nil)
 	require.Empty(t, reason)
 	require.Equal(t, uint64(7), rs.ParentSlot)
 	require.Same(t, sysvars, actualSysvars)
@@ -109,7 +109,7 @@ func TestRejectedForkUnwindDoesNotMutateLiveBranch(t *testing.T) {
 	tail.SetContext(7, forkTestContext(7)) // missing immutable sysvars
 	tail.Add(8, []*accounts.Account{testAccount(1, 8)}, testHashBytes(8))
 	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
-	_, _, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil)
+	_, _, reason := tryInLoopUnwind(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{}, schedule, 0, nil, nil)
 	require.Equal(t, unwindFallbackMissingSysvars, reason)
 	require.Contains(t, tail.bankhashes, uint64(8))
 	acct, err := tail.GetAccount(8, testAccount(1, 8).Key)
