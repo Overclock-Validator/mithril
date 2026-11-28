@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -16,24 +14,6 @@ import (
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
-
-func getBlockHistoryHTTPCall(t *testing.T, endpoint *httptest.Server, method, params string, status ...int) map[string]json.RawMessage {
-	t.Helper()
-	request := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":%s}`, method, params)
-	response, err := endpoint.Client().Post(endpoint.URL, "application/json", strings.NewReader(request))
-	require.NoError(t, err)
-	defer response.Body.Close()
-	wantStatus := 200
-	if len(status) != 0 {
-		wantStatus = status[0]
-	}
-	require.Equal(t, wantStatus, response.StatusCode)
-	var body map[string]json.RawMessage
-	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
-	require.JSONEq(t, `"2.0"`, string(body["jsonrpc"]))
-	require.JSONEq(t, `1`, string(body["id"]))
-	return body
-}
 
 func TestBlockHeightBankContract(t *testing.T) {
 	oldSlot, oldHeight := global.Slot(), global.BlockHeight()

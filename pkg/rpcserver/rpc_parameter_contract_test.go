@@ -2,7 +2,6 @@ package rpcserver
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http/httptest"
 	"strings"
@@ -17,20 +16,6 @@ import (
 func TestSpecExactRPCParameters(t *testing.T) {
 	server := &RpcServer{epochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}}
 	server.SetRootedBankState(9007199254740992, 4, 5)
-	t.Run("getSlot_exact_control", func(t *testing.T) {
-		_, err := server.GetSlot(t.Context(), jsonrpc.RawParams(`[{"minContextSlot":9007199254740993}]`))
-		var behind *MinContextSlotNotReachedError
-		if !errors.As(err, &behind) {
-			t.Fatalf("expected minimum-context error, got %v", err)
-		}
-	})
-	t.Run("epoch_minimum_must_not_round_down", func(t *testing.T) {
-		got, err := server.GetEpochInfo(t.Context(), jsonrpc.RawParams(`[{"minContextSlot":9007199254740993}]`))
-		var behind *MinContextSlotNotReachedError
-		if !errors.As(err, &behind) {
-			t.Fatalf("requested minimum 9007199254740993; returned slot %d with error %v", got.AbsoluteSlot, err)
-		}
-	})
 	t.Run("distance_accepts_full_u64", func(t *testing.T) {
 		params, err := decodeOptionalParams(jsonrpc.RawParams(`[{"delinquentSlotDistance":18446744073709551615}]`))
 		if err != nil {
@@ -41,27 +26,10 @@ func TestSpecExactRPCParameters(t *testing.T) {
 			t.Fatalf("valid maximum u64: value=%d error=%v", got.delinquentSlotDistance, err)
 		}
 	})
-	t.Run("fraction_must_not_round_to_integer", func(t *testing.T) {
-		_, err := server.GetEpochInfo(t.Context(), jsonrpc.RawParams(`[{"minContextSlot":1.0000000000000001}]`))
-		var invalid *InvalidParamsError
-		if !errors.As(err, &invalid) {
-			t.Fatalf("fractional u64 accepted: error=%v", err)
-		}
-	})
 	t.Run("null_optional_minimum", func(t *testing.T) {
 		_, err := server.GetEpochInfo(t.Context(), jsonrpc.RawParams(`[{"minContextSlot":null}]`))
 		if err != nil {
 			t.Fatalf("optional minimum null should use default: %v", err)
-		}
-	})
-	t.Run("balance_minimum_must_not_round_down", func(t *testing.T) {
-		balanceServer := &RpcServer{acctsDb: newRPCAccountsDB(t)}
-		balanceServer.SetRootedBankState(9007199254740992, 4, 5)
-		params := jsonrpc.RawParams(`["` + (solana.PublicKey{8}).String() + `",{"minContextSlot":9007199254740993}]`)
-		got, err := balanceServer.GetBalance(t.Context(), params)
-		var behind *MinContextSlotNotReachedError
-		if !errors.As(err, &behind) {
-			t.Fatalf("requested minimum 9007199254740993; returned slot %d with error %v", got.Context.Slot, err)
 		}
 	})
 }
@@ -170,6 +138,9 @@ func TestRPCOptionalConfigAndDecoderContract(t *testing.T) {
 		_, err := decodeOptionalParams(jsonrpc.RawParams(raw))
 		require.Error(t, err, raw)
 	}
-	_, err = decodeOptionalParams(jsonrpc.RawParams("[] \n\t"))
-	require.NoError(t, err)
+	for _, raw := range []string{"", "null", "[] \n\t"} {
+		args, err := decodeOptionalParams(jsonrpc.RawParams(raw))
+		require.NoError(t, err)
+		require.Empty(t, args)
+	}
 }

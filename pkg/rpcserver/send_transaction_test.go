@@ -9,11 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/leaderschedule"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
-	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
 	solanarpc "github.com/gagliardetto/solana-go/rpc"
@@ -119,12 +117,7 @@ func TestSendTransaction_RejectsSanitizeFailure(t *testing.T) {
 }
 
 func TestSendTransaction_PreflightSignatureFailure(t *testing.T) {
-	rpcServer := &RpcServer{
-		slotCtx: &sealevel.SlotCtx{
-			Slot:     123,
-			Features: features.NewFeaturesDefault(),
-		},
-	}
+	rpcServer := transactionOptionsServer(t)
 	forwarded := 0
 	rpcServer.transactionSender = func(context.Context, []byte, tpuEndpoint) error {
 		forwarded++
@@ -175,6 +168,7 @@ func TestFailureLoadedAccountsDataSizeUsesLoaderSelectedSemantics(t *testing.T) 
 }
 
 func TestSendTransaction_SkipPreflight_FansOutToUpcomingLeaders(t *testing.T) {
+	rpcServer := transactionOptionsServer(t)
 	listenerA := mustListenUDP(t)
 	defer listenerA.Close()
 	listenerB := mustListenUDP(t)
@@ -212,21 +206,19 @@ func TestSendTransaction_SkipPreflight_FansOutToUpcomingLeaders(t *testing.T) {
 
 	tx, wire := testLegacyTransaction(t)
 	fetchCount := 0
-	rpcServer := &RpcServer{
-		transactionSender:                 defaultTransactionSender,
-		clusterNodesRefreshEvery:          sendTransactionClusterNodesRefreshEvery,
-		sendTransactionLeaderForwardCount: sendTransactionLeaderForwardCount,
-		clusterNodesFetcher: func(context.Context) ([]*solanarpc.GetClusterNodesResult, error) {
-			fetchCount++
-			return []*solanarpc.GetClusterNodesResult{
-				{Pubkey: leaderA, TPU: stringPtr(listenerA.LocalAddr().String())},
-				{Pubkey: leaderB, TPU: stringPtr(listenerB.LocalAddr().String())},
-				{Pubkey: leaderC, TPU: stringPtr(listenerC.LocalAddr().String())},
-				{Pubkey: leaderD, TPU: stringPtr(listenerD.LocalAddr().String())},
-				{Pubkey: leaderE, TPU: stringPtr(listenerE.LocalAddr().String())},
-				{Pubkey: leaderF, TPU: stringPtr(listenerF.LocalAddr().String())},
-			}, nil
-		},
+	rpcServer.transactionSender = defaultTransactionSender
+	rpcServer.clusterNodesRefreshEvery = sendTransactionClusterNodesRefreshEvery
+	rpcServer.sendTransactionLeaderForwardCount = sendTransactionLeaderForwardCount
+	rpcServer.clusterNodesFetcher = func(context.Context) ([]*solanarpc.GetClusterNodesResult, error) {
+		fetchCount++
+		return []*solanarpc.GetClusterNodesResult{
+			{Pubkey: leaderA, TPU: stringPtr(listenerA.LocalAddr().String())},
+			{Pubkey: leaderB, TPU: stringPtr(listenerB.LocalAddr().String())},
+			{Pubkey: leaderC, TPU: stringPtr(listenerC.LocalAddr().String())},
+			{Pubkey: leaderD, TPU: stringPtr(listenerD.LocalAddr().String())},
+			{Pubkey: leaderE, TPU: stringPtr(listenerE.LocalAddr().String())},
+			{Pubkey: leaderF, TPU: stringPtr(listenerF.LocalAddr().String())},
+		}, nil
 	}
 
 	gotSig, err := rpcServer.SendTransaction(
