@@ -56,6 +56,9 @@ func (rpcServer *RpcServer) accountsAtSlot(ctx context.Context, keys []solana.Pu
 		if err != nil {
 			return err
 		}
+		if _, _, any := hs.Range(); !any {
+			return &InvalidParamsError{Message: fmt.Sprintf("account history is empty; it starts with the first fold after slot %d", durable)}
+		}
 		if through < durable {
 			return &InvalidParamsError{Message: fmt.Sprintf("account history reaches slot %d, behind the durable store at %d", through, durable)}
 		}
