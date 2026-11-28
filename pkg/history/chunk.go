@@ -2,6 +2,7 @@ package history
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -23,15 +24,15 @@ import (
 //	footer: index offset u64, block count u32, index crc32 u32,
 //	        from slot u64, to slot u64, magic "MHCHUNK1"
 //
-// A record is: key [32], flags byte (bit 0: a full copy follows), the full
-// copy (AppendWhole), then a uvarint count of differences, each a uvarint slot
+// A record is: key [32], flags byte (bit 0: a full copy follows; bit 1: the
+// account did not exist before the chunk), the full copy (AppendWhole), then a uvarint count of differences, each a uvarint slot
 // offset from the chunk's first slot, a uvarint length and the XOR bytes.
 const (
-	chunkMagic      = "MHCHUNK1"
-	chunkFooterLen  = 8 + 4 + 4 + 8 + 8 + 8
-	indexEntryLen   = 32 + 8 + 4 + 4
-	targetBlockSize = 64 << 10
-	recordHasFull   = 1
+	chunkMagic     = "MHCHUNK1"
+	chunkFooterLen = 8 + 4 + 4 + 8 + 8 + 8
+	indexEntryLen  = 32 + 8 + 4 + 4
+	recordHasFull  = 1
+	recordAbsent   = 2
 )
 
 // Diff is one slot's change to an account.
@@ -42,10 +43,21 @@ type Diff struct {
 
 // Record is one account's history within a chunk.
 type Record struct {
-	Key   [32]byte
-	Full  *Version // version before the first change in the segment; nil if not in this chunk
-	Diffs []Diff   // ascending by slot
+	Key  [32]byte
+	Full *Version // version before the chunk's first change; nil if not in this chunk
+	// AbsentBefore: the account did not exist before the chunk's first
+	// change, so a read needs no older chunk. Chunks written before the flag
+	// existed never set it.
+	AbsentBefore bool
+	Diffs        []Diff // ascending by slot
 }
+
+// targetBlockSize is the raw size at which a chunk block is closed; a read
+// decompresses one block. On a mainnet corpus 16 KiB blocks made
+// whole-block queries' account reads about twice as fast as 64 KiB ones,
+// for 4% more disk and 48 bytes of index in memory per block. A variable
+// so tests can compare sizes.
+var targetBlockSize = 16 << 10
 
 var (
 	encOnce sync.Once
@@ -63,10 +75,13 @@ func codecs() (*zstd.Encoder, *zstd.Decoder) {
 
 func appendRecord(dst []byte, r *Record, from uint64) []byte {
 	dst = append(dst, r.Key[:]...)
-	if r.Full != nil {
+	switch {
+	case r.Full != nil:
 		dst = append(dst, recordHasFull)
 		dst = AppendWhole(dst, r.Full)
-	} else {
+	case r.AbsentBefore:
+		dst = append(dst, recordAbsent)
+	default:
 		dst = append(dst, 0)
 	}
 	dst = binary.AppendUvarint(dst, uint64(len(r.Diffs)))
@@ -86,6 +101,7 @@ func readRecord(b []byte, from uint64) (*Record, []byte, error) {
 	copy(r.Key[:], b[:32])
 	flags := b[32]
 	b = b[33:]
+	r.AbsentBefore = flags&recordAbsent != 0
 	if flags&recordHasFull != 0 {
 		v, rest, err := ReadWhole(b)
 		if err != nil {
@@ -117,6 +133,47 @@ func readRecord(b []byte, from uint64) (*Record, []byte, error) {
 		b = b[l:]
 	}
 	return r, b, nil
+}
+
+// skipRecord returns what follows the record at the start of b, checking its
+// lengths as readRecord does but allocating nothing.
+func skipRecord(b []byte) ([]byte, error) {
+	if len(b) < 33 {
+		return nil, errChunk
+	}
+	flags := b[32]
+	b = b[33:]
+	if flags&recordHasFull != 0 {
+		if len(b) < 49 {
+			return nil, errChunk
+		}
+		n, k := binary.Uvarint(b[49:])
+		if k <= 0 || n > MaxDataLen || uint64(len(b)-49-k) < n {
+			return nil, errChunk
+		}
+		b = b[49+k+int(n):]
+	}
+	n, k := binary.Uvarint(b)
+	if k <= 0 {
+		return nil, errChunk
+	}
+	b = b[k:]
+	if n > uint64(len(b))/2 {
+		return nil, errChunk
+	}
+	for i := uint64(0); i < n; i++ {
+		_, k1 := binary.Uvarint(b)
+		if k1 <= 0 {
+			return nil, errChunk
+		}
+		b = b[k1:]
+		l, k2 := binary.Uvarint(b)
+		if k2 <= 0 || l > uint64(len(b)-k2) {
+			return nil, errChunk
+		}
+		b = b[k2+int(l):]
+	}
+	return b, nil
 }
 
 var errChunk = errors.New("history: malformed chunk")
@@ -310,12 +367,68 @@ func (c *chunkReader) block(i int) ([]byte, error) {
 	return raw, nil
 }
 
-// blockCache keeps decompressed blocks for the duration of one batch read.
-type blockCache map[blockKey][]byte
+// blockCache keeps recently decompressed blocks for every reader of a store,
+// so the reads of one query, and of queries near each other, decompress a
+// block once. Entries are keyed by reader: a chunk recorded again after a
+// truncation has a new reader and never sees the old one's blocks. Cached
+// blocks are shared and must not be modified.
+type blockCache struct {
+	mu           sync.Mutex
+	limit        int64
+	size         int64
+	m            map[blockKey]*list.Element
+	lru          list.List // of *cachedBlock, newest first
+	hits, misses uint64
+}
 
 type blockKey struct {
-	path  string
+	c     *chunkReader
 	block int
+}
+
+type cachedBlock struct {
+	key blockKey
+	raw []byte
+}
+
+func newBlockCache(limit int64) *blockCache {
+	if limit <= 0 {
+		return nil
+	}
+	return &blockCache{limit: limit, m: make(map[blockKey]*list.Element)}
+}
+
+func (bc *blockCache) get(k blockKey) []byte {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if e, ok := bc.m[k]; ok {
+		bc.lru.MoveToFront(e)
+		bc.hits++
+		return e.Value.(*cachedBlock).raw
+	}
+	bc.misses++
+	return nil
+}
+
+func (bc *blockCache) put(k blockKey, raw []byte) {
+	n := int64(cap(raw))
+	if n > bc.limit/4 {
+		return
+	}
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if _, ok := bc.m[k]; ok {
+		return // another reader decompressed it at the same time
+	}
+	bc.m[k] = bc.lru.PushFront(&cachedBlock{key: k, raw: raw})
+	bc.size += n
+	for bc.size > bc.limit {
+		e := bc.lru.Back()
+		cb := e.Value.(*cachedBlock)
+		bc.lru.Remove(e)
+		delete(bc.m, cb.key)
+		bc.size -= int64(cap(cb.raw))
+	}
 }
 
 // lookup returns the record for key, or nil if the chunk does not hold it.
@@ -323,14 +436,15 @@ func (c *chunkReader) lookup(key [32]byte) (*Record, error) {
 	return c.lookupCached(key, nil)
 }
 
-func (c *chunkReader) lookupCached(key [32]byte, cache blockCache) (*Record, error) {
+func (c *chunkReader) lookupCached(key [32]byte, cache *blockCache) (*Record, error) {
 	i := sort.Search(len(c.blocks), func(i int) bool { return bytes.Compare(c.blocks[i].first[:], key[:]) > 0 }) - 1
 	if i < 0 {
 		return nil, nil
 	}
 	var raw []byte
+	k := blockKey{c, i}
 	if cache != nil {
-		raw = cache[blockKey{c.path, i}]
+		raw = cache.get(k)
 	}
 	if raw == nil {
 		var err error
@@ -338,19 +452,27 @@ func (c *chunkReader) lookupCached(key [32]byte, cache blockCache) (*Record, err
 			return nil, err
 		}
 		if cache != nil {
-			cache[blockKey{c.path, i}] = raw
+			cache.put(k, raw)
 		}
 	}
+	// Records before the key are skipped without decoding them.
 	for len(raw) > 0 {
-		r, rest, err := readRecord(raw, c.from)
-		if err != nil {
-			return nil, fmt.Errorf("history: %s: %w", c.path, err)
+		if len(raw) < 33 {
+			return nil, fmt.Errorf("history: %s: %w", c.path, errChunk)
 		}
-		switch bytes.Compare(r.Key[:], key[:]) {
+		switch bytes.Compare(raw[:32], key[:]) {
 		case 0:
+			r, _, err := readRecord(raw, c.from)
+			if err != nil {
+				return nil, fmt.Errorf("history: %s: %w", c.path, err)
+			}
 			return r, nil
 		case 1:
 			return nil, nil
+		}
+		rest, err := skipRecord(raw)
+		if err != nil {
+			return nil, fmt.Errorf("history: %s: %w", c.path, err)
 		}
 		raw = rest
 	}

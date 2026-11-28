@@ -87,6 +87,7 @@ type Store struct {
 	lastBank      uint64     // slot of the newest bank record, when lastBankKnown
 	lastBankKnown bool
 	banks         bankFiles
+	blocks        *blockCache // nil when Options.ReadCacheBytes < 0
 	repaired      string
 }
 
@@ -94,6 +95,25 @@ type Store struct {
 type Options struct {
 	SegmentChunks int // chunks per segment, 1..64; default 64
 	KeepSegments  int // closed segments retained; default 48
+	// ReadCacheBytes bounds the decompressed chunk blocks kept for account
+	// reads, shared by all readers; default DefaultReadCacheBytes, negative
+	// for none.
+	ReadCacheBytes int64
+}
+
+// DefaultReadCacheBytes holds about 16,000 decompressed 16 KiB blocks: the
+// blocks a whole-block query reads, for a few queries at once.
+const DefaultReadCacheBytes = 256 << 20
+
+// ReadCacheStats reports the block cache's hits and misses so far and the
+// bytes it holds.
+func (s *Store) ReadCacheStats() (hits, misses uint64, size int64) {
+	if s.blocks == nil {
+		return 0, 0, 0
+	}
+	s.blocks.mu.Lock()
+	defer s.blocks.mu.Unlock()
+	return s.blocks.hits, s.blocks.misses, s.blocks.size
 }
 
 // Open opens or creates a history store in dir. A damaged or missing chunk
@@ -112,7 +132,10 @@ func Open(dir string, o Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, segmentChunks: o.SegmentChunks, keepSegments: o.KeepSegments}
+	if o.ReadCacheBytes == 0 {
+		o.ReadCacheBytes = DefaultReadCacheBytes
+	}
+	s := &Store{dir: dir, segmentChunks: o.SegmentChunks, keepSegments: o.KeepSegments, blocks: newBlockCache(o.ReadCacheBytes)}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -323,7 +346,7 @@ func diffBytes(r *Record) uint64 {
 }
 
 func (f sinceFull) after(r *Record) sinceFull {
-	if r.Full != nil {
+	if r.Full != nil || r.AbsentBefore {
 		return sinceFull{chunks: 1, bytes: diffBytes(r)}
 	}
 	return sinceFull{chunks: f.chunks + 1, bytes: f.bytes + diffBytes(r)}
@@ -495,7 +518,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			}
 		}
 		r := &Record{Key: kh.Key, Diffs: kh.Diffs}
-		if kh.Prev != nil && !kh.Prev.Absent && since[kh.Key].needsFull(kh.Prev, diffBytes(r)) {
+		if kh.Prev == nil || kh.Prev.Absent {
+			r.AbsentBefore = true
+		} else if since[kh.Key].needsFull(kh.Prev, diffBytes(r)) {
 			r.Full = kh.Prev
 		}
 		records = append(records, r)
@@ -626,7 +651,7 @@ func lessKey(a, b [32]byte) bool {
 func (s *Store) AccountAt(key [32]byte, slot uint64) (*Version, uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.accountAtLocked(key, slot, nil)
+	return s.accountAtLocked(key, slot, s.blocks)
 }
 
 // AccountsAt is AccountAt for several keys at one slot, sharing decompressed
@@ -654,7 +679,7 @@ func (s *Store) AccountsAtLimit(keys [][32]byte, slot uint64, maxDataBytes uint6
 	}
 	versions = make([]*Version, len(keys))
 	errs = make([]error, len(keys))
-	cache := blockCache{}
+	cache := s.blocks
 	remaining := maxDataBytes
 	for i, k := range keys {
 		versions[i], _, errs[i] = s.accountAtLocked(k, slot, cache)
@@ -668,7 +693,7 @@ func (s *Store) AccountsAtLimit(keys [][32]byte, slot uint64, maxDataBytes uint6
 	return versions, errs, through, nil
 }
 
-func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*Version, uint64, error) {
+func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache *blockCache) (*Version, uint64, error) {
 	n := len(s.segments)
 	if n == 0 {
 		return nil, 0, ErrAfterHistory
@@ -726,6 +751,9 @@ func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*V
 			if r.Full != nil {
 				start = r.Full
 				break
+			}
+			if r.AbsentBefore {
+				break // start stays absent
 			}
 		}
 		if len(recs) == 0 {
