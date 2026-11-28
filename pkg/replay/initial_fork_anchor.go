@@ -110,7 +110,6 @@ func seedInitialRootAnchor(tail *unrootedTail, source sealevel.AccountReader, bl
 		parentForkState.ctx.CurrentFeatures = parentFeatures
 		parentForkState.rewardsEnabled = parentFeatures.IsActive(features.EnablePartitionedEpochReward) || parentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 	}
-	count := global.TransactionCount()
 	ctx := &state.ResumeContext{
 		Slot: block.ParentSlot, BlockHeight: block.BlockHeight - 1, Epoch: forkState.epoch,
 		Bankhash: base58.Encode(block.ParentBankhash[:]), AcctsLtHash: base64.StdEncoding.EncodeToString(block.AcctsLtHash.Hash()),
@@ -118,7 +117,7 @@ func seedInitialRootAnchor(tail *unrootedTail, source sealevel.AccountReader, bl
 		PrevLamportsPerSig: block.PrevFeeRateGovernor.PrevLamportsPerSignature,
 		EvictedBlockhash:   base58.Encode(block.LatestEvictedBlockhash[:]), Blockhash: base58.Encode(block.LastBlockhash[:]),
 		RecentBlockhashes: EncodeRecentBlockhashes(&recent), SlotHashes: EncodeSlotHashes(&hashes),
-		Clock: base64.StdEncoding.EncodeToString(clock.MustMarshal()), TransactionCount: &count,
+		Clock: base64.StdEncoding.EncodeToString(clock.MustMarshal()), TransactionCount: global.ExactTransactionCount(),
 		Capitalization: parentForkState.ctx.Capitalization, SlotsPerYear: forkState.ctx.SlotsPerYear,
 		InflationInitial: forkState.ctx.Inflation.Initial, InflationTerminal: forkState.ctx.Inflation.Terminal,
 		InflationTaper: forkState.ctx.Inflation.Taper, InflationFoundation: forkState.ctx.Inflation.FoundationVal,

@@ -17,16 +17,16 @@ import (
 // execute-on-receipt fork switch to re-run a certified sibling without a
 // process restart.
 
-// resolveInitialTransactionCount picks the transaction count to seed a replay
-// run with: the checkpoint's exact count when the context recorded one, else
-// the snapshot manifest's count (exact only when nothing folded past the
-// snapshot — a checkpoint written before the field existed loses the folded
-// span, so the caller warns that the count is approximate until re-bootstrap).
-func resolveInitialTransactionCount(rs *ResumeState, manifestCount uint64) (count uint64, exact bool) {
-	if rs != nil && rs.TransactionCount != nil {
-		return *rs.TransactionCount, true
+// A checkpoint from after the snapshot needs its own cumulative count.
+func resolveInitialTransactionCount(rs *ResumeState, s *state.MithrilState) *uint64 {
+	if rs != nil {
+		if rs.TransactionCount != nil || rs.ParentSlot != s.ManifestParentSlot {
+			return rs.TransactionCount
+		}
+	} else if s.LastRootedSlot > s.ManifestParentSlot {
+		return nil
 	}
-	return manifestCount, false
+	return new(s.ManifestTransactionCount)
 }
 
 // initialReplayEpoch is the epoch of the state being extended. On resume this
