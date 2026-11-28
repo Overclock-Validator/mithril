@@ -64,7 +64,7 @@ func newCapPressureBlock(t *testing.T, size int, usedCU uint64, capKCU int64) *w
 		}
 		return LoadAndExecuteTransactionOutput{ExecCtx: ctx}
 	}
-	w := newWorkAhead(slot, &block.Block{Transactions: txs}, execute, nil)
+	w := newWorkAhead(slot, &block.Block{Transactions: txs}, execute, nil, false)
 	require.NotNil(t, w)
 	pool := workAheadArenas
 	workAheadArenas = make(chan *arena.Arena[sealevel.BorrowedAccount], 8)

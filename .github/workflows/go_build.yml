@@ -39,7 +39,8 @@ jobs:
         run: >-
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
-          ./pkg/rpcserver ./pkg/epochrewards ./pkg/blockhistory
+          ./pkg/rpcserver ./pkg/epochrewards ./pkg/transactionhistory ./pkg/blockhistory
+          ./pkg/txstatus ./pkg/accountsdb ./pkg/statsd
           ./pkg/turbine ./pkg/shredcap ./pkg/sigverify ./pkg/blockprod/...
           ./cmd/mithril/node ./cmd/mithril/configcmd
 

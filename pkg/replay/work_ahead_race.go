@@ -81,7 +81,7 @@ func (w *workAhead) race(idx int, e *workAheadEntry, cancel *atomic.Bool) (*Load
 			raceArena = nil
 		}
 	}
-	input := transactionExecutionInput(w.slotCtx, w.txs[idx], w.txMeta(idx), raceArena, false, false)
+	input := transactionExecutionInput(w.slotCtx, w.txs[idx], w.txMeta(idx), raceArena, false, false, w.recordMetadata)
 	input.Speculative = true
 	input.SpeculativeCancel = cancel
 	out, panicked, _ := workAheadExecute(input)

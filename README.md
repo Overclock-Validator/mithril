@@ -229,14 +229,18 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBankHash` - Get bankhash for a slot (Mithril extension, not standard Solana RPC)
 - `getBlockHeight` - Get current block height
 - `getBlockProduction` - Get produced and assigned block counts by validator
-- `getBlock` - Get retained block summaries
+- `getBlock` - Get retained block summaries or recorded transactions
+- `getBlocks` - List produced slots across a retained rooted range
 - `getEpochInfo` - Get current epoch info
 - `getInflationReward` - Get retained inflation rewards for an epoch
 - `getGenesisHash` - Get the cluster genesis hash
 - `getLatestBlockhash` - Get recent blockhash
 - `getLeaderSchedule` - Get the leader schedule for an epoch
+- `getMultipleAccounts` - Read up to 100 accounts from one rooted view
+- `getSignatureStatuses` - Look up recent signature outcomes or retained receipts
 - `getSlot` - Get the slot at the requested commitment (defaults to finalized)
 - `getVoteAccounts` - Get current and delinquent vote accounts
+- `getTransaction` - Get a recorded transaction by its first signature
 - `sendTransaction` - Forward a signed transaction to upcoming leaders. The node sends one round, even when `maxRetries` is set. A returned signature does not confirm the transaction.
 - `simulateTransaction` - Simulate a transaction
 
@@ -255,6 +259,15 @@ progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 On Alpenglow, `processed` uses the live replay slot; `confirmed` and `finalized`
 use the published rooted slot. If that slot is below `minContextSlot`, the request
 returns error `-32016` with the available slot in `data.contextSlot`.
+
+On an Alpenglow verifying node, set `[rpc].transaction_history = true` to
+record transactions for `getTransaction` and full `getBlock` responses. Set
+`[rpc].signature_statuses = true` to serve recent signature statuses. Both are
+off by default and require a nonzero RPC port. History does not backfill older
+transactions. Enabling either option makes the RPC listener HTTP-only.
+
+`getBlocks` and `getMultipleAccounts` are HTTP methods. Block ranges are limited
+to retained rooted summaries. Account batches accept up to 100 addresses.
 
 ### Current Limitations
 

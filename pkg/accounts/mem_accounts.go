@@ -1,11 +1,15 @@
 package accounts
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	"github.com/gagliardetto/solana-go"
 )
+
+// ErrAccountNotFound indicates that an account key is absent from the store.
+var ErrAccountNotFound = errors.New("account not found")
 
 type MemAccounts struct {
 	Map map[[32]byte]*Account
@@ -20,6 +24,10 @@ type missingMemAccountError struct {
 
 func (e *missingMemAccountError) Error() string {
 	return "no such account " + base58.Encode(e.key[:]) + " found"
+}
+
+func (e *missingMemAccountError) Unwrap() error {
+	return ErrAccountNotFound
 }
 
 func NewMemAccounts() MemAccounts {

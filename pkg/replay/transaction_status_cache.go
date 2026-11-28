@@ -753,7 +753,9 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	if through > c.rootedThrough {
 		c.rootedThrough = through
 	}
-	if !c.coverageComplete {
+	// Genesis coverage can be complete before the retention window fills.
+	// Keep counting rooted banks so its next checkpoint can be reopened.
+	if c.rootedSinceSeed < maxTransactionStatusRoots {
 		rooted := uint32(c.rootedSinceSeed) + uint32(newlyRooted)
 		if rooted >= maxTransactionStatusRoots {
 			c.rootedSinceSeed = maxTransactionStatusRoots

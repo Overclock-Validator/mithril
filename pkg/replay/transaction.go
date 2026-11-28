@@ -728,7 +728,7 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 }
 
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool) (*fees.TxFeeInfo, uint64, error) {
-	return processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil, nil)
+	return processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil, nil, nil, nil)
 }
 
 // processTransaction is ProcessTransaction. A non-nil executed output, from an
@@ -739,7 +739,13 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 // The timings recorder belongs to the calling replay worker and is cleared
 // before the execution context returns to any caller. Independent callers
 // retain atomics.
-func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, executed *LoadAndExecuteTransactionOutput, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, uint64, error) {
+func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, executed *LoadAndExecuteTransactionOutput, timings *metrics.TransactionTimings, capture *transactionMetadataCapture, result *transactionResultCapture) (feeInfo *fees.TxFeeInfo, computeUnits uint64, executionErr error) {
+	if result != nil {
+		*result = transactionResultCapture{}
+	}
+	if capture != nil {
+		*capture = transactionMetadataCapture{budget: capture.budget}
+	}
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -790,14 +796,37 @@ func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		defer mlog.Log.DisableInfLogging()
 	}
 
+	var metadata *transactionMetadata
+	if capture != nil {
+		metadata, capture.Err = prepareTransactionMetadata(slotCtx, tx, capture.budget)
+	}
+
 	// Execute via pure function
 	var output LoadAndExecuteTransactionOutput
 	if executed != nil {
 		output = *executed
 	} else {
-		input := transactionExecutionInput(slotCtx, tx, txMeta, arena, debugTx, captureTx)
+		input := transactionExecutionInput(slotCtx, tx, txMeta, arena, debugTx, captureTx, metadata != nil)
 		input.TimingRecorder = timings
 		output = LoadAndExecuteTransaction(input)
+	}
+	if result != nil {
+		defer func() {
+			if feeInfo != nil {
+				result.finish(tx, output.ProcessingResult.TransactionError)
+			}
+		}()
+	}
+	if metadata != nil {
+		defer func() {
+			if feeInfo == nil {
+				return
+			}
+			capture.Err = metadata.finish(slotCtx, tx, output, feeInfo.TotalFee, capture.budget)
+			if capture.Err == nil {
+				capture.Record = metadata
+			}
+		}()
 	}
 
 	execCtx := output.ExecCtx
@@ -1009,7 +1038,7 @@ func isDebugTransaction(tx *solana.Transaction, dbgOpts *DebugOptions) bool {
 
 // transactionExecutionInput is the replay execution input for tx; every
 // execution of a replayed transaction, early or not, must use it.
-func transactionExecutionInput(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, txMeta *rpc.TransactionMeta, arena *arena.Arena[sealevel.BorrowedAccount], debugTx, captureTx bool) LoadAndExecuteTransactionInput {
+func transactionExecutionInput(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, txMeta *rpc.TransactionMeta, arena *arena.Arena[sealevel.BorrowedAccount], debugTx, captureTx, recordMetadata bool) LoadAndExecuteTransactionInput {
 	return LoadAndExecuteTransactionInput{
 		SlotCtx:     slotCtx,
 		Transaction: tx,
@@ -1018,9 +1047,11 @@ func transactionExecutionInput(slotCtx *sealevel.SlotCtx, tx *solana.Transaction
 		LeanResult:  true,
 		// On-chain metadata and the trailing verifier are the only replay
 		// consumers of pre-balances. Ordinary production transactions skip it.
-		CapturePreBalances: txMeta != nil || captureTx,
-		RecordLogs:         debugTx,
-		SkipTimingMetrics:  SkipPhaseTimers,
+		CapturePreBalances:      txMeta != nil || captureTx,
+		RecordLogs:              debugTx || recordMetadata,
+		boundedMetadata:         recordMetadata,
+		RecordInnerInstructions: recordMetadata,
+		SkipTimingMetrics:       SkipPhaseTimers,
 	}
 }
 
