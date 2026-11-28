@@ -357,9 +357,9 @@ func (c *chunkReader) lookupCached(key [32]byte, cache blockCache) (*Record, err
 	return nil, nil
 }
 
-// keys calls fn with every key in the chunk, in order. Used to rebuild the
-// open segment's table after a restart or truncation.
-func (c *chunkReader) keys(fn func(key [32]byte)) error {
+// records calls fn with every record in the chunk, in key order. Used to
+// rebuild the open segment's tables after a restart or truncation.
+func (c *chunkReader) records(fn func(r *Record)) error {
 	for i := range c.blocks {
 		raw, err := c.block(i)
 		if err != nil {
@@ -370,7 +370,7 @@ func (c *chunkReader) keys(fn func(key [32]byte)) error {
 			if err != nil {
 				return err
 			}
-			fn(r.Key)
+			fn(r)
 			raw = rest
 		}
 	}

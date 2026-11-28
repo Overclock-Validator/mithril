@@ -42,8 +42,9 @@ type chunkMeta struct {
 type segment struct {
 	dir    string
 	chunks []*chunkMeta
-	index  *segmentIndex       // closed segments
-	masks  map[[32]byte]uint64 // open segment
+	index  *segmentIndex          // closed segments
+	masks  map[[32]byte]uint64    // open segment
+	since  map[[32]byte]sinceFull // open segment: work since each key's last full copy
 }
 
 func (s *segment) from() uint64 { return s.chunks[0].from }
@@ -251,13 +252,57 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 
 func (seg *segment) rebuildMasks() error {
 	seg.masks = make(map[[32]byte]uint64)
+	seg.since = make(map[[32]byte]sinceFull)
 	for i, c := range seg.chunks {
 		bit := uint64(1) << i
-		if err := c.reader.keys(func(k [32]byte) { seg.masks[k] |= bit }); err != nil {
+		if err := c.reader.records(func(r *Record) {
+			seg.masks[r.Key] |= bit
+			seg.since[r.Key] = seg.since[r.Key].after(r)
+		}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// A chunk repeats an account's full copy once a read from the last one would
+// cross fullEveryChunks chunks or apply more than fullEveryBytesFactor times
+// the account's size in differences, so a read of an account that changes
+// every fold touches a bounded number of chunks.
+const (
+	fullEveryChunks      = 8
+	fullEveryBytesFactor = 2
+)
+
+// sinceFull is the read work from a key's last full copy in the open segment
+// through its newest chunk: chunks holding it, and difference bytes.
+type sinceFull struct {
+	chunks uint32
+	bytes  uint64
+}
+
+func diffBytes(r *Record) uint64 {
+	n := uint64(0)
+	for _, d := range r.Diffs {
+		n += uint64(len(d.Bytes))
+	}
+	return n
+}
+
+func (f sinceFull) after(r *Record) sinceFull {
+	if r.Full != nil {
+		return sinceFull{chunks: 1, bytes: diffBytes(r)}
+	}
+	return sinceFull{chunks: f.chunks + 1, bytes: f.bytes + diffBytes(r)}
+}
+
+// needsFull reports whether this chunk should repeat the key's full copy.
+func (f sinceFull) needsFull(prev *Version, added uint64) bool {
+	if f.chunks == 0 {
+		return true // the key's first chunk in the segment
+	}
+	size := uint64(len(prev.Data)) + 64
+	return f.chunks >= fullEveryChunks || f.bytes+added > fullEveryBytesFactor*size
 }
 
 // Close releases open files.
@@ -388,9 +433,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 
 	// A new segment starts when the open one is full.
 	newSegment := last == nil || last.masks == nil || len(last.chunks) >= s.segmentChunks
-	var seen map[[32]byte]uint64
+	var since map[[32]byte]sinceFull
 	if !newSegment {
-		seen = last.masks
+		since = last.since
 	}
 	records := make([]*Record, 0, len(keys))
 	for _, kh := range keys {
@@ -403,7 +448,7 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			}
 		}
 		r := &Record{Key: kh.Key, Diffs: kh.Diffs}
-		if seen[kh.Key] == 0 && kh.Prev != nil && !kh.Prev.Absent {
+		if kh.Prev != nil && !kh.Prev.Absent && since[kh.Key].needsFull(kh.Prev, diffBytes(r)) {
 			r.Full = kh.Prev
 		}
 		records = append(records, r)
@@ -452,12 +497,13 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 				return err
 			}
 		}
-		last = &segment{dir: segDir, masks: make(map[[32]byte]uint64)}
+		last = &segment{dir: segDir, masks: make(map[[32]byte]uint64), since: make(map[[32]byte]sinceFull)}
 		s.segments = append(s.segments, last)
 	}
 	bit := uint64(1) << len(last.chunks)
 	for _, r := range records {
 		last.masks[r.Key] |= bit
+		last.since[r.Key] = last.since[r.Key].after(r)
 	}
 	last.chunks = append(last.chunks, meta)
 	s.prune()
@@ -566,39 +612,72 @@ func (s *Store) accountAtLocked(key [32]byte, slot uint64, cache blockCache) (*V
 		if mask == 0 {
 			continue
 		}
-		// Only the first record is needed when the account first changed after
-		// the slot's segment (j > i), and only chunks starting at or before the
-		// slot otherwise: later chunks hold only later differences.
-		var recs []*Record
+		// Chunks holding the key, ascending (a closed segment's index may
+		// name extra chunks through a prefix collision).
+		var held [maxSegmentChunks]int
+		idx := held[:0]
 		for m := mask; m != 0; m &= m - 1 {
 			c := bits.TrailingZeros64(m)
 			if c >= len(seg.chunks) {
 				break
 			}
-			if len(recs) > 0 && (j > i || seg.chunks[c].from > slot) {
-				break
+			idx = append(idx, c)
+		}
+		// The last chunk starting at or before the slot: later ones hold only
+		// later differences.
+		hi := -1
+		if j == i {
+			for k, c := range idx {
+				if seg.chunks[c].from <= slot {
+					hi = k
+				}
 			}
-			r, err := seg.chunks[c].reader.lookupCached(key, cache)
+		}
+		// Walk back to the nearest full copy at or before the slot.
+		var recs []*Record // descending
+		start := &Version{Absent: true}
+		for k := hi; k >= 0; k-- {
+			r, err := seg.chunks[idx[k]].reader.lookupCached(key, cache)
 			if err != nil {
 				return nil, through, err
 			}
-			if r != nil {
-				recs = append(recs, r)
+			if r == nil {
+				continue
+			}
+			recs = append(recs, r)
+			if r.Full != nil {
+				start = r.Full
+				break
 			}
 		}
 		if len(recs) == 0 {
-			continue // a prefix collision in a closed segment's index
+			// The account first changed after the slot within this segment, or
+			// in a later one: its version then is its first record's full copy
+			// (none: it did not exist). Chunks without a record for it are
+			// prefix collisions in a closed segment's index.
+			found := false
+			for _, c := range idx[hi+1:] {
+				r, err := seg.chunks[c].reader.lookupCached(key, cache)
+				if err != nil {
+					return nil, through, err
+				}
+				if r == nil {
+					continue
+				}
+				if r.Full != nil {
+					return r.Full, through, nil
+				}
+				found = true
+				break
+			}
+			if found {
+				return &Version{Absent: true}, through, nil
+			}
+			continue
 		}
-		v := &Version{Absent: true}
-		if recs[0].Full != nil {
-			v = recs[0].Full
-		}
-		if j > i {
-			return v, through, nil
-		}
-		v = v.Clone()
-		for _, r := range recs {
-			for _, d := range r.Diffs {
+		v := start.Clone()
+		for k := len(recs) - 1; k >= 0; k-- {
+			for _, d := range recs[k].Diffs {
 				if d.Slot > slot {
 					return v, through, nil
 				}
@@ -657,7 +736,7 @@ func closeSegment(seg *segment) error {
 		return err
 	}
 	seg.index = idx
-	seg.masks = nil
+	seg.masks, seg.since = nil, nil
 	return nil
 }
 

@@ -509,3 +509,86 @@ func TestSidecars(t *testing.T) {
 	require.Equal(t, []byte{0, 1, 2}, d)
 	require.NoError(t, s.Close())
 }
+
+// Accounts that change every fold get repeated full copies inside a segment;
+// every slot still reads back exactly, across a reopen in mid segment.
+func TestRepeatedFullCopies(t *testing.T) {
+	rng := rand.New(rand.NewSource(10))
+	dir := t.TempDir()
+	opts := Options{SegmentChunks: 40}
+	s, err := Open(dir, opts)
+	require.NoError(t, err)
+	keys := make([][32]byte, 12)
+	for i := range keys {
+		rng.Read(keys[i][:])
+	}
+	cur := map[[32]byte]*Version{}
+	for _, k := range keys {
+		v := &Version{Lamports: 10, Data: make([]byte, 400)}
+		rng.Read(v.Data)
+		cur[k] = v
+	}
+	truth := map[uint64]map[[32]byte]*Version{}
+	prev := func(ks [][32]byte) ([]*Version, error) {
+		out := make([]*Version, len(ks))
+		for i, k := range ks {
+			out[i] = cur[k]
+		}
+		return out, nil
+	}
+	slot := uint64(5000)
+	for f := 0; f < 34; f++ {
+		var sw []SlotWrites
+		next := map[[32]byte]*Version{}
+		for k, v := range cur {
+			next[k] = v
+		}
+		for sl := slot; sl < slot+4; sl++ {
+			w := SlotWrites{Slot: sl}
+			for i, k := range keys {
+				v := next[k].Clone()
+				v.Lamports++
+				if i%3 == 0 {
+					rng.Read(v.Data) // heavy: whole data rewritten
+				} else {
+					v.Data[rng.Intn(len(v.Data))] ^= 1 // light: one byte
+				}
+				w.Keys = append(w.Keys, k)
+				w.Versions = append(w.Versions, v)
+				next[k] = v
+			}
+			sw = append(sw, w)
+			snap := map[[32]byte]*Version{}
+			for k, v := range next {
+				snap[k] = v
+			}
+			truth[sl] = snap
+		}
+		require.NoError(t, s.Append(slot, slot+3, sw, prev))
+		cur = next
+		slot += 4
+		if f == 20 {
+			require.NoError(t, s.Close())
+			s, err = Open(dir, opts)
+			require.NoError(t, err)
+		}
+	}
+	require.Len(t, s.segments, 1)
+	fulls := 0
+	for _, c := range s.segments[0].chunks[1:] {
+		require.NoError(t, c.reader.records(func(r *Record) {
+			if r.Full != nil {
+				fulls++
+			}
+		}))
+	}
+	require.Positive(t, fulls, "later chunks repeat full copies")
+	for sl := uint64(5000); sl < slot; sl++ {
+		vs, errs, _ := s.AccountsAt(keys, sl)
+		for i, k := range keys {
+			require.NoError(t, errs[i], "slot %d", sl)
+			require.True(t, Same(vs[i], truth[sl][k]), "slot %d key %d", sl, i)
+		}
+	}
+	require.NoError(t, s.Close())
+}
