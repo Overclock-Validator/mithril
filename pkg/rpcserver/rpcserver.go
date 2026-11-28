@@ -11,11 +11,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -31,12 +35,21 @@ type rpcHandler struct {
 
 type rpcMethods interface {
 	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBalance(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
 	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlock(context.Context, jsonrpc.RawParams) (GetBlockResp, error)
 	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
 	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
 }
@@ -45,16 +58,28 @@ type RpcServer struct {
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
 
-	isReady       bool
-	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
-	listener      net.Listener
-	acctsDb       *accountsdb.AccountsDb
-	epochSchedule *sealevel.SysvarEpochSchedule
-	slotCtx       *sealevel.SlotCtx
-	slotCtxMu     sync.RWMutex
-	genesisHash   string
-	epochRewards  *epochrewards.Store
+	isReady         bool
+	rpcService      *jsonrpc.RPCServer
+	serv            *httptest.Server
+	listener        net.Listener
+	acctsDb         *accountsdb.AccountsDb
+	epochSchedule   *sealevel.SysvarEpochSchedule
+	slotCtx         *sealevel.SlotCtx
+	processedHeight uint64
+	processedCount  *uint64
+	slotCtxMu       sync.RWMutex
+	healthSlot      func() (uint64, bool)
+	healthReady     bool
+	genesisHash     string
+	epochRewards    *epochrewards.Store
+	blockHistory    *blockhistory.Store
+	rootedBank      atomic.Pointer[rootedBankState]
+	slotHistory     atomic.Pointer[publishedSlotHistory]
+
+	stakeCacheOnce  sync.Once
+	stakeCache      rootedStakeCache
+	voteRecordsOnce sync.Once
+	voteRecords     rootedVoteRecordCache
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -69,9 +94,28 @@ type RpcServer struct {
 	sendTransactionLeaderForwardCount uint64
 }
 
+// rootedBankState identifies the durable AccountsDB view served by state RPCs.
+// Publishing it only after a successful fold keeps response context and account
+// values on the same finalized bank.
+type rootedBankState struct {
+	Slot             uint64
+	BlockHeight      uint64
+	TransactionCount *uint64
+}
+
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
+	"getBalance":             {},
+	"getBlock":               {},
+	"getBlockProduction":     {},
+	"getFirstAvailableBlock": {},
+	"getHealth":              {},
+	"getLeaderSchedule":      {},
+	"getSlot":                {},
+	"getVoteAccounts":        {},
+	"minimumLedgerSlot":      {},
+
 	"getAccountInfo":      {},
 	"getBankHash":         {},
 	"getBlockHeight":      {},
@@ -81,6 +125,60 @@ var supportedRPCMethods = map[string]struct{}{
 	"getLatestBlockhash":  {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
+}
+
+func (rpcServer *RpcServer) EnableBlockHistory(dir string, retentionSlots, rootedSlot uint64) error {
+	store, err := blockhistory.Open(dir, retentionSlots)
+	if err != nil {
+		return err
+	}
+	if err := store.SetRooted(rootedSlot); err != nil {
+		return err
+	}
+	rpcServer.blockHistory = store
+	return nil
+}
+
+func (rpcServer *RpcServer) RecordBlockHistory(block *b.Block) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordBlock(block)
+}
+
+func (rpcServer *RpcServer) RecordSkippedBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordSkipped(slot)
+}
+
+func (rpcServer *RpcServer) PrepareBlockHistory(through uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Prepare(through)
+}
+
+func (rpcServer *RpcServer) SetRootedBlockHistorySlot(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.SetRooted(slot)
+}
+
+func (rpcServer *RpcServer) RewindBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Rewind(slot)
+}
+
+func (rpcServer *RpcServer) DiscardUnrootedBlockHistory(from uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.DiscardUnrootedFrom(from)
 }
 
 // EnableEpochRewards attaches durable Alpenglow reward history to the RPC server.
@@ -195,8 +293,135 @@ func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
 	rpcServer.historyRecoveryMu.Lock()
 	defer rpcServer.historyRecoveryMu.Unlock()
 	rpcServer.historyRecoveryPending = pending
+	if pending {
+		rpcServer.slotHistory.Store(nil)
+	}
 	if pending && rpcServer.epochRewards != nil {
 		rpcServer.epochRewards.ResetPublished()
+	}
+}
+
+func copyTransactionCount(count *uint64) *uint64 {
+	if count != nil {
+		return new(*count)
+	}
+	return nil
+}
+
+// SetRootedBankState publishes a bank with a known cumulative transaction count.
+func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	rpcServer.PublishRootedBankState(slot, blockHeight, &transactionCount)
+}
+
+// PublishRootedBankState preserves an unknown count from a legacy checkpoint.
+func (rpcServer *RpcServer) PublishRootedBankState(slot, blockHeight uint64, transactionCount *uint64) {
+	rpcServer.rootedBank.Store(&rootedBankState{
+		Slot:             slot,
+		BlockHeight:      blockHeight,
+		TransactionCount: copyTransactionCount(transactionCount),
+	})
+}
+
+func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
+	rooted := rpcServer.rootedBank.Load()
+	if rooted == nil {
+		return rootedBankState{}, false
+	}
+	return *rooted, true
+}
+
+func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana.PublicKey, minContextSlot *uint64) (rootedBankState, *accounts.Account, error) {
+	var floor uint64
+	if minContextSlot != nil {
+		floor = *minContextSlot
+	}
+	rooted, accountSet, err := rpcServer.readRootedAccountsAtLeast(ctx, []solana.PublicKey{pubkey}, floor)
+	if err != nil {
+		return rooted, nil, err
+	}
+	// Batch reads use zero-lamport placeholders for absent/deleted accounts.
+	// Translate that loader representation into absence at the RPC boundary.
+	if len(accountSet) != 1 || accountSet[0] == nil || accountSet[0].Lamports == 0 {
+		return rooted, nil, accountsdb.ErrNoAccount
+	}
+	return rooted, accountSet[0], nil
+}
+
+func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
+	return rpcServer.readRootedAccountsAtLeast(ctx, pubkeys, 0)
+}
+
+func (rpcServer *RpcServer) readRootedAccountsAtLeast(ctx context.Context, pubkeys []solana.PublicKey, minContextSlot uint64) (rootedBankState, []*accounts.Account, error) {
+	var retry accountPublicationWait
+	for {
+		bank := rpcServer.rootedBank.Load()
+		if bank == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no rooted bank available")
+		}
+		rooted := *bank
+		if rpcServer.acctsDb == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no accounts database available")
+		}
+		version, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := retry.wait(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		if rooted.Slot < minContextSlot {
+			if rpcServer.rootedBank.Load() != bank {
+				if err := retry.wait(ctx); err != nil {
+					return rooted, nil, err
+				}
+				continue
+			}
+			return rooted, nil, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
+		}
+		accounts, stats, err := rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || stats.PendingFoldHits > 0 ||
+			rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := retry.wait(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		return rooted, accounts, err
+	}
+}
+
+func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
+	durableThrough := rpcServer.acctsDb.DurableThrough()
+	// Zero means the snapshot baseline is active and no fold has committed yet.
+	return durableThrough != 0 && durableThrough != rootedSlot
+}
+
+// Start the bound on the first retry. A read that selects a stable bank pays
+// no clock or timer cost, and a failed publication cannot hold a caller forever.
+type accountPublicationWait struct{ deadline time.Time }
+
+func (w *accountPublicationWait) wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	if w.deadline.IsZero() {
+		w.deadline = now.Add(time.Second)
+	} else if !now.Before(w.deadline) {
+		return context.DeadlineExceeded
+	}
+	return waitForRootedPublication(ctx)
+}
+
+func waitForRootedPublication(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -264,6 +489,11 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	// Replay calls this before starting the next bank. Capture the completed
+	// bank's counters once; never read the next bank's work during an RPC.
+	rpcServer.processedHeight = global.BlockHeight()
+	rpcServer.processedCount = global.ExactTransactionCount()
+	rpcServer.healthReady = slotCtx != nil
 	rpcServer.slotCtxMu.Unlock()
 }
 
