@@ -31,6 +31,7 @@ type GlobalCtx struct {
 	slot                       uint64
 	epoch                      uint64
 	transactionCount           uint64
+	transactionCountKnown      bool
 	pendingStakeBySlot         map[uint64][]accountsdb.StakeIndexEntry // New stake entries keyed by the slot that created them; flushed to the index file only when that slot FOLDS (branch-safe: unwound slots drop their entries), merged into stake scans from RAM meanwhile
 	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
 	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
@@ -41,6 +42,7 @@ type GlobalCtx struct {
 	slotsConfirmed             map[uint64]struct{}
 	leaderSchedule             *leaderschedule.LeaderSchedule // compatibility schedule installed by SetLeaderSchedule
 	leaderSchedules            map[uint64]*leaderschedule.LeaderSchedule
+	leaderScheduleGeneration   uint64
 	calcUnixTimeForClockSysvar bool
 	manageLeaderSchedule       bool
 	pendingStakeMutex          sync.Mutex // Protects pendingNewStakePubkeys
@@ -73,7 +75,7 @@ func IncrTransactionCount(num uint64) {
 	instance.IncrTransactionCount(num)
 }
 
-func SetTransactionCount(num uint64) {
+func SetTransactionCount(num *uint64) {
 	instance.SetTransactionCount(num)
 }
 
@@ -301,6 +303,16 @@ func Epoch() uint64 {
 	return instance.Epoch()
 }
 
+// ExactTransactionCount returns nil when the checkpoint lacked a cumulative count.
+func ExactTransactionCount() *uint64 {
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	if !instance.transactionCountKnown {
+		return nil
+	}
+	return new(instance.transactionCount)
+}
+
 func TransactionCount() uint64 {
 	return instance.TransactionCount()
 }
@@ -324,6 +336,7 @@ func ManageLeaderSchedule() bool {
 func SetLeaderSchedule(ls *leaderschedule.LeaderSchedule) {
 	instance.leaderScheduleMutex.Lock()
 	defer instance.leaderScheduleMutex.Unlock()
+	instance.leaderScheduleGeneration++
 
 	instance.leaderSchedule = ls
 	instance.leaderSchedules = nil
@@ -336,6 +349,7 @@ func SetLeaderSchedule(ls *leaderschedule.LeaderSchedule) {
 func SetLeaderScheduleForEpoch(epoch uint64, ls *leaderschedule.LeaderSchedule) {
 	instance.leaderScheduleMutex.Lock()
 	defer instance.leaderScheduleMutex.Unlock()
+	instance.leaderScheduleGeneration++
 
 	// Epoch-aware production callers supersede the legacy single-schedule API.
 	instance.leaderSchedule = nil
@@ -440,10 +454,14 @@ func (globctx *GlobalCtx) IncrTransactionCount(num uint64) {
 // SetTransactionCount overwrites the running transaction count — used to seed it
 // from a resume checkpoint and to restore it after an in-loop fork-switch unwind
 // (so a discarded fork's transactions do not linger in the count).
-func (globctx *GlobalCtx) SetTransactionCount(num uint64) {
+func (globctx *GlobalCtx) SetTransactionCount(num *uint64) {
 	globctx.mu.Lock()
 	defer globctx.mu.Unlock()
-	globctx.transactionCount = num
+	globctx.transactionCountKnown = num != nil
+	globctx.transactionCount = 0
+	if num != nil {
+		globctx.transactionCount = *num
+	}
 }
 
 func (globctx *GlobalCtx) LatestBlockhash() [32]byte {
