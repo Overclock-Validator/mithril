@@ -8,6 +8,7 @@ import (
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/stretchr/testify/require"
@@ -110,5 +111,35 @@ func TestEpochRewardHistoryRecoveryGate(t *testing.T) {
 		}
 		require.NoError(t, err)
 		require.Equal(t, []*InflationRewardResp{{Epoch: 0, EffectiveSlot: 2, Amount: 1, PostBalance: 2}}, rewards)
+	}
+}
+
+func TestBlockHistoryRecoveryGate(t *testing.T) {
+	server := &RpcServer{}
+	require.NoError(t, server.EnableBlockHistory(t.TempDir(), 100, 0))
+	require.NoError(t, server.RecordBlockHistory(&b.Block{Slot: 2, ParentSlot: 1, BlockHeight: 2}))
+	require.NoError(t, server.PrepareBlockHistory(2))
+	require.NoError(t, server.SetRootedBlockHistorySlot(2))
+
+	for _, pending := range []bool{false, true, false} {
+		server.SetHistoryRecoveryPending(pending)
+		minimum, minimumErr := server.MinimumLedgerSlot(t.Context(), jsonrpc.RawParams("[]"))
+		first, firstErr := server.GetFirstAvailableBlock(t.Context(), jsonrpc.RawParams("[]"))
+		block, blockErr := server.GetBlock(t.Context(), jsonrpc.RawParams(`[2,{"transactionDetails":"none"}]`))
+		if pending {
+			for _, err := range []error{minimumErr, firstErr, blockErr} {
+				require.EqualError(t, err, "RPC history is unavailable during account recovery")
+			}
+			require.Zero(t, minimum)
+			require.Zero(t, first)
+			require.Zero(t, block)
+			continue
+		}
+		require.NoError(t, minimumErr)
+		require.NoError(t, firstErr)
+		require.NoError(t, blockErr)
+		require.Equal(t, uint64(2), minimum)
+		require.Equal(t, uint64(2), first)
+		require.Equal(t, uint64(2), block.BlockHeight)
 	}
 }
