@@ -37,6 +37,7 @@ type chunkMeta struct {
 	from, to uint64
 	path     string
 	reader   *chunkReader
+	sigs     bool // the chunk's transactions are in the signature index
 }
 
 type segment struct {
@@ -45,6 +46,9 @@ type segment struct {
 	index  *segmentIndex          // closed segments
 	masks  map[[32]byte]uint64    // open segment
 	since  map[[32]byte]sinceFull // open segment: work since each key's last full copy
+	// sigFiles is the segment's signature index, ascending: once the segment
+	// is closed, one file for all of it; before that, one per chunk.
+	sigFiles []*sigFile
 }
 
 func (s *segment) from() uint64 { return s.chunks[0].from }
@@ -168,7 +172,7 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 		return nil, false, err
 	}
 	var found []*chunkMeta
-	var banks []string
+	var banks, sigNames []string
 	hasIndex := false
 	for _, e := range entries {
 		name := e.Name()
@@ -177,6 +181,8 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 			_ = os.Remove(filepath.Join(dir, name))
 		case name == segmentIndexName:
 			hasIndex = true
+		case strings.HasSuffix(name, ".hsg"):
+			sigNames = append(sigNames, name)
 		case strings.HasSuffix(name, ".hbk"), strings.HasSuffix(name, ".hsc"):
 			banks = append(banks, name)
 		default:
@@ -228,7 +234,18 @@ func (s *Store) loadSegment(dir string, last bool, expect uint64, have bool) (se
 	if len(seg.chunks) == 0 {
 		return nil, damaged, os.RemoveAll(dir)
 	}
+	seg.loadSigs(sigNames)
 	open := last && len(seg.chunks) < s.segmentChunks
+	if !open {
+		// A segment closed by a fold that stopped before merging.
+		merged, err := seg.mergeSigs()
+		if err != nil {
+			return nil, damaged, err
+		}
+		if merged != nil {
+			seg.useMergedSigs(merged)
+		}
+	}
 	if hasIndex && !open {
 		idx, err := openSegmentIndex(filepath.Join(dir, segmentIndexName))
 		if err == nil {
@@ -454,6 +471,19 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 		records = append(records, r)
 	}
 
+	// A segment about to close merges its chunks' signature files first,
+	// outside the lock: readers keep using the chunk files until the swap.
+	var merged *sigFile
+	if newSegment && last != nil && last.masks != nil {
+		s.mu.RLock()
+		var err error
+		merged, err = last.mergeSigs()
+		s.mu.RUnlock()
+		if err != nil {
+			return err
+		}
+	}
+
 	segDir := ""
 	if newSegment {
 		segDir = filepath.Join(s.dir, segmentDirName(from))
@@ -480,11 +510,18 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			return err
 		}
 	}
+	var sigs *sigFile
+	if bank != nil && bank.Signatures != nil {
+		var err error
+		if sigs, err = writeChunkSigs(filepath.Join(segDir, sigChunkFileName(from, to)), from, to, bank.Signatures); err != nil {
+			return err
+		}
+	}
 	reader, err := writeChunk(path, from, to, records)
 	if err != nil {
 		return err
 	}
-	meta := &chunkMeta{from: from, to: to, path: path, reader: reader}
+	meta := &chunkMeta{from: from, to: to, path: path, reader: reader, sigs: sigs != nil}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -496,6 +533,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 			if err := closeSegment(last); err != nil {
 				return err
 			}
+			if merged != nil {
+				last.useMergedSigs(merged)
+			}
 		}
 		last = &segment{dir: segDir, masks: make(map[[32]byte]uint64), since: make(map[[32]byte]sinceFull)}
 		s.segments = append(s.segments, last)
@@ -506,6 +546,9 @@ func (s *Store) AppendKeys(from, to uint64, keys []KeyHistory, bank *BankData) e
 		last.since[r.Key] = last.since[r.Key].after(r)
 	}
 	last.chunks = append(last.chunks, meta)
+	if sigs != nil {
+		last.sigFiles = append(last.sigFiles, sigs)
+	}
 	s.prune()
 	return nil
 }
@@ -828,6 +871,9 @@ func (s *Store) TruncateFrom(slot uint64) error {
 			if err := os.Remove(filepath.Join(seg.dir, segmentIndexName)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+		}
+		if err := seg.truncateSigs(keep); err != nil {
+			return err
 		}
 		for _, c := range seg.chunks[keep:] {
 			if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {

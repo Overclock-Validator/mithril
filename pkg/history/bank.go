@@ -54,6 +54,9 @@ type BankData struct {
 	// case letters and digits), such as replay hints. Each is stored in its
 	// own file, removed with the chunk, and read back with SidecarAt.
 	Sidecars map[string][]byte
+	// Signatures index the fold's transactions by signature, one entry per
+	// folded block in slot order; nil when not recorded for this fold.
+	Signatures []SlotSignatures
 }
 
 // ErrNoSidecar: no record of that kind for the slot's chunk.

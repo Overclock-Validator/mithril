@@ -201,6 +201,10 @@ type unrootedTail struct {
 	// contexts holds the deep-copied end-of-slot resume context per held slot,
 	// retained until promotion so the context as of the last rooted slot survives for resume.
 	contexts map[uint64]*state.ResumeContext
+	// sigPrefixes holds each held slot's transactions' first-signature
+	// prefixes in block order, for account history's signature index (only
+	// while history is on).
+	sigPrefixes map[uint64][]uint64
 	// bankSysvars is the in-memory-only immutable sysvar snapshot paired with
 	// each retained context. It is deliberately not part of ResumeContext (and
 	// therefore never enters persisted JSON): the durable resume path rebuilds
@@ -246,6 +250,7 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		maxBytes:       WorkingSetMaxBytes,
 		stakeIdxDir:    stakeIdxDir,
 		contexts:       make(map[uint64]*state.ResumeContext),
+		sigPrefixes:    make(map[uint64][]uint64),
 		bankSysvars:    make(map[uint64]*sealevel.BankSysvars),
 		epochCaches:    make(map[uint64]*global.EpochCacheSnapshot),
 		forkStates:     make(map[uint64]*replayForkState),
@@ -513,6 +518,21 @@ func (t *unrootedTail) SetContext(slot uint64, ctx *state.ResumeContext, bankSys
 	}
 }
 
+// SetSignatures records a held slot's transactions for account history's
+// signature index; it does nothing while history is off.
+func (t *unrootedTail) SetSignatures(slot uint64, txs []*solana.Transaction) {
+	if hb, ok := t.committer.(historyBankStager); !ok || !hb.HistoryEnabled() {
+		return
+	}
+	p := make([]uint64, len(txs))
+	for i, tx := range txs {
+		if len(tx.Signatures) > 0 {
+			p[i] = history.SignaturePrefix(tx.Signatures[0][:])
+		}
+	}
+	t.sigPrefixes[slot] = p
+}
+
 // promote folds full K-slot chunks of the rooted prefix <= through to disk;
 // a trailing partial chunk stays in RAM until it fills (or flush() forces it).
 // Returns the highest slot now durable and its resume context (nil if none).
@@ -537,6 +557,11 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 	for s := range t.contexts {
 		if s <= promotedThrough {
 			delete(t.contexts, s)
+		}
+	}
+	for s := range t.sigPrefixes {
+		if s <= promotedThrough {
+			delete(t.sigPrefixes, s)
 		}
 	}
 	for s := range t.bankSysvars {
@@ -617,9 +642,19 @@ func decode32(s string) (out [32]byte, ok bool) {
 
 // foldHistoryBank turns the chunk's per-slot resume contexts into history bank
 // records, with the chunk top's heavier context. A context that does not
-// decode is left out rather than recorded with zero hashes.
-func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, through uint64) *history.BankData {
-	b := &history.BankData{}
+// decode is left out rather than recorded with zero hashes. The chunk's
+// transactions are indexed by signature only when every slot's are known, so
+// the index never claims a slot it lacks.
+func foldHistoryBank(chunk []accounts.SlotDelta, contexts map[uint64]*state.ResumeContext, sigPrefixes map[uint64][]uint64, through uint64) *history.BankData {
+	b := &history.BankData{Signatures: make([]history.SlotSignatures, 0, len(chunk))}
+	for _, sd := range chunk {
+		p, ok := sigPrefixes[sd.Slot]
+		if !ok {
+			b.Signatures = nil
+			break
+		}
+		b.Signatures = append(b.Signatures, history.SlotSignatures{Slot: sd.Slot, Prefixes: p})
+	}
 	for _, sd := range chunk {
 		ctx := contexts[sd.Slot]
 		if ctx == nil {
@@ -738,7 +773,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	}
 	var historyBank *history.BankData
 	if hb, ok := t.committer.(historyBankStager); ok && hb.HistoryEnabled() {
-		historyBank = foldHistoryBank(chunk, t.contexts, through)
+		historyBank = foldHistoryBank(chunk, t.contexts, t.sigPrefixes, through)
 	}
 	return &foldJob{
 		historyBank:                            historyBank,
@@ -889,6 +924,11 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 	for s := range t.contexts {
 		if s <= job.through {
 			delete(t.contexts, s)
+		}
+	}
+	for s := range t.sigPrefixes {
+		if s <= job.through {
+			delete(t.sigPrefixes, s)
 		}
 	}
 	for s := range t.bankSysvars {
@@ -1094,6 +1134,11 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 		if slot >= fromSlot {
 			global.DropPendingStakePubkeys(slot)
 			delete(t.bankhashes, slot)
+		}
+	}
+	for slot := range t.sigPrefixes {
+		if slot >= fromSlot {
+			delete(t.sigPrefixes, slot)
 		}
 	}
 	for slot := range t.contexts {

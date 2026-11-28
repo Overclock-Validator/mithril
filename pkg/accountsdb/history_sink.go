@@ -190,6 +190,11 @@ func bankWithin(b *history.BankData, from, to uint64) bool {
 			return false
 		}
 	}
+	for i, r := range b.Signatures {
+		if r.Slot < from || r.Slot > to || (i > 0 && r.Slot <= b.Signatures[i-1].Slot) {
+			return false
+		}
+	}
 	return b.Top == nil || (b.Top.Slot >= from && b.Top.Slot <= to)
 }
 

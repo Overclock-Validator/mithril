@@ -4044,6 +4044,7 @@ func ReplayBlocks(
 			}
 			unrootedTailState.SetContext(block.Slot, resumeCtx, lastSlotCtx.BankSysvars())
 			if unrootedTailState != nil {
+				unrootedTailState.SetSignatures(block.Slot, block.Transactions)
 				if _, ok := rpcServer.(rootedExecutionBankSetter); ok {
 					unrootedTailState.executionBanks[block.Slot] = rpcExecutionBankContext(lastSlotCtx)
 				}
