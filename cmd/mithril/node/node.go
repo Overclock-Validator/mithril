@@ -2623,6 +2623,7 @@ postBootstrap:
 		if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
 			klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
 		}
+		rpcServer.SetIdentitySource(func() string { return validatorIdentity.PublicKey().String() })
 		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}

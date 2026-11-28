@@ -39,6 +39,8 @@ type rpcMethods interface {
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 }
 
 type RpcServer struct {
@@ -67,6 +69,9 @@ type RpcServer struct {
 	// transactionSender is injectable for tests; production supports QUIC with UDP fallback.
 	transactionSender                 transactionSender
 	sendTransactionLeaderForwardCount uint64
+
+	identity       string
+	identitySource func() string
 }
 
 const maxQuietMethodProbeBody = 64 << 10
@@ -81,6 +86,9 @@ var supportedRPCMethods = map[string]struct{}{
 	"getLatestBlockhash":  {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
+
+	"getIdentity": {},
+	"getVersion":  {},
 }
 
 // EnableEpochRewards attaches durable Alpenglow reward history to the RPC server.
