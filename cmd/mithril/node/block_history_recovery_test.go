@@ -133,10 +133,10 @@ func TestBlockHistoryHTTPAfterDurableRewind(t *testing.T) {
 			require.Contains(t, string(call(blockRequest)["error"]), "RPC history is unavailable during account recovery")
 			wrongRoot := *s
 			wrongRoot.LastRootedSlot++
-			_, err = finishReplayRecovery(server, &wrongRoot, nil)
+			_, err = finishReplayRecovery(server, &wrongRoot, nil, nil, true)
 			require.ErrorContains(t, err, "does not match the durable root")
 			require.Contains(t, string(call(blockRequest)["error"]), "RPC history is unavailable during account recovery")
-			_, err = finishReplayRecovery(server, s, nil)
+			_, err = finishReplayRecovery(server, s, nil, nil, true)
 			require.NoError(t, err)
 			require.JSONEq(t, `2`, string(call(slotRequest)["result"]))
 			require.JSONEq(t, `{"code":-32004,"message":"Block not available for slot 4"}`, string(call(blockRequest)["error"]))

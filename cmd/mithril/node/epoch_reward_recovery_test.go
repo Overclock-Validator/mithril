@@ -121,7 +121,7 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 				require.True(t, rewindStoreBelowDivergence(dir, db, s, 3, 100, server))
 			}
 			require.Equal(t, uint64(2), s.LastRootedSlot)
-			_, err = finishReplayRecovery(server, s, nil)
+			_, err = finishReplayRecovery(server, s, nil, nil, true)
 			require.NoError(t, err)
 			// Replay's startup hook must not restore the discarded durable reward.
 			require.NoError(t, server.RewindEpochRewards(s.GetResumeSlot()))

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -44,6 +45,7 @@ func TestChainTipTracksReplayedSlot(t *testing.T) {
 		LatestEvictedBlockhash: [32]byte{6},
 		VoteAccts:              map[solana.PublicKey]uint64{epochStakeKey: 55},
 		TotalEpochStake:        99,
+		FeeRateGovernor:        &sealevel.FeeRateGovernor{LamportsPerSignature: 6000, PrevLamportsPerSignature: 5000},
 	}
 	require.NoError(t, slotCtx.PublishBankSysvars(bankSysvars))
 	require.NoError(t, slotCtx.SetAccount(nanoClock.Key, nanoClock))
@@ -83,6 +85,30 @@ func TestChainTipTracksReplayedSlot(t *testing.T) {
 	require.True(t, tip.AcctsLtHash.Equals(updated))
 	require.True(t, tip.Features.IsActive(features.AccountsLtHash))
 	require.Same(t, statuses, tip.TransactionStatuses)
+
+	rpcBank := rpcExecutionBankContext(slotCtx)
+	require.NotNil(t, rpcBank)
+	require.Equal(t, tip.Slot, rpcBank.Slot)
+	require.Equal(t, tip.LastBlockhash, rpcBank.LastBlockhash)
+	require.Equal(t, tip.LatestEvictedBlockhash, rpcBank.LatestEvictedBlockhash)
+	require.Equal(t, tip.BlockHeight, rpcBank.BlockHeight)
+	require.Equal(t, tip.TotalEpochStake, rpcBank.TotalEpochStake)
+	require.Same(t, bankSysvars, rpcBank.BankSysvars)
+	require.Nil(t, rpcBank.UnrootedRead)
+	require.Nil(t, rpcBank.AcctsLtHash)
+	require.Nil(t, rpcBank.TransactionStatuses)
+	require.Nil(t, rpcBank.NanosecondClockAccount)
+	slotCtx.Features.DisableFeature(features.AccountsLtHash)
+	slotCtx.FeeRateGovernor.PrevLamportsPerSignature = 9999
+	require.True(t, rpcBank.Features.IsActive(features.AccountsLtHash))
+	require.Equal(t, uint64(5000), rpcBank.PrevFeeGovernor.PrevLamportsPerSignature)
+	require.Equal(t, uint64(6000), rpcBank.PrevFeeGovernor.LamportsPerSignature)
+
+	otherBank, err := sealevel.NewBankSysvars(slotCtx.Slot)
+	require.NoError(t, err)
+	require.NoError(t, slotCtx.PublishBankSysvars(otherBank))
+	require.Nil(t, rpcExecutionBankContext(slotCtx), "same-slot snapshots from different banks cannot be paired")
+	require.Nil(t, rpcExecutionBankContext(nil))
 }
 
 func TestResetChainTipClearsTransactionStatuses(t *testing.T) {
@@ -110,6 +136,27 @@ func TestResetChainTipClearsTransactionStatuses(t *testing.T) {
 	require.Zero(t, after.LatestEvictedBlockhash)
 	require.False(t, after.HasNanosecondClockAccount)
 	require.Nil(t, after.NanosecondClockAccount)
+}
+
+func TestChainTipBindsAccountVersionsBeforeSameSlotReplacement(t *testing.T) {
+	t.Cleanup(ResetChainTip)
+	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+	tail := asyncTestTail(fc, 5)
+	db := &accountsdb.AccountsDb{}
+	ctx := &sealevel.SlotCtx{Slot: 5, AccountsDb: db, UnrootedRead: tail}
+	UpdateChainTipFromSlotCtx(ctx, nil, nil, ChainTipIdentity{})
+	published := ChainTipParentContext()
+	require.True(t, published.AccountVersionsReady)
+	require.Equal(t, tail.AccountReadVersion(), published.UnrootedVersion)
+	version, stable := db.CommittedAccountVersion()
+	require.True(t, stable)
+	require.Equal(t, version, published.AccountVersion)
+	tail.Add(5, []*accounts.Account{{Key: solana.PublicKey{1}, Lamports: 77}}, nil)
+	require.Greater(t, tail.AccountReadVersion(), published.UnrootedVersion)
+	require.Equal(t, published.UnrootedVersion, ChainTipParentContext().UnrootedVersion,
+		"reading the publication must not substitute the new fork's current revision")
+	ResetChainTip()
+	require.False(t, ChainTipParentContext().AccountVersionsReady)
 }
 
 func TestChainTipPreservesPrefundedNanosecondClockAccount(t *testing.T) {

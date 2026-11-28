@@ -249,7 +249,7 @@ func TestWorkAheadFinishAfterEmptyPlan(t *testing.T) {
 	workAheadEnabled = true
 	defer func() { workAheadEnabled = saved }()
 	slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewOverlayAccounts(accounts.NewMemAccountsWithLen(1)), Features: features.NewFeaturesDefault()}
-	w := newWorkAhead(slotCtx, &b.Block{}, nil, nil)
+	w := newWorkAhead(slotCtx, &b.Block{}, nil, nil, false)
 	if w == nil {
 		t.Fatal("work-ahead off")
 	}

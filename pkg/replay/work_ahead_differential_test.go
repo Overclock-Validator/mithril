@@ -76,20 +76,22 @@ func TestWorkAheadDifferentialCommit(t *testing.T) {
 		first, second *solana.Transaction
 		adopt         bool
 		wantErr       error
+		capture       bool
 	}{
-		{"predicted fee debit", fails, succeeds, true, nil},
-		{"successful prerequisite invalidates predicted debit", succeeds, feesOnly, false, TxErrInvalidProgramForExecution},
-		{"fee-only load failure", fails, feesOnly, true, TxErrInvalidProgramForExecution},
-		{"fee-only prerequisite", feesOnly, succeeds, true, nil},
-		{"durable nonce success", fails, nonceSuccess, true, nil},
-		{"durable nonce rollback", fails, nonceFailure, true, nil},
-		{"failed nonce prerequisite", nonceFailure, succeeds, true, nil},
-		{"reused durable nonce", nonceFailure, nonceSuccess, false, TxErrInvalidBlockhash},
+		{"predicted fee debit", fails, succeeds, true, nil, false},
+		{"successful prerequisite invalidates predicted debit", succeeds, feesOnly, false, TxErrInvalidProgramForExecution, false},
+		{"fee-only load failure", fails, feesOnly, true, TxErrInvalidProgramForExecution, false},
+		{"fee-only prerequisite", feesOnly, succeeds, true, nil, false},
+		{"durable nonce success", fails, nonceSuccess, true, nil, false},
+		{"durable nonce rollback", fails, nonceFailure, true, nil, false},
+		{"failed nonce prerequisite", nonceFailure, succeeds, true, nil, false},
+		{"reused durable nonce", nonceFailure, nonceSuccess, false, TxErrInvalidBlockhash, false},
+		{"adopted execution retains history metadata", fails, succeeds, true, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want, got := slot(t), slot(t)
 			txs := []*solana.Transaction{tc.first, tc.second}
-			w := newWorkAhead(got, &b.Block{Transactions: txs}, []bool{true, true}, nil)
+			w := newWorkAhead(got, &b.Block{Transactions: txs}, []bool{true, true}, nil, tc.capture)
 			require.NotNil(t, w)
 			// Supply the worker arena normally installed at node startup.
 			pool := workAheadArenas
@@ -124,12 +126,25 @@ func TestWorkAheadDifferentialCommit(t *testing.T) {
 					defer release()
 					require.Equal(t, tc.adopt, adopted != nil)
 					if adopted != nil {
-						canonical := LoadAndExecuteTransaction(transactionExecutionInput(want, tx, nil, nil, false, false))
+						canonical := LoadAndExecuteTransaction(transactionExecutionInput(want, tx, nil, nil, false, false, tc.capture))
 						require.Empty(t, compareOutputs(adopted, &canonical))
+						if tc.capture {
+							require.IsType(t, &sealevel.LogRecorder{}, adopted.ExecCtx.Log)
+						}
 					}
 				}
-				wantFee, wantCU, wantErr := processTransaction(want, nil, tx, nil, nil, nil, false, nil, nil)
-				gotFee, gotCU, gotErr := processTransaction(got, nil, tx, nil, nil, nil, false, adopted, nil)
+				var wantCapture, gotCapture *transactionMetadataCapture
+				if tc.capture {
+					wantCapture, gotCapture = &transactionMetadataCapture{}, &transactionMetadataCapture{}
+				}
+				wantFee, wantCU, wantErr := processTransaction(want, nil, tx, nil, nil, nil, false, nil, nil, wantCapture, nil)
+				gotFee, gotCU, gotErr := processTransaction(got, nil, tx, nil, nil, nil, false, adopted, nil, gotCapture, nil)
+				if tc.capture {
+					require.NoError(t, wantCapture.Err)
+					require.NoError(t, gotCapture.Err)
+					require.NotNil(t, wantCapture.Record)
+					require.Equal(t, wantCapture.Record, gotCapture.Record)
+				}
 				require.Equal(t, wantFee, gotFee)
 				require.Equal(t, wantCU, gotCU)
 				require.Equal(t, wantErr, gotErr)

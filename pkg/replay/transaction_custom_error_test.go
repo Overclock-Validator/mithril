@@ -17,6 +17,9 @@ func TestTransactionCustomErrorJSON(t *testing.T) {
 	wrap := func(err error) error {
 		return fmt.Errorf("program: %w", &sbpf.Exception{Detail: sbpf.ExcSyscallError{Err: err}})
 	}
+	wrapDetail := func(err error) error {
+		return &sbpf.Exception{Detail: fmt.Errorf("call: %w", sbpf.ExcSyscallError{Err: err})}
+	}
 	for _, test := range []struct {
 		name string
 		err  error
@@ -34,12 +37,15 @@ func TestTransactionCustomErrorJSON(t *testing.T) {
 		{"wrapped-named-code", fmt.Errorf("program: %w", sealevel.SystemProgErrResultWithNegativeLamports), `{"Custom":1}`},
 		{"nested-named-zero", wrap(sealevel.SystemProgErrAccountAlreadyInUse), `{"Custom":0}`},
 		{"nested-named-one", wrap(sealevel.SystemProgErrResultWithNegativeLamports), `{"Custom":1}`},
+		{"wrapped-detail-named", wrapDetail(sealevel.SystemProgErrResultWithNegativeLamports), `{"Custom":1}`},
+		{"wrapped-detail-typed", wrapDetail(sealevel.InstrErrCustomCode{Code: 1}), `{"Custom":1}`},
 		{"unit-variant", sealevel.InstrErrInvalidArgument, `"InvalidArgument"`},
 		{"wrapped-unit", fmt.Errorf("program: %w", sealevel.InstrErrInvalidArgument), `"InvalidArgument"`},
 		{"nested-compute-budget", wrap(sealevel.InstrErrComputationalBudgetExceeded), `"ComputationalBudgetExceeded"`},
 		{"nested-missing-signature", wrap(sealevel.InstrErrMissingRequiredSignature), `"MissingRequiredSignature"`},
 		{"nested-privilege", wrap(sealevel.InstrErrPrivilegeEscalation), `"PrivilegeEscalation"`},
 		{"nested-vm-failure", wrap(sealevel.InstrErrProgramFailedToComplete), `"ProgramFailedToComplete"`},
+		{"direct-vm-failure", sealevel.InstrErrProgramFailedToComplete, `"ProgramFailedToComplete"`},
 		{"borsh-unit", sealevel.InstrErrBorshIoError, `"BorshIoError"`},
 		{"nested-borsh-unit", wrap(sealevel.InstrErrBorshIoError), `"BorshIoError"`},
 		{"unknown", errors.New("unknown instruction failure"), `"unknown instruction failure"`},

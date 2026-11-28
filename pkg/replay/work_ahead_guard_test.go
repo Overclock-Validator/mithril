@@ -47,7 +47,7 @@ func TestWorkAheadFooterShutoff(t *testing.T) {
 	savedEnabled := workAheadEnabled
 	workAheadEnabled = true
 	defer func() { workAheadEnabled = savedEnabled }()
-	if newWorkAhead(slotCtx, &b.Block{Slot: 200}, nil, nil) != nil {
+	if newWorkAhead(slotCtx, &b.Block{Slot: 200}, nil, nil, false) != nil {
 		t.Fatal("work-ahead must stay off once tripped")
 	}
 }
@@ -221,10 +221,10 @@ func TestWorkAheadNeverOnLocalProduction(t *testing.T) {
 	workAheadEnabled = true
 	defer func() { workAheadEnabled = savedEnabled }()
 	slotCtx := &sealevel.SlotCtx{Slot: 200, Accounts: accounts.NewOverlayAccounts(accounts.NewMemAccounts())}
-	if newWorkAhead(slotCtx, &b.Block{Slot: 200}, nil, nil) == nil {
+	if newWorkAhead(slotCtx, &b.Block{Slot: 200}, nil, nil, false) == nil {
 		t.Fatal("replayed block: work-ahead expected")
 	}
-	if newWorkAhead(slotCtx, &b.Block{Slot: 200, FromLocalProduction: true}, nil, nil) != nil {
+	if newWorkAhead(slotCtx, &b.Block{Slot: 200, FromLocalProduction: true}, nil, nil, false) != nil {
 		t.Fatal("locally produced block executed early")
 	}
 }

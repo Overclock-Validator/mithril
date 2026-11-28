@@ -280,7 +280,17 @@ func lifecycleWholeBlock(t *testing.T, env *lifecycleEnv, txs []*solana.Transact
 // execute at finalize.
 func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int) (lifecycleOutcome, *streamingExecutor) {
 	t.Helper()
-	s, exec, tail := lifecycleOpenStream(t, env, txs, splits, suffixTxs, workers)
+	return lifecycleStreamCapture(t, env, txs, splits, suffixTxs, workers, nil)
+}
+
+func lifecycleStreamCapture(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture) (lifecycleOutcome, *streamingExecutor) {
+	t.Helper()
+	return lifecycleStreamResults(t, env, txs, splits, suffixTxs, workers, capture, nil)
+}
+
+func lifecycleStreamResults(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture, results *blockResultCapture) (lifecycleOutcome, *streamingExecutor) {
+	t.Helper()
+	s, exec, tail := lifecycleOpenStream(t, env, txs, splits, suffixTxs, workers, capture, results)
 
 	block := env.block(txs)
 	block.MarkTransactionSignaturesVerified()
@@ -299,12 +309,14 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 // lifecycleOpenStream is lifecycleStream up to, and not including, finalize:
 // the stream has executed every transaction but the suffix and is waiting for
 // the complete block.
-func lifecycleOpenStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int) (*streamingExecutor, *blockExecution, *lifecycleTail) {
+func lifecycleOpenStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture, results *blockResultCapture) (*streamingExecutor, *blockExecution, *lifecycleTail) {
 	t.Helper()
 	tail := &lifecycleTail{durable: env.durable}
 	statuses := NewTransactionStatusCache()
 	shell := env.block(nil)
 	exec := newBlockExecution(env.acctsDb, shell, env.epochSchedule, workers, nil, &persistedTracker{}, tail, statuses, false, env.parent)
+	exec.metadata = capture
+	exec.results = results
 	require.NoError(t, exec.open())
 	exec.slotCtx.DeferVoteCachePublication = true
 	exec.slotCtx.TrackProgramCacheAdds = true
@@ -381,7 +393,7 @@ func TestFailedBlockTailJoinsItsLongestChain(t *testing.T) {
 	t.Run("streamed", func(t *testing.T) {
 		CaptureBankHashes = nil
 		env := newLifecycleEnv(t)
-		s, exec, tail := lifecycleOpenStream(t, env, txs, []int{3, 7}, 2, 4)
+		s, exec, tail := lifecycleOpenStream(t, env, txs, []int{3, 7}, 2, 4, nil, nil)
 		CaptureBankHashes = map[uint64][32]byte{}
 		block := env.block(txs)
 		block.MarkTransactionSignaturesVerified()
