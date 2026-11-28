@@ -39,6 +39,8 @@ func (rpcServer *RpcServer) SetHealthSlotSource(source func() (uint64, bool)) {
 func (rpcServer *RpcServer) InvalidateHealth() {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.healthReady = false
+	rpcServer.executionGeneration++
+	rpcServer.executionInvalidated = true
 	rpcServer.slotCtxMu.Unlock()
 }
 

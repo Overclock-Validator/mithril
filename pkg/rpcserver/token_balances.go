@@ -102,7 +102,7 @@ func (indices tokenBalanceIndices) extractTokenBalances(
 }
 
 // fetchMintDecimals collects the unique mints referenced by token
-// accounts in txAccts and looks each one up in the supplied account view to extract its
+// accounts in txAccts and looks each one up in the captured bank to extract its
 // decimals byte. A transaction-local mint takes precedence over the bank.
 func (indices tokenBalanceIndices) fetchMintDecimals(
 	txAccts []*accounts.Account,
