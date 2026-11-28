@@ -87,3 +87,12 @@ func countTrue(values []bool) int {
 	}
 	return count
 }
+
+// refreshReadCaches publishes a cache epoch and refreshes entries, as a fold
+// does, so cache tests can exercise coherence without a full CommitBatch.
+func (accountsDb *AccountsDb) refreshReadCaches(accts []*accounts.Account) {
+	accountsDb.readCacheEpochMu.Lock()
+	defer accountsDb.readCacheEpochMu.Unlock()
+	accountsDb.readCacheEpoch++
+	accountsDb.refreshReadCacheEntries(accts)
+}

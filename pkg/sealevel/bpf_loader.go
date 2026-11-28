@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -100,6 +101,14 @@ func (write *UpgradeableLoaderInstrWrite) UnmarshalWithDecoder(decoder *bin.Deco
 	bytesLen, err := decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+
+	// Agave's limited_deserialize counts the enum tag, offset and vector
+	// length against PACKET_DATA_SIZE, but permits unconsumed trailing bytes.
+	// V1 transactions can carry more than 1232 bytes; loader instructions still
+	// retain this decoding limit. Check before converting an untrusted length.
+	if decoder.Position() > instructionDeserializationLimit || bytesLen > uint64(instructionDeserializationLimit-decoder.Position()) {
+		return InstrErrInvalidInstructionData
 	}
 
 	bytes, err := decoder.ReadBytes(int(bytesLen))
@@ -519,6 +528,44 @@ func accountDataDirectMappingActive(execCtx *ExecutionCtx) bool {
 		execCtx.Features.IsActive(features.AccountDataDirectMapping)
 }
 
+// A VASA write can expose the reserved growth area before the program updates
+// AccountInfo.data_len. The permitted length also depends on growth by earlier
+// accounts in this transaction, not just on this account's reserved space.
+func maxAccountDataLengthForWrite(txCtx *TransactionCtx, oldLen, reserved uint64) uint64 {
+	remaining := safemath.SaturatingSubI64(maxAccountDataGrowthPerTransaction, txCtx.AccountsResizeDelta)
+	remaining = max(remaining, 0)
+	return min(reserved, MaxPermittedDataLength, safemath.SaturatingAddU64(oldLen, uint64(remaining)))
+}
+
+// Copied VASA regions keep their VM backing in the serialized input. On a
+// growth write, Agave nevertheless resizes the runtime account immediately,
+// and charges the transaction's growth budget before allowing the store.
+func copiedAccountDataOnWrite(execCtx *ExecutionCtx, acct *BorrowedAccount, reserved uint64) func(*sbpf.InputRegion, uint64) error {
+	if !accountDataRegionWritable(acct, execCtx.Features) {
+		return nil
+	}
+	return func(region *sbpf.InputRegion, requestedLen uint64) error {
+		touchedAcct, err := acct.TxCtx.Accounts.Touch(acct.IndexInTransaction)
+		if err != nil {
+			return err
+		}
+		acct.Account = touchedAcct
+		oldLen := uint64(len(touchedAcct.Data))
+		if requestedLen > region.RegionSize {
+			newLen := maxAccountDataLengthForWrite(acct.TxCtx, oldLen, reserved)
+			if newLen > oldLen {
+				acct.UpdateAccountsResizeDelta(newLen)
+				touchedAcct.Resize(newLen, 0)
+			}
+			region.RegionSize = newLen
+		}
+		if requestedLen > region.RegionSize {
+			return InstrErrInvalidRealloc
+		}
+		return nil
+	}
+}
+
 func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reserved uint64) ([]byte, bool, func(*sbpf.InputRegion, uint64) error, error) {
 	canChange := acct.DataCanBeChanged(execCtx.Features) == nil
 	data := acct.Data()
@@ -540,13 +587,7 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 
 		oldLen := uint64(len(touchedAcct.Data))
 		if requestedLen > oldLen {
-			newLen := reserved
-			if newLen > MaxPermittedDataLength {
-				newLen = MaxPermittedDataLength
-			}
-			if requestedLen > newLen {
-				return InstrErrInvalidRealloc
-			}
+			newLen := maxAccountDataLengthForWrite(acct.TxCtx, oldLen, reserved)
 			acct.UpdateAccountsResizeDelta(newLen)
 			touchedAcct.Resize(newLen, 0)
 		}
@@ -554,6 +595,9 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 		region.Data = touchedAcct.Data
 		region.RegionSize = uint64(len(touchedAcct.Data))
 		region.Writable = true
+		if requestedLen > region.RegionSize {
+			return InstrErrInvalidRealloc
+		}
 		return nil
 	}
 
@@ -654,8 +698,18 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	size += 8 + uint64(len(instrData)) // data len
 	size += solana.PublicKeyLength     // program id
 
+	// SIMD-0449: after the program id, pad to 8-byte alignment and append the VM
+	// address of each instruction account's serialized header (duplicates point
+	// at the account they duplicate), mirroring Agave serialize_parameters_for_abiv1.
+	directAccountPointers := execCtx.Features.IsActive(features.DirectAccountPointersInProgramInput)
+	var accountPointersPadding uint64
+	if directAccountPointers {
+		accountPointersPadding = util.AlignUp(size, 8) - size
+		size += accountPointersPadding + 8*uint64(len(accts))
+	}
+
 	var serializedData []byte
-	if !execCtx.IsSimulation && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0]
 	} else {
@@ -752,7 +806,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 					appendVasaAccountDataRegion(&inputRegions, dataStart, 0, dataLen, reserved, writable, int(acct.indexOfAcct), data, onWrite)
 					hostRegionStart = uint64(l) + 88 + (bpfAlignOfU128 - alignmentOffset)
 				} else {
-					appendVasaAccountDataRegion(&inputRegions, dataStart, uint64(l)+88, dataLen, reserved, accountDataRegionWritable(borrowedAcct, execCtx.Features), int(acct.indexOfAcct), nil, nil)
+					appendVasaAccountDataRegion(&inputRegions, dataStart, uint64(l)+88, dataLen, reserved, accountDataRegionWritable(borrowedAcct, execCtx.Features), int(acct.indexOfAcct), nil, copiedAccountDataOnWrite(execCtx, borrowedAcct, reserved))
 					hostRegionStart = uint64(l) + 88 + reserved
 				}
 				regionStart = safemath.SaturatingAddU64(dataStart, reserved)
@@ -791,6 +845,18 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	copy(serializedData[l+8:l+8+len(instrData)], instrData)
 	copy(serializedData[len(serializedData)-32:], programId[:])
 	virtualOffset += 8 + uint64(len(instrData)) + solana.PublicKeyLength
+
+	if directAccountPointers {
+		l := len(serializedData)
+		pointers := l + int(accountPointersPadding)
+		serializedData = serializedData[:pointers+8*len(accts)]
+		clear(serializedData[l:pointers])
+		for i := range accts {
+			// vmKeyAddr follows the 8-byte dup/signer/writable/executable/padding header.
+			binary.LittleEndian.PutUint64(serializedData[pointers+8*i:], accountMetadatas[i].vmKeyAddr-8)
+		}
+		virtualOffset += accountPointersPadding + 8*uint64(len(accts))
+	}
 
 	if vasa {
 		appendVasaMetadataRegion(&inputRegions, regionStart, virtualOffset, hostRegionStart)
@@ -883,7 +949,7 @@ func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, 
 			}
 
 			if !vasa {
-				resizeErr := borrowedAcct.CanDataBeResized(postLen)
+				resizeErr := borrowedAcct.CanDataBeResized(postLen, execCtx.Features)
 				changedErr := borrowedAcct.DataCanBeChanged(execCtx.Features)
 
 				if resizeErr != nil || changedErr != nil {
@@ -1009,7 +1075,7 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, uint64, []seri
 	size += solana.PublicKeyLength     // program id
 
 	var serializedData []byte
-	if !execCtx.IsSimulation && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0] // Use arena slice with zero length but full capacity
 	} else {
@@ -1190,7 +1256,7 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 			}
 
 			if !vasa {
-				resizeErr := borrowedAcct.CanDataBeResized(uint64(len(data)))
+				resizeErr := borrowedAcct.CanDataBeResized(uint64(len(data)), execCtx.Features)
 				changedErr := borrowedAcct.DataCanBeChanged(execCtx.Features)
 
 				if resizeErr != nil || changedErr != nil {
@@ -1241,6 +1307,17 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 	return nil
 }
 
+// executionSyscalls returns the registry every program executes with: the
+// syscalls execCtx's feature set enables. Its answers depend on that set alone.
+func executionSyscalls(execCtx *ExecutionCtx) sbpf.SyscallRegistry {
+	return func(u uint32) (sbpf.Syscall, bool) {
+		return Syscalls(&execCtx.Features, false, u)
+	}
+}
+
+// executeLoadedProgram runs program. syscallRegistry must be
+// executionSyscalls(execCtx): the VM is told the registry's identity is that
+// of execCtx's feature set.
 func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallRegistry sbpf.SyscallRegistry) error {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
@@ -1296,22 +1373,40 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 		Input:          parameterBytes,
 		InputDataVaddr: inputDataVaddr,
 		Syscalls:       syscallRegistry,
-		MaxCU:          int(execCtx.ComputeMeter.Remaining()),
-		ComputeMeter:   &execCtx.ComputeMeter,
-		Context:        execCtx,
-		TxSignature:    execCtx.TransactionContext.Signature,
-		ProgramId:      programId,
-		InputRegions:   inputRegions,
+		// The registry answers from the feature set alone, so the set (and
+		// the count of in-place feature changes, as for cached programs)
+		// identifies it.
+		SyscallsID:   execCtx.Features.Identity(),
+		SyscallsGen:  features.Mutations(),
+		MaxCU:        int(execCtx.ComputeMeter.Remaining()),
+		ComputeMeter: &execCtx.ComputeMeter,
+		Context:      execCtx,
+		TxSignature:  execCtx.TransactionContext.Signature,
+		ProgramId:    programId,
+		InputRegions: inputRegions,
 		DisableStackFrameGaps: execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) ||
 			!program.SbpfVersion.StackFrameGaps(),
 	}
 	start := time.Now()
+	if execCtx.Speculative {
+		opts.Cancel = execCtx.SpeculativeCancel
+	}
 	interpreter := sbpf.NewInterpreter(program, opts)
 	defer interpreter.Finish()
 	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddTimingSince(start)
 	start = time.Now()
 	ret, _, runErr := interpreter.Run()
 	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddTimingSince(start)
+
+	// Agave depletes the remaining transaction compute budget when the VM
+	// itself fails, including an access violation. A syscall error already
+	// accounts for its own compute use and must keep the remaining balance.
+	if runErr != nil && !errors.Is(runErr, sbpf.ErrCancelled) {
+		var syscallErr sbpf.ExcSyscallError
+		if !errors.As(runErr, &syscallErr) {
+			_ = execCtx.ComputeMeter.Consume(execCtx.ComputeMeter.Remaining())
+		}
+	}
 
 	if execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) {
 		runErr = mapVirtualAddressSpaceRunErr(execCtx, runErr, inputRegions)
@@ -1328,11 +1423,17 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 		if isLoaderDeprecated {
 			err = deserializeParametersUnaligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
+				if _, ok := solanaErrCode(err); ok {
+					return err
+				}
 				return InstrErrInvalidArgument
 			}
 		} else {
 			err = deserializeParametersAligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
+				if _, ok := solanaErrCode(err); ok {
+					return err
+				}
 				return InstrErrInvalidArgument
 			}
 		}
@@ -1341,15 +1442,17 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	return normalizeProgramRunErr(runErr)
 }
 
-func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry) error {
-	return executeProgramFromSource(execCtx, programAddr, programData, syscallRegistry, false)
+func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte) error {
+	return executeProgramFromSource(execCtx, programAddr, programData, false)
 }
 
-func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry, immutable bool) error {
+func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, immutable bool) error {
 	start := time.Now()
+	syscallRegistry := executionSyscalls(execCtx)
 	// The caller has already validated the bank-visible loader metadata. Never
 	// let a global cache hit bypass that validation or select a different fork.
-	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok {
+	compileReason := "miss"
+	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok && !execCtx.PrivatePrograms {
 		var matches bool
 		if immutable {
 			matches = entry.MatchesImmutableSource(programData, &execCtx.Features)
@@ -1359,7 +1462,11 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 		if matches {
 			return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
 		}
+		compileReason = "stale"
+	} else if ok {
+		compileReason = "private"
 	}
+
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
 		return InstrErrUnsupportedProgramId
@@ -1380,9 +1487,19 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 	}
 
 	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
+	if programCompileLog {
+		mlog.Log.Infof("program compile slot %d cache-key %s reason %s depth %d speculative %t bytes %d us %d",
+			execCtx.SlotCtx.Slot, programAddr, compileReason, execCtx.StackHeight(), execCtx.Speculative, len(programData), time.Since(start).Microseconds())
+	}
 
 	return executeLoadedProgram(execCtx, program, syscallRegistry)
 }
+
+// MITHRIL_PROGRAM_COMPILE_LOG=1 (diagnostic): log every program compiled
+// during execution with why the cache did not serve it (miss, stale entry, or
+// private loads), its instruction depth (1 = top level, more = invoked by
+// another program) and whether the execution was speculative.
+var programCompileLog = os.Getenv("MITHRIL_PROGRAM_COMPILE_LOG") == "1"
 
 // PreloadProgram loads, verifies and caches the executable for a program's
 // source under cacheKey (the programdata address for upgradeable programs, the
@@ -1461,7 +1578,7 @@ func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot 
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.IsSimulation || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+	if execCtx.Speculative || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
@@ -1527,10 +1644,8 @@ func normalizeProgramRunErr(err error) error {
 	if _, ok := solanaErrCode(err); ok {
 		return err
 	}
-	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
-		if IsCustomErr(cause) {
-			return cause
-		}
+	if IsCustomErr(err) {
+		return err
 	}
 	return InstrErrProgramFailedToComplete
 }
@@ -1583,9 +1698,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	if !programAcct.IsExecutable() {
 		return InstrErrUnsupportedProgramId
 	}
-	// The loader already validated the real account; legacy metadata-only
-	// program stubs deliberately carry zero lamports.
-	if programAcct.Lamports() == 0 && !programAcct.Account.IsDummy {
+	if programAcct.Lamports() == 0 {
 		return InstrErrUnsupportedProgramId
 	}
 
@@ -1681,11 +1794,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 
 	programAcct.Drop()
 
-	syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
-		return Syscalls(&execCtx.Features, false, u)
-	})
-
-	err = executeProgramFromSource(execCtx, programAcctKey, programBytes, syscallRegistry, immutableProgramBytes)
+	err = executeProgramFromSource(execCtx, programAcctKey, programBytes, immutableProgramBytes)
 
 	return err
 }
@@ -2783,7 +2892,9 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					if !execCtx.IsSimulation {
+					// An early execution publishes nothing (loader instructions
+					// are never executed early; this does not rely on that).
+					if !execCtx.Speculative {
 						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
 					}
 				}

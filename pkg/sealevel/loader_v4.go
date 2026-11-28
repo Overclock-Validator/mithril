@@ -7,7 +7,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
-	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
@@ -68,6 +67,11 @@ func (write *LoaderV4Write) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	bytesLen, err = decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+
+	// Check the consumed-byte budget before converting the untrusted vector length.
+	if decoder.Position() > instructionDeserializationLimit || bytesLen > uint64(instructionDeserializationLimit-decoder.Position()) {
+		return InstrErrInvalidInstructionData
 	}
 
 	write.Bytes, err = decoder.ReadBytes(int(bytesLen))
@@ -139,7 +143,7 @@ func decodeLoaderV4State(data []byte) (*LoaderV4State, error) {
 }
 
 func setLoaderV4AcctState(acct *BorrowedAccount, state *LoaderV4State) error {
-	stateSlice, err := acct.DataMutable(nil)
+	stateSlice, err := acct.DataMutable(features.Features{})
 	if err != nil {
 		return err
 	}
@@ -205,12 +209,11 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 			return InstrErrComputationalBudgetExceeded
 		}
 
-		if len(instrData) < 1 {
+		decoder := bin.NewBinDecoder(instrData)
+		instrType, err := decoder.ReadUint32(bin.LE)
+		if err != nil {
 			return InstrErrInvalidInstructionData
 		}
-
-		decoder := bin.NewBinDecoder(instrData)
-		instrType := instrData[0]
 
 		switch instrType {
 		case LoaderV4InstrTypeWrite:
@@ -266,6 +269,8 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 				err = LoaderV4ProcessFinalize(execCtx)
 			}
 
+		default:
+			return InstrErrInvalidInstructionData
 		}
 	} else { // execute bpf program code path
 		var program *BorrowedAccount
@@ -297,13 +302,9 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 
 		programBytes = programDataAcct.Data[loaderV4ProgramDataOffset:]
 
-		syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
-			return Syscalls(&execCtx.Features, false, u)
-		})
-
 		program.Drop()
 
-		err = executeProgramFromBytes(execCtx, program.Key(), programBytes, syscallRegistry)
+		err = executeProgramFromBytes(execCtx, program.Key(), programBytes)
 
 	}
 
@@ -610,7 +611,7 @@ func LoaderV4ProcessDeploy(execCtx *ExecutionCtx) error {
 	}
 
 	entry := &accountsdb.ProgramCacheEntry{Program: programObj, DeploymentSlot: currentSlot}
-	if !execCtx.IsSimulation {
+	if !execCtx.IsSimulation && !execCtx.Speculative {
 		execCtx.SlotCtx.AccountsDb.AddProgramToCache(program.Key(), entry)
 		execCtx.SlotCtx.RecordProgramCacheAdd(program.Key())
 	}
@@ -666,7 +667,7 @@ func LoaderV4ProcessRetract(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	if !execCtx.IsSimulation {
+	if !execCtx.IsSimulation && !execCtx.Speculative {
 		execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(program.Key())
 	}
 	return nil

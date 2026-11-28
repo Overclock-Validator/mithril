@@ -21,21 +21,19 @@ import (
 func TestMissingFooterPreflightScope(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
-		alpenglow    bool
 		block        *b.Block
 		wantRejected bool
 	}{
-		{"missing footer", true, &b.Block{Slot: 99, FromLiveStream: true}, true},
-		{"present footer", true, &b.Block{Slot: 99, FromLiveStream: true, HasAlpenglowFooter: true}, false},
-		{"classic stream", false, &b.Block{Slot: 99, FromLiveStream: true}, false},
-		{"skipped slot", true, &b.Block{Slot: 99, FromLiveStream: true, IsSkipped: true}, false},
-		{"local leader", true, &b.Block{Slot: 99, FromLiveStream: true, FromLocalProduction: true}, false},
-		{"non-live block", true, &b.Block{Slot: 99}, false},
-		{"nil", true, nil, false},
+		{"missing footer", &b.Block{Slot: 99, FromLiveStream: true}, true},
+		{"present footer", &b.Block{Slot: 99, FromLiveStream: true, HasAlpenglowFooter: true}, false},
+		{"skipped slot", &b.Block{Slot: 99, FromLiveStream: true, IsSkipped: true}, false},
+		{"local leader", &b.Block{Slot: 99, FromLiveStream: true, FromLocalProduction: true}, false},
+		{"non-live block", &b.Block{Slot: 99}, false},
+		{"nil", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			rejected, err := quarantineMissingAlpenglowFooter(tc.block, tc.alpenglow, nil, func(got *b.Block) error {
+			rejected, err := quarantineMissingAlpenglowFooter(tc.block, nil, func(got *b.Block) error {
 				calls++
 				require.Same(t, tc.block, got)
 				return nil
@@ -57,7 +55,7 @@ func TestMissingFooterPreflightDiscardsStreamBeforeQuarantine(t *testing.T) {
 	h := newFinalizeFailureHarness(t)
 	block := h.matchingBlock(t, h.txs)
 	called := false
-	rejected, err := quarantineMissingAlpenglowFooter(block, true, h.exec, func(got *b.Block) error {
+	rejected, err := quarantineMissingAlpenglowFooter(block, h.exec, func(got *b.Block) error {
 		called = true
 		require.Same(t, block, got)
 		h.assertUndone(t, "missing_footer")
@@ -71,7 +69,7 @@ func TestMissingFooterPreflightDiscardsStreamBeforeQuarantine(t *testing.T) {
 func TestMissingFooterPreflightFailsClosedWhenQuarantineFails(t *testing.T) {
 	for _, cause := range []error{blockstream.ErrBlockNotQuarantinable, errors.New("candidate conflicts with certified state")} {
 		block := &b.Block{Slot: 99, FromLiveStream: true}
-		rejected, err := quarantineMissingAlpenglowFooter(block, true, nil, func(*b.Block) error { return cause })
+		rejected, err := quarantineMissingAlpenglowFooter(block, nil, func(*b.Block) error { return cause })
 		require.True(t, rejected)
 		require.ErrorIs(t, err, cause)
 		require.ErrorContains(t, err, "slot 99 missing block footer")
@@ -122,7 +120,7 @@ func TestMissingFooterPreflightCapturedMainnetCandidate(t *testing.T) {
 	// Empty reward-certificate bytes do not reject a missing footer.
 	require.NoError(t, validatePreConsensusRewardCertificates(candidate, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}, 50093))
 	var quarantined *b.Block
-	rejected, err := quarantineMissingAlpenglowFooter(candidate, true, nil, func(got *b.Block) error {
+	rejected, err := quarantineMissingAlpenglowFooter(candidate, nil, func(got *b.Block) error {
 		quarantined = got
 		return nil
 	})

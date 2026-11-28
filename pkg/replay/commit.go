@@ -29,7 +29,7 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 		}
 		slotCtx.RecordWritableAccts(executionResult.WritableAccounts)
 		if recordMetrics {
-			metrics.GlobalBlockReplay.TxPublishRecordWritableAcct.AddTimingSince(writableStart)
+			execCtx.TimingRecorder.AddTimingSince(metrics.TransactionTxPublishRecordWritableAcct, writableStart)
 		}
 	}
 
@@ -37,9 +37,12 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 	if recordMetrics {
 		touchedStart = time.Now()
 	}
+	if workAheadUnchanged {
+		learnUnchanged(execCtx)
+	}
 	stats := handleModifiedAccounts(slotCtx, execCtx)
 	if recordMetrics {
-		metrics.GlobalBlockReplay.TxPublishTouchedAccountState.AddTimingSince(touchedStart)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionTxPublishTouchedAccountState, touchedStart)
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccounts, stats.touchedAccounts)
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccountBytes, stats.touchedAccountBytes)
 	}
@@ -54,7 +57,7 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 		recordStakeAndVoteAccounts(slotCtx, execCtx, executionResult.WritableAccountSet)
 	}
 	if recordMetrics {
-		metrics.GlobalBlockReplay.TxPublishStakeVoteBookkeeping.AddTimingSince(stakeVoteStart)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionTxPublishStakeVoteBookkeeping, stakeVoteStart)
 	}
 	return nil
 }

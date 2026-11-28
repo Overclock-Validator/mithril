@@ -78,13 +78,10 @@ func TestEpoch116InactiveStakeBankHash(t *testing.T) {
 		require.Equal(t, row.OriginalUpdatedDataSHA256, fmt.Sprintf("%x", sha256.Sum256(bad.Data)))
 		erroneousUpdates = append(erroneousUpdates, bad)
 	}
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts(storedAccounts, 6264000, func() { close(stored) }))
-	<-stored
+	seedDurableAccounts(t, db, storedAccounts, 6264000)
 	count, err := global.FlushPendingStakePubkeysThrough(dir, 6264000)
 	require.NoError(t, err)
 	require.Equal(t, len(fixture.Stakes), count)
-	db.RootedDurable = true
 
 	f := &features.Features{}
 	f.EnableFeature(features.AccountsLtHash, 0)

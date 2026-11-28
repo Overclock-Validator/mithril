@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
@@ -78,6 +77,9 @@ type blockExecution struct {
 
 	txFeeAccumulator fees.TxFeeInfoAccumulator
 	totalCU          uint64
+	// computeUnits is what each transaction consumed, in block order: set
+	// whole by ProcessBlock, grown group by group by streaming execution.
+	computeUnits []uint64
 
 	// Retained across global metric resets while a speculative stream waits.
 	accountLoader metrics.AccountLoader
@@ -111,11 +113,11 @@ func newBlockExecution(
 		parentBankSysvars:   parentBankSysvars,
 		seenMessages:        make(map[[32]byte]int),
 	}
-	// In rooted-durable mode, block accounts/sysvars load through the unrooted
-	// tail (overlay→durable) so execution sees confirmed-but-unrooted state.
-	exec.blockSrc = acctsDb
-	if tail != nil {
-		exec.blockSrc = tail
+	// Block accounts/sysvars load through the unrooted tail (overlay→durable)
+	// so execution sees confirmed-but-unrooted state.
+	exec.blockSrc = tail
+	if block != nil {
+		clearWorkAheadRan(block.Slot) // this attempt's early executions set it again
 	}
 
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
@@ -403,6 +405,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 		exec.totalCU += computeUnits[idx]
 		exec.txFeeAccumulator.Add(txFeeInfo)
 	}
+	exec.computeUnits = append(exec.computeUnits, computeUnits...)
 	exec.slotCtx.TotalComputeUnitsConsumed = exec.totalCU
 	exec.groups++
 	metrics.GlobalBlockReplay.StreamingExecution.Groups++
@@ -528,44 +531,86 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 
 	metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
 	txErrors := make([]error, len(txs))
+	timings := newWorkerTransactionTimings(workers)
+	defer timings.merge()
 	do := make(chan int, len(txs))
 	done := make(chan int, len(txs))
 	plannerDone := make(chan struct{})
-	go func() {
-		defer close(plannerDone)
-		plannerDispatchStart := time.Now()
-		dispatchDependencyPlan(plan, do, done)
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
-	}()
-
-	wg := &sync.WaitGroup{}
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func(workerIdx int) {
-			defer wg.Done()
-			var workerArena *arena.Arena[sealevel.BorrowedAccount]
-			if workerIdx < len(sealevel.BorrowedAccountArenas) {
-				workerArena = sealevel.BorrowedAccountArenas[workerIdx]
-			}
-			for idx := range do {
-				if !execute[idx] {
-					done <- idx
-					continue
-				}
-				feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
-				done <- idx
-			}
-		}(i)
+	workAhead := newWorkAhead(slotCtx, view, execute, dbgOpts)
+	processTx := func(workerIdx, idx int) {
+		if !execute[idx] {
+			return
+		}
+		var workerArena *arena.Arena[sealevel.BorrowedAccount]
+		if workerIdx < len(sealevel.BorrowedAccountArenas) {
+			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
+		}
+		executed, release := workAhead.claim(idx)
+		execStart := time.Now()
+		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, executed, timings.at(workerIdx))
+		execElapsed := time.Since(execStart)
+		release()
+		workAhead.verify(idx, txErrors[idx], computeUnits[idx])
+		workAhead.recordOutcome(idx, txErrors[idx], execElapsed, executed != nil)
 	}
-	wg.Wait()
-	close(done)
-	<-plannerDone
+	if directDispatch && schedulingOnFor(slotCtx.Slot) {
+		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
+			runDependencyPlan(plan, workers, workAhead, scheduleFor(txs, slotCtx.Slot), nil, processTx))
+	} else {
+		go func() {
+			defer close(plannerDone)
+			plannerDispatchStart := time.Now()
+			if workAhead != nil {
+				workAhead.dispatch(plan, do, done)
+			} else {
+				dispatchDependencyPlan(plan, do, done)
+			}
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+		}()
+
+		wg := &sync.WaitGroup{}
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func(workerIdx int) {
+				defer wg.Done()
+				for {
+					idx, ahead, ok := workAhead.next(do)
+					if !ok {
+						break
+					}
+					if ahead {
+						workAhead.run(idx)
+						continue
+					}
+					processTx(workerIdx, idx)
+					done <- idx
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(done)
+		<-plannerDone
+	}
+	workAhead.finish(slotCtx.Slot)
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
 			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
 		}
 	}
 	return feeInfos, computeUnits, nil
+}
+
+// executedTransactions returns the block's transactions in block order as this
+// bank executed them, with their address-table accounts resolved. A streamed
+// bank executed copies of the transactions it received before the block was
+// complete (the block's own objects stay unresolved), so its executed list is
+// the one built group by group; a whole-block bank resolves and executes the
+// block's transactions in place.
+func (exec *blockExecution) executedTransactions() []*solana.Transaction {
+	if exec.groups > 0 {
+		return exec.transactions
+	}
+	return exec.block.Transactions
 }
 
 // UnprocessableTransactionError reports the first transaction, by block index,
@@ -590,16 +635,30 @@ func unprocessableTransactionError(index int, err error) error {
 	return &UnprocessableTransactionError{Index: index, Err: err}
 }
 
-// finalize runs the end-of-block phases over the open SlotCtx: fees to the
+// finalize completes the bank once every transaction has executed. It starts
+// the block's longest-chain measurement on its own goroutine and runs the
+// end-of-block tail beside it; the replay loop collects the measurement when
+// it writes the block's timing row. A bank whose tail fails is abandoned, so
+// its measurement is joined here, before the caller discards the bank.
+func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
+	chain := blockLongestChain.start(exec.slotCtx, exec.executedTransactions(), exec.computeUnits)
+	slotCtx, err := exec.finalizeTail()
+	if err != nil {
+		blockLongestChain.abandon(chain)
+		return nil, err
+	}
+	return slotCtx, nil
+}
+
+// finalizeTail runs the end-of-block phases over the open SlotCtx: fees to the
 // leader, rent, incinerator, the Alpenglow footer clock and vote rewards, bank
 // sysvar finalization, bank hash, footer verification, state publication and
 // transaction status commit. It is the unchanged tail of ProcessBlock and is
 // shared by streaming execution, which calls it once the complete block has
 // been matched against the executed prefix.
-func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
+func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	block := exec.block
 	slotCtx := exec.slotCtx
-	acctsDb := exec.acctsDb
 	tail := exec.tail
 	setReplayStage := exec.setReplayStage
 	alpenglowClock := exec.alpenglowClock
@@ -633,6 +692,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	metrics.GlobalBlockReplay.RunIncinerator.AddTimingSince(start)
 
 	// Alpenglow banks set the Clock timestamp from the block footer after execution.
+	var voteVersions votePublicationVersions
 	if alpenglowClock {
 		footerClockStart := time.Now()
 		if err := applyAlpenglowFooterClock(slotCtx, block, bankEpochSchedule); err != nil {
@@ -645,7 +705,10 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 		}
 		metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
 		voteRewardsStart := time.Now()
-		voteRewardsErr := ApplyAlpenglowVoteRewards(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion)
+		if slotCtx.Replay {
+			voteVersions = make(votePublicationVersions)
+		}
+		voteRewardsErr := applyVoteRewardsWithVersions(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion, voteVersions)
 		metrics.GlobalBlockReplay.AlpenglowVoteRewards.AddTimingSince(voteRewardsStart)
 		if voteRewardsErr != nil {
 			return nil, voteRewardsErr
@@ -657,7 +720,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 
 	setReplayStage("compile_accounts")
 	start = time.Now()
-	writableAccts, modifiedAccts := compileWritableAndModifiedAccts(slotCtx, block, rentAccts)
+	writableAccts, modifiedAccts := compileAccountsWithVoteVersions(slotCtx, block, rentAccts, voteVersions)
 	metrics.GlobalBlockReplay.CompileWritableAndModifiedAccts.AddTimingSince(start)
 	start = time.Now()
 	ensureParentsErr := ensureParentAccountsForModified(slotCtx, modifiedAccts)
@@ -676,69 +739,40 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 		metrics.GlobalBlockReplay.AlpenglowFooterVerification.AddTimingSince(footerVerificationStart)
 		if footerVerificationErr != nil {
 			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
-			return nil, footerVerificationErr
+			// If this is the replay of a slot whose first attempt, with early
+			// executions, failed here too, say whether speculation was the cause.
+			return nil, workAheadReplayVerdict(block, slotCtx.FinalBankhash, footerVerificationErr)
 		}
+	}
+	// The replay of a slot the footer shutoff refused: the verdict compares
+	// the hashes itself, which matters when the clock mode above did not.
+	if err := workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil); err != nil {
+		writeFooterBankhashMismatchArtifact(err, block, slotCtx, writableAccts, modifiedAccts)
+		return nil, err
+	}
+	// Early executions are only ever accepted in a block whose computed bank
+	// hash was just compared with its footer's (work_ahead_guard.go).
+	if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
+		return nil, err
+	}
+	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
+		return nil, err
 	}
 
 	// Bankhash consensus enforcement is handled in the replay loop (not here)
 	// because forkchoice is fed after ProcessBlock returns — checking here would
 	// never see votes from recently submitted blocks and could deadlock.
 
-	// Enter critical commit window - panics here may leave AccountsDB inconsistent
-	commitSlot.Store(slotCtx.Slot)
-	commitInProgress.Store(true)
 	blockUpdateStart := time.Now()
 	setReplayStage("store_accounts")
-	persistedSlot := slotCtx.Slot
 	persistedBankhash := append([]byte(nil), slotCtx.FinalBankhash...)
-	persistedBlockSlot := block.Slot
-	stakeIndexDir := filepath.Join(acctsDb.AcctsDir, "..")
-	afterStoreAccounts := func() {
-		if tail != nil {
-			// Rooted-durable: accounts + bankhash are buffered in the overlay and
-			// become durable only on promotion; nothing written here (rooted-only).
-		} else {
-			if berr := acctsDb.StoreBankHashForSlot(persistedSlot, persistedBankhash); berr != nil {
-				mlog.Log.Infof("unable to store bankhash for slot %d", persistedSlot)
-			}
-		}
-		if tail == nil {
-			// Legacy/verify modes (no fork ambiguity): flush per block as before.
-			// Rooted-durable replay flushes at FOLD time instead — entries stay
-			// slot-scoped in RAM so a fork unwind can drop them, and scans merge
-			// the pending set (StreamStakeAccounts) for completeness meanwhile.
-			flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir)
-			if err != nil {
-				mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
-			} else if flushed > 0 {
-				mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
-			}
-		}
-
-		persistedHashes.Set(persistedBlockSlot, persistedBankhash)
-
-		// Exit critical commit window - AccountsDB is now consistent
-		commitInProgress.Store(false)
-		commitSlot.Store(0)
-	}
-
-	if tail != nil {
-		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
-		// (always, even when empty, so the bankhash is recorded); no durable write.
-		recordSlotStakeChange(tail, slotCtx, modifiedAccts)
-		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
-		afterStoreAccounts()
-	} else if len(modifiedAccts) > 0 {
-		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
-	}
-	// In rooted-durable mode the callback above is synchronous, so this includes
-	// the complete critical-path overlay publication. Legacy StoreAccounts only
-	// enqueues here; its asynchronous disk work deliberately belongs to no slot's
-	// replay wall time and must never update a later slot's metrics record.
+	// Buffer this slot's writes + bankhash in the unrooted tail (always, even
+	// when empty, so the bankhash is recorded). Nothing reaches disk here: rooted
+	// slots become durable only when promotion folds them.
+	recordSlotStakeChange(tail, slotCtx, modifiedAccts)
+	tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
+	persistedHashes.Set(block.Slot, persistedBankhash)
 	metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(blockUpdateStart)
-	if err != nil {
-		return slotCtx, err
-	}
 	statusCommitStart := time.Now()
 	statusWaitStart := time.Now()
 	preparedStatuses := exec.statusPreparation.wait()

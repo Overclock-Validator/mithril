@@ -18,6 +18,12 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// DelegatedFinalityEnabled lets replay take the cluster's finalized slot from
+// RPC while the engine has no finalization certificate of its own (an unstaked
+// observer may see none). Offline replay turns it off, so the root advances
+// only from block footer certificates and no RPC call sits in the replay loop.
+var DelegatedFinalityEnabled = true
+
 // alpenglowRootedSlot returns the highest slot the engine has seen a finalization
 // certificate for — the Alpenglow finality watermark that drives promotion, the
 // certificate-based counterpart to TowerBFT's HighestRootedSlot.
@@ -298,6 +304,17 @@ type alpenglowFinalityExpectation struct {
 	Conflict bool
 }
 
+// alpenglowPromotionFloor excludes the imported snapshot/restart parent even
+// before the first local fold sets LastRootedSlot. A distance from the tip is
+// not a safe substitute: rewards windows and skipped slots can span more than
+// the ordinary retained-bank cap.
+func alpenglowPromotionFloor(lastRooted, firstReplaySlot uint64) uint64 {
+	if firstReplaySlot > 0 {
+		return max(lastRooted, firstReplaySlot-1)
+	}
+	return lastRooted
+}
+
 // alpenglowPromotionGate caps promotion at the last slot whose executed identity is
 // consistent with certificate finality. It walks (lastRooted, through] in order and
 // stops at the first violation (prefix-stop: descendants of an unpromoted block must
@@ -326,11 +343,8 @@ func alpenglowPromotionGate(
 	if executedTip < walkTop {
 		walkTop = executedTip
 	}
-	// Nothing below the in-RAM tail can fold, so never walk it: on a fresh bootstrap
-	// lastRooted starts at 0 and an unfloored walk would span the whole chain.
-	if executedTip > unrootedTailHaltCap && lastRooted+1 < executedTip-unrootedTailHaltCap {
-		lastRooted = executedTip - unrootedTailHaltCap
-	}
+	// The caller supplies alpenglowPromotionFloor as lastRooted. Check the
+	// entire unfolded prefix, including banks older than the normal tail cap.
 	index, _ := consensusEngine.(consensusengine.AlpenglowFinalityIndex)
 	for slot := lastRooted + 1; slot <= walkTop; slot++ {
 		if want, disputed := forced[slot]; disputed {

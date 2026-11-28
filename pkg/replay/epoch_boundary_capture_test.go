@@ -117,9 +117,7 @@ func capturedEpochBoundaryDB(t *testing.T, slot uint64, delegations []capturedBo
 			Lamports: captured.Delegation.StakeLamports, Data: data})
 		global.EnqueuePendingStakePubkey(slot, captured.Pubkey)
 	}
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts(accts, slot, func() { close(done) }))
-	<-done
+	seedDurableAccounts(t, db, accts, slot)
 	_, err = global.FlushPendingStakePubkeys(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() {

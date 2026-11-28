@@ -9,6 +9,7 @@ import (
 	"github.com/mr-tron/base58"
 )
 
+// GetBankHash returns the stored bank hash for the requested slot.
 func (rpcServer *RpcServer) GetBankHash(ctx context.Context, p jsonrpc.RawParams) (string, error) {
 	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {

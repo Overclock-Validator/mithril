@@ -1,5 +1,7 @@
 # Mithril
 
+> **Unaudited software. Use at your own risk.** Mithril has not been through a security audit for at least a year and is provided "as is" under its open-source license. See the [disclaimer](docs/DISCLAIMER.md) before running it.
+
 Mithril is a Solana validator client (Alpenglow), and Solana full node client (Alpenglow & pre-Alpenglow) written in Golang. 
 
 Mithril was originally built for the purpose of serving as a "verifying full node" with lower hardware requirements than that of Solana validators and RPC nodes. Now that Mithril has begun its journey as a validator implementation, we still aim for Mithril to be deployable on accessible server platforms. This project is being developed upon the foundations of [Radiance](https://github.com/firedancer-io/radiance), which was built by Richard Patel (@ripatel) with contributions from @leoluk.
@@ -17,12 +19,16 @@ While Mithril is already functional and runs reliably for many use cases, it is 
 
 The `run` command starts Mithril as a live full node - it bootstraps from a Solana snapshot and continuously verifies new blocks as they are produced.
 
-This branch supports two protocol paths. `network.cluster = "alpenglow"` (the default) uses native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `mainnet-beta`, `testnet`, and `devnet` retain Mithril's established verifying-only RPC replay and per-slot AccountsDB persistence. Validator/block-production mode is deliberately available only on Alpenglow; the classic clusters remain verifying nodes.
+Every cluster runs Alpenglow: native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `network.cluster` names the chain: `mainnet` (the default; `mainnet-beta` is accepted as an alias), `testnet`, or `devnet`. Each built-in cluster carries its genesis hash and public gossip entrypoint, and startup refuses an RPC endpoint whose genesis belongs to another cluster.
+
+A custom (private) cluster uses any other name and must supply `network.genesis_hash`, `network.rpc`, and `turbine.gossip_entrypoint` itself; the shred version is discovered from the entrypoint unless `turbine.shred_version` is set. State files and ledger artifacts are bound to the genesis hash, so a node never mixes state across clusters.
 
 Mithril in its `alpenglow-dev` branch can be run via a command of the following form:
 ```
-./mithril run   --bootstrap new-snapshot   --cluster alpenglow   --accounts-path /mnt/mithril-ag-accounts   --ledger-path /mnt/mithril-ag-ledger   --block-source turbine   --turbine-bind-addr 0.0.0.0:8025   --turbine-gossip-entrypoint 74.50.90.234:9000   --turbine-gossip-bind-addr 0.0.0.0:8020   --turbine-advertised-ip X.Y.X.Y  --consensus-mode validator   --alpenglow-observer-bind-addr 0.0.0.0:8010   --tpu-quic-bind-addr 0.0.0.0:8011   --validator-advertised-ip X.Y.X.Y   --identity-keypair ./validator-keypair.json   --vote-account-keypair ./vote-account-keypair.json   --rpc https://rpc.ag.validator1.net
+./mithril run   --bootstrap new-snapshot   --cluster mainnet   --accounts-path /mnt/mithril-accounts   --ledger-path /mnt/mithril-ledger   --block-source turbine   --turbine-bind-addr 0.0.0.0:8025   --turbine-gossip-bind-addr 0.0.0.0:8020   --turbine-advertised-ip X.Y.X.Y  --consensus-mode validator   --alpenglow-observer-bind-addr 0.0.0.0:8010   --tpu-quic-bind-addr 0.0.0.0:8011   --validator-advertised-ip X.Y.X.Y   --identity-keypair ./validator-keypair.json   --vote-account-keypair ./vote-account-keypair.json   --rpc https://your-rpc.example.com
 ```
+
+For a custom cluster add `--cluster <name> --genesis-hash <base58 genesis> --turbine-gossip-entrypoint <host:port>`.
 
 ### Nix (NixOS / nix-darwin / Home Manager)
 
@@ -96,13 +102,13 @@ Mithril requires a C compiler for the zstd compression library:
 sudo apt-get update && sudo apt-get install -y build-essential
 ```
 
-**Step 4: Install Go 1.27.2**
+**Step 4: Install Go 1.27.3**
 
-Mithril pins Go 1.27.2 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
+Mithril pins Go 1.27.3 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
 
 ```bash
 # Set Go version and detect architecture
-GO_VERSION="1.27.2"
+GO_VERSION="1.27.3"
 case $(uname -m) in
     x86_64)  GOARCH="amd64" ;;
     aarch64) GOARCH="arm64" ;;
@@ -273,6 +279,8 @@ make build
 
 **Clean Shutdown**: Always use `Ctrl+C` to stop Mithril cleanly rather than killing the terminal or closing the SSH session. This allows Mithril to flush data and exit gracefully.
 
+**Replay Failures**: `mithril run` returns a nonzero exit status after saving shutdown state and closing AccountsDB when replay fails. A clean cancellation returns success unless shutdown itself fails. Service managers using `Restart=on-failure`, including the Nix systemd service, will restart after a replay failure. A deterministic bank hash mismatch can recur at the same slot on every restart; use a bounded restart policy and investigate repeated failures.
+
 For detailed troubleshooting tips, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ---
@@ -300,7 +308,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for supported networks and feature gate
 - **Status**: Mithril can retrieve and replay current MainnetBeta blocks. There are rare bankhash mismatches that we are actively investigating.
 
 ### Milestone 3 (In Progress): Alpha Release and System Optimization
-- First formal audit (https://runtimeverification.com/ team is nearing end of audit). Includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
+- First formal audit. No audit is in progress at present, and the code has not been audited for at least a year (see the [disclaimer](docs/DISCLAIMER.md)). This milestone includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
 - Thorough optimization work on entire system, including on components such as the Virtual Machine and AccountsDB.
 - Consensus verification implementation (landed on this branch: the Alpenglow certificate engine drives fork choice and durable-state promotion).
 - Direct shred replay support (landed on this branch: native turbine is the default Alpenglow block source; classic clusters default to RPC).

@@ -108,6 +108,7 @@ var (
 	TasksIndexEntryBuilderLatency               = Metric{"tasks_index_entry_builder_latency"}
 	TasksAppendVecCopyingLatency                = Metric{"tasks_append_vec_copying_latency"}
 	SlotReplayDurationMs                        = Metric{"slot_replay_duration_ms"}
+	SlotReplayWorkMs                            = Metric{"slot_replay_work_ms"}
 	TxsPerBlock                                 = Metric{"txs_per_block"}
 	SnapshotTarBytesRead                        = Metric{"snapshot_tar_bytes_read"}
 	SlotReplays                                 = Metric{"slot_replays"}
@@ -120,6 +121,11 @@ var (
 	BlockProductionStartDecisionTickDeliveryLag = Metric{"block_production_start_decision_tick_delivery_lag_seconds"}
 	BlockProductionStartDecisionTickWork        = Metric{"block_production_start_decision_tick_work_seconds"}
 	BlockProductionStartAttempt                 = Metric{"block_production_start_attempt_seconds"}
+	BlockProductionCompletion                   = Metric{"block_production_completion_duration_seconds"}
+	BlockProductionDeadlineMargin               = Metric{"block_production_deadline_margin_seconds"}
+	BlockProductionDeadlineMisses               = Metric{"block_production_deadline_misses_total"}
+	BlockProductionExecutionQuiescence          = Metric{"block_production_execution_quiescence_duration_seconds"}
+	BlockProductionRewardPreparation            = Metric{"block_production_reward_preparation_total"}
 	TurbineShredCollection                      = Metric{"turbine_shred_collection_duration_seconds"}
 	TurbineBlockCompletionQueueDelay            = Metric{"turbine_block_completion_queue_delay_seconds"}
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
@@ -146,6 +152,12 @@ var (
 	// Harmonic block engine integration. Session and pipeline counters are
 	// exported once a second; slot metrics when each leader slot ends.
 	HarmonicBlockEngineHealthy       = Metric{"harmonic_block_engine_healthy"}
+	HarmonicBundleSubscriptionActive = Metric{"harmonic_bundle_subscription_active"}
+	HarmonicBundleSubscriptions      = Metric{"harmonic_bundle_subscriptions_total"}
+	HarmonicBundleMessagesDrained    = Metric{"harmonic_bundle_messages_drained_total"}
+	HarmonicBundlesDrained           = Metric{"harmonic_bundles_drained_total"}
+	HarmonicBundlePacketsDrained     = Metric{"harmonic_bundle_packets_drained_total"}
+	HarmonicBundleBytesDrained       = Metric{"harmonic_bundle_bytes_drained_total"}
 	HarmonicRelayerConnected         = Metric{"harmonic_relayer_connected"}
 	HarmonicRelayerTPUAdvertised     = Metric{"harmonic_relayer_tpu_advertised"}
 	HarmonicClientIDAdvertised       = Metric{"harmonic_client_id_advertised"}
@@ -267,6 +279,7 @@ var MetricToType = map[Metric]metricType{
 	TasksAppendVecCopyingLatency:   TimingT,
 
 	SlotReplayDurationMs: TimingT,
+	SlotReplayWorkMs:     TimingT,
 	TxsPerBlock:          TimingT,
 
 	SnapshotTarBytesRead:                    CountT,
@@ -281,6 +294,11 @@ var MetricToType = map[Metric]metricType{
 	BlockProductionStartDecisionTickDeliveryLag: TimingT,
 	BlockProductionStartDecisionTickWork:        TimingT,
 	BlockProductionStartAttempt:                 TimingT,
+	BlockProductionCompletion:                   TimingT,
+	BlockProductionDeadlineMargin:               TimingT,
+	BlockProductionDeadlineMisses:               CountT,
+	BlockProductionExecutionQuiescence:          TimingT,
+	BlockProductionRewardPreparation:            CountT,
 	TurbineShredCollection:                      TimingT,
 	TurbineBlockCompletionQueueDelay:            TimingT,
 	TurbineBlockDecode:                          TimingT,
@@ -297,6 +315,12 @@ var MetricToType = map[Metric]metricType{
 	TurbineReplayAdmission:                      TimingT,
 
 	HarmonicBlockEngineHealthy:       GaugeT,
+	HarmonicBundleSubscriptionActive: GaugeT,
+	HarmonicBundleSubscriptions:      CountT,
+	HarmonicBundleMessagesDrained:    CountT,
+	HarmonicBundlesDrained:           CountT,
+	HarmonicBundlePacketsDrained:     CountT,
+	HarmonicBundleBytesDrained:       CountT,
 	HarmonicRelayerConnected:         GaugeT,
 	HarmonicRelayerTPUAdvertised:     GaugeT,
 	HarmonicClientIDAdvertised:       GaugeT,
@@ -408,6 +432,7 @@ var MetricToLabels = map[Metric][]string{
 	TasksAppendVecCopyingLatency:   {},
 
 	SlotReplayDurationMs:                    {},
+	SlotReplayWorkMs:                        {},
 	TxsPerBlock:                             {},
 	SnapshotTarBytesRead:                    {},
 	SlotReplays:                             {},
@@ -421,6 +446,11 @@ var MetricToLabels = map[Metric][]string{
 	BlockProductionStartDecisionTickDeliveryLag: {"outcome"},
 	BlockProductionStartDecisionTickWork:        {"outcome"},
 	BlockProductionStartAttempt:                 {"result"},
+	BlockProductionCompletion:                   {},
+	BlockProductionDeadlineMargin:               {},
+	BlockProductionDeadlineMisses:               {},
+	BlockProductionExecutionQuiescence:          {},
+	BlockProductionRewardPreparation:            {"status"},
 	TurbineShredCollection:                      {},
 	TurbineBlockCompletionQueueDelay:            {},
 	TurbineBlockDecode:                          {},
@@ -437,6 +467,12 @@ var MetricToLabels = map[Metric][]string{
 	TurbineReplayAdmission:                      {},
 
 	HarmonicBlockEngineHealthy:       {},
+	HarmonicBundleSubscriptionActive: {},
+	HarmonicBundleSubscriptions:      {},
+	HarmonicBundleMessagesDrained:    {},
+	HarmonicBundlesDrained:           {},
+	HarmonicBundlePacketsDrained:     {},
+	HarmonicBundleBytesDrained:       {},
 	HarmonicRelayerConnected:         {},
 	HarmonicRelayerTPUAdvertised:     {},
 	HarmonicClientIDAdvertised:       {},
@@ -474,6 +510,24 @@ var blockProductionDurationBuckets = []float64{
 	0.100, 0.125, 0.150, 0.200, 0.400, 0.800, 1.600, 3.200,
 }
 
+// Completion is normally only a few milliseconds; retain resolution around
+// the configurable 15ms reserve and enough range to expose long-tail stalls.
+var blockProductionCompletionBuckets = []float64{
+	0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.0025, 0.005,
+	0.0075, 0.010, 0.0125, 0.015, 0.020, 0.025, 0.050, 0.100,
+	0.200, 0.400, 0.800, 1.600, 3.200,
+}
+
+// Margin is protocol deadline minus network completion: negative means late.
+// Its signed sum can decrease; use bucket/count rates for quantiles rather
+// than treating rate(..._sum) as a counter of elapsed time.
+var blockProductionMarginBuckets = []float64{
+	-0.800, -0.400, -0.200, -0.100, -0.050, -0.025, -0.020,
+	-0.015, -0.010, -0.005, -0.0025, -0.001, 0,
+	0.001, 0.0025, 0.005, 0.0075, 0.010, 0.0125, 0.015,
+	0.020, 0.025, 0.050, 0.100, 0.200, 0.400, 0.800,
+}
+
 var turbinePipelineDurationBuckets = []float64{
 	0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005,
 	0.010, 0.025, 0.050, 0.100, 0.200, 0.400, 0.800, 1.600,
@@ -489,6 +543,9 @@ var MetricToBuckets = map[Metric][]float64{
 	BlockProductionStartDecisionTickDeliveryLag: blockProductionDurationBuckets,
 	BlockProductionStartDecisionTickWork:        blockProductionDurationBuckets,
 	BlockProductionStartAttempt:                 blockProductionDurationBuckets,
+	BlockProductionCompletion:                   blockProductionCompletionBuckets,
+	BlockProductionDeadlineMargin:               blockProductionMarginBuckets,
+	BlockProductionExecutionQuiescence:          blockProductionCompletionBuckets,
 	TurbineShredCollection:                      turbinePipelineDurationBuckets,
 	TurbineBlockCompletionQueueDelay:            turbinePipelineDurationBuckets,
 	TurbineBlockDecode:                          turbinePipelineDurationBuckets,
@@ -619,6 +676,21 @@ func Duration(m Metric, duration time.Duration, labels []string) error {
 	if duration < 0 {
 		return fmt.Errorf("duration metric %s cannot observe negative duration %s", m, duration)
 	}
+	return observeDuration(m, duration, labels)
+}
+
+// SignedDuration records signed seconds for a histogram whose explicit buckets
+// include negative values, such as a deadline margin. Ordinary durations retain
+// Duration's rejection of negative values. Signed sums are not monotonic.
+func SignedDuration(m Metric, duration time.Duration, labels []string) error {
+	buckets := MetricToBuckets[m]
+	if len(buckets) == 0 || buckets[0] >= 0 {
+		return fmt.Errorf("metric %s is not registered for signed duration observations", m)
+	}
+	return observeDuration(m, duration, labels)
+}
+
+func observeDuration(m Metric, duration time.Duration, labels []string) error {
 	metricType, registered := MetricToType[m]
 	if !registered {
 		return fmt.Errorf("duration metric %s is not registered", m)

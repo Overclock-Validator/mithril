@@ -14,15 +14,16 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/spinlock"
 	"github.com/gagliardetto/solana-go"
 )
 
 type ExecutionCtx struct {
+	// TimingRecorder is owned by the executing worker; it is cleared before results escape.
+	TimingRecorder *metrics.TransactionTimings
 	// SkipTimingMetrics disables instruction-dispatch timing collection for
 	// leader execution; it never changes instruction validation or CU charging.
-	SkipTimingMetrics bool
-	// SkipStableLogs avoids formatting messages when the caller discards logs.
-	SkipStableLogs           bool
+	SkipTimingMetrics        bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -33,6 +34,18 @@ type ExecutionCtx struct {
 	SlotCtx                  *SlotCtx
 	ModifiedVoteStates       map[solana.PublicKey]*VoteStateVersions
 	IsSimulation             bool
+	// Speculative marks an execution whose result may be discarded: it never
+	// publishes to the shared program cache; its program cache misses compile a
+	// private entry.
+	Speculative bool
+	// SpeculativeCancel is private to an attempt already rejected by replay.
+	SpeculativeCancel *atomic.Bool
+	// PrivateParameters serializes instruction parameters into heap buffers
+	// instead of the bank's parameter arena.
+	PrivateParameters bool
+	// PrivatePrograms makes every program load bypass the shared program cache
+	// (diagnostic).
+	PrivatePrograms bool
 
 	// RecordInnerInstructions enables capture of CPI instructions into
 	// InnerInstrs. Off by default; the simulate handler enables it when
@@ -110,18 +123,26 @@ type SlotCtx struct {
 
 	TraceCtx context.Context
 
-	// Speculative execution support (streaming replay). A bank executed before
+	// ParentReadHook, when set, is told every key this context reads from the
+	// parent bank directly, that is, not through Accounts (bank sysvar
+	// snapshots excluded). Diagnostic: an early execution's sealed context
+	// uses it to show that such reads were also seen by its recording view.
+	// Never copied to a derived context.
+	ParentReadHook func(solana.PublicKey)
+
+	// Speculative execution support (streaming replay and local production). A bank executed before
 	// its block is complete must not publish to process-global state until
 	// the block is accepted, so a discard leaves nothing behind.
 	//
-	// DeferVoteCachePublication buffers global vote-cache puts and deletes in
-	// the pending maps (protected by PendingVoteCacheMu) and turns the
-	// vote/stake dirty marker into VoteStakeDirty; the replay finalize step
-	// publishes them once the bank is accepted.
+	// DeferVoteCachePublication buffers vote-cache puts/deletes and stake-index
+	// discoveries in bank-owned pending maps (protected by PendingVoteCacheMu).
+	// Ordered replay acceptance publishes them together; discarded banks cannot
+	// affect global execution state or another bank at the same slot.
 	DeferVoteCachePublication bool
 	PendingVoteCacheMu        sync.Mutex
 	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
 	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
+	PendingStakePubkeys       map[solana.PublicKey]struct{}
 	VoteStakeDirty            bool
 	// TrackProgramCacheAdds records every program-cache insertion made while
 	// executing this bank so a discarded bank can evict them again (eviction
@@ -256,6 +277,9 @@ func (execCtx *ExecutionCtx) PrepareInstruction(ix Instruction, signers []solana
 	}
 
 	var instructionAccounts []InstructionAccount
+	if len(duplicateIndices) != 0 {
+		instructionAccounts = make([]InstructionAccount, 0, len(duplicateIndices))
+	}
 	for _, duplicateIndex := range duplicateIndices {
 		if duplicateIndex > uint64(len(dedupInstructionAccounts)-1) {
 			return nil, nil, InstrErrNotEnoughAccountKeys
@@ -290,11 +314,11 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	if err != nil {
 		return err
 	}
-	metrics.GlobalBlockReplay.GetNextIxCtx.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionGetNextIxCtx, start)
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx.Configure(programIndices, instructionAccts, instrData)
-	metrics.GlobalBlockReplay.NextIxCtxConfigure.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionNextIxCtxConfigure, start)
 
 	// Capture this invocation as an inner instruction when nested under
 	// an active top-level frame and recording is enabled. Stack height
@@ -320,7 +344,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	if err != nil {
 		return err
 	}
-	metrics.GlobalBlockReplay.IxPush.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionIxPush, start)
 
 	if len(programIndices) > 0 {
 		programKey, keyErr := execCtx.TransactionContext.KeyOfAccountAtIndex(programIndices[len(programIndices)-1])
@@ -333,7 +357,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err2 := execCtx.Pop()
-	metrics.GlobalBlockReplay.IxPop.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionIxPop, start)
 
 	if err1 != nil {
 		return err1
@@ -380,48 +404,31 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	if err != nil { // unrecognised builtin
 		return err
 	}
-	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxResolveNativeProgram, start)
 
-	var programKey solana.PublicKey
-	recordLogs := execCtx.Log != nil && !execCtx.SkipStableLogs
-	if recordLogs {
-		var keyErr error
-		programKey, keyErr = instrCtx.LastProgramKey(txCtx)
-		recordLogs = keyErr == nil && !isPrecompile(programKey) && programKey != a.Secp256r1PrecompileAddr
-		if recordLogs {
-			execCtx.Log.Log(fmt.Sprintf("Program %s invoke [%d]", programKey, execCtx.StackHeight()))
-		}
-	}
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
-	if recordLogs {
-		if err == nil {
-			execCtx.Log.Log(fmt.Sprintf("Program %s success", programKey))
-		} else {
-			execCtx.Log.Log(fmt.Sprintf("Program %s failed: %s", programKey, instructionErrorLogMessage(err)))
-		}
-	}
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramSystem, start)
 	case a.StakeProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramStake.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramStake, start)
 	case a.VoteProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramVote.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramVote, start)
 	case a.ComputeBudgetProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramComputeBudget.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramComputeBudget, start)
 	case a.BpfLoader2AddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoader2.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoader2, start)
 	case a.BpfLoaderDeprecatedAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoaderDeprecated.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoaderDeprecated, start)
 	case a.BpfLoaderUpgradeableAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoaderUpgradeable.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoaderUpgradeable, start)
 	case a.ZkElgamalProofProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramZkElgamalProof.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramZkElgamalProof, start)
 	case a.Ed25519PrecompileAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramEd25519Precompile.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramEd25519Precompile, start)
 	case a.Secp256kPrecompileAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramSecp256kPrecompile.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramSecp256kPrecompile, start)
 	}
 
 	return err
@@ -528,12 +535,18 @@ func (slotCtx *SlotCtx) GetAccount(pubkey solana.PublicKey) (*accounts.Account, 
 }
 
 func (slotCtx *SlotCtx) GetAccountShared(pubkey solana.PublicKey) (*accounts.Account, error) {
-	pk := [32]byte(pubkey)
-	return slotCtx.Accounts.GetAccount(&pk)
+	return accounts.GetAccountByValue(slotCtx.Accounts, pubkey)
 }
 
 func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
-	acct, err := slotCtx.ParentAccts.GetAccountWithoutLock(pubkey)
+	if slotCtx.ParentReadHook != nil {
+		slotCtx.ParentReadHook(pubkey)
+	}
+	// Producer commits retain parent images while other admitted scratch
+	// transactions may still read this shared store. Finalization joins all
+	// scratch execution before mutating the frozen bank.
+	key := [32]byte(pubkey)
+	acct, err := slotCtx.ParentAccts.GetAccount(&key)
 	if err != nil {
 		return nil, err
 	} else {
@@ -548,6 +561,9 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 		}
 		return nil, fmt.Errorf("bank sysvar account %s is absent at slot %d", pubkey, slotCtx.Slot)
 	}
+	if slotCtx.ParentReadHook != nil {
+		slotCtx.ParentReadHook(pubkey)
+	}
 	if slotCtx.UnrootedRead != nil {
 		return slotCtx.UnrootedRead.GetAccount(slotCtx.Slot, pubkey)
 	}
@@ -559,13 +575,30 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 	}
 }
 
-// getAccountFromAccountsDbReadOnly is restricted to program loading. The caller
-// must not mutate the account or its data, or pass them to mutable execution.
+// getAccountFromAccountsDbReadOnly is restricted to program loading and parent
+// images (ParentAccountReadOnly). The caller must not mutate the account or its
+// data, or pass them to mutable execution.
 // Keep bank sysvar precedence and fall back to the ordinary owned read for
 // sources that do not explicitly support immutable shared accounts.
 func (slotCtx *SlotCtx) getAccountFromAccountsDbReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
 	acct, _, err := slotCtx.getProgramAccountSource(pubkey)
 	return acct, err
+}
+
+// ParentAccountReadOnly resolves the same parent-bank version as
+// GetAccountFromAccountsDb, borrowing an immutable account only from sources
+// that explicitly support shared reads. Bank sysvar snapshots retain precedence.
+// Callers must not mutate the returned header or data; Clone makes a writable
+// account, and copying the header permits private bookkeeping without copying
+// the immutable payload. Retained parent data must never be mutated or recycled.
+func (slotCtx *SlotCtx) ParentAccountReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acct, err := slotCtx.getAccountFromAccountsDbReadOnly(pubkey)
+	if err != nil || acct != nil {
+		return acct, err
+	}
+	// Preserve the owning fallback if a shared-capable source has no shared
+	// value but can still resolve the account through its ordinary read.
+	return slotCtx.GetAccountFromAccountsDb(pubkey)
 }
 
 // The bool proves the source explicitly supports immutable shared accounts.
@@ -575,6 +608,9 @@ func (slotCtx *SlotCtx) getProgramAccountSource(pubkey solana.PublicKey) (*accou
 		if reader, ok := slotCtx.UnrootedRead.(interface {
 			GetAccountShared(uint64, solana.PublicKey) (*accounts.Account, error)
 		}); ok {
+			if slotCtx.ParentReadHook != nil {
+				slotCtx.ParentReadHook(pubkey)
+			}
 			acct, err := reader.GetAccountShared(slotCtx.Slot, pubkey)
 			return acct, true, err
 		}
@@ -591,6 +627,9 @@ func (slotCtx *SlotCtx) GetAccountDataLenFromAccountsDb(pubkey solana.PublicKey)
 		if reader, ok := slotCtx.UnrootedRead.(interface {
 			GetAccountDataLen(uint64, solana.PublicKey) (uint64, error)
 		}); ok {
+			if slotCtx.ParentReadHook != nil {
+				slotCtx.ParentReadHook(pubkey)
+			}
 			return reader.GetAccountDataLen(slotCtx.Slot, pubkey)
 		}
 	}
@@ -623,7 +662,7 @@ func (slotCtx *SlotCtx) RecordModifiedAccountStates(accountStates []*accounts.Ac
 	if len(accountStates) != len(touched) {
 		panic("account states/touched length mismatch")
 	}
-	slotCtx.AcctMapsMu.Lock()
+	spinlock.Lock(slotCtx.AcctMapsMu)
 	defer slotCtx.AcctMapsMu.Unlock()
 	for idx, acct := range accountStates {
 		if touched[idx] {

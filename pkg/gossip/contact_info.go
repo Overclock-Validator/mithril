@@ -39,17 +39,15 @@ const (
 	socketTagTPUVoteQuic     = 12
 	socketTagAlpenglow       = 13
 
-	// Agave's Version has a numeric ClientId, not a string. Unknown IDs are
-	// accepted, so use a stable "MI" marker while keeping ClientName in logs.
-	versionClientMithril = 0x4d49
+	versionClientMithril = 15
 )
 
 const (
 	// ClientIDMithril is the client ID mithril advertises by default.
 	ClientIDMithril uint16 = versionClientMithril
 	// ClientIDMithrilHarmonic is the client ID mithril advertises while it is
-	// connected to a Harmonic block engine (validator client-ID registry: 15).
-	ClientIDMithrilHarmonic uint16 = 15
+	// connected to a Harmonic block engine.
+	ClientIDMithrilHarmonic uint16 = 16
 )
 
 type Pubkey [32]byte

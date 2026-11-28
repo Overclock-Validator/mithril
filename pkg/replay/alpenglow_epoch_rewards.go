@@ -63,7 +63,7 @@ func missingParentAccount(key solana.PublicKey) *accounts.Account {
 // merely a replay cache: omitting it changes both capitalization and bank hash.
 func stageRewardEpochDelegatedStakes(
 	acctsDb *accountsdb.AccountsDb,
-	readSlot, storeSlot, rewardedEpoch uint64,
+	readSlot, rewardedEpoch uint64,
 	admitted map[solana.PublicKey]uint64,
 	rewardEpochEffectiveStakes map[solana.PublicKey]uint64,
 	replayCtx *ReplayCtx,
@@ -96,9 +96,6 @@ func stageRewardEpochDelegatedStakes(
 		Executable: false,
 		RentEpoch:  0,
 	}
-	if err := acctsDb.StoreAccounts([]*accounts.Account{updated}, storeSlot, nil); err != nil {
-		return nil, nil, fmt.Errorf("store reward epoch delegated stakes account: %w", err)
-	}
 	if updated.Lamports >= parent.Lamports {
 		replayCtx.Capitalization = safemath.SaturatingAddU64(replayCtx.Capitalization, updated.Lamports-parent.Lamports)
 	} else {
@@ -113,7 +110,7 @@ func stageRewardEpochDelegatedStakes(
 // payout, incinerator burn before bank freeze).
 func applyAlpenglowBoundaryVAT(
 	acctsDb *accountsdb.AccountsDb,
-	readSlot, storeSlot, burnPerValidator uint64,
+	readSlot, burnPerValidator uint64,
 	admitted map[solana.PublicKey]uint64,
 ) ([]*accounts.Account, []*accounts.Account, error) {
 	if burnPerValidator == 0 || len(admitted) == 0 {
@@ -123,7 +120,6 @@ func applyAlpenglowBoundaryVAT(
 	keys := sortedPubkeys(admitted)
 	updated := make([]*accounts.Account, 0, len(keys)+1)
 	parents := make([]*accounts.Account, 0, len(keys)+1)
-	toStore := make([]*accounts.Account, 0, len(keys)+1)
 	var totalVAT uint64
 	for _, key := range keys {
 		parent, err := acctsDb.GetAccount(readSlot, key)
@@ -133,11 +129,12 @@ func applyAlpenglowBoundaryVAT(
 		if parent.Lamports < burnPerValidator {
 			return nil, nil, fmt.Errorf("VAT vote account %s has %d lamports, burn requires %d", key, parent.Lamports, burnPerValidator)
 		}
+		// GetAccount may share cached data: the parent and the update are
+		// each a copy of their own.
 		parents = append(parents, parent.Clone())
 		acct := parent.Clone()
 		acct.Lamports -= burnPerValidator
-		updated = append(updated, acct.Clone())
-		toStore = append(toStore, acct)
+		updated = append(updated, acct)
 		var addErr error
 		totalVAT, addErr = safemath.CheckedAddU64(totalVAT, burnPerValidator)
 		if addErr != nil {
@@ -163,12 +160,8 @@ func applyAlpenglowBoundaryVAT(
 		return nil, nil, fmt.Errorf("credit incinerator with epoch VAT: %w", err)
 	}
 	parents = append(parents, incineratorParent)
-	updated = append(updated, incinerator.Clone())
-	toStore = append(toStore, incinerator)
+	updated = append(updated, incinerator)
 
-	if err := acctsDb.StoreAccounts(toStore, storeSlot, nil); err != nil {
-		return nil, nil, fmt.Errorf("store epoch VAT accounts: %w", err)
-	}
 	return updated, parents, nil
 }
 

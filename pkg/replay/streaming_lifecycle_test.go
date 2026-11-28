@@ -188,6 +188,10 @@ type lifecycleOutcome struct {
 	computeUnits  uint64
 	lamportsBurnt uint64
 	delta         map[solana.PublicKey]*accounts.Account
+	// The block's longest dependency chain, as the replay loop records it in
+	// the block's timing row.
+	longestChainCU  uint64
+	longestChainTxs uint32
 }
 
 func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycleTail) lifecycleOutcome {
@@ -201,12 +205,26 @@ func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycle
 		delta[acct.Key] = acct
 	}
 	require.Contains(t, delta, txfixture.PayerPubkey())
+
+	// The bank's longest chain was measured beside its tail, from the
+	// transactions it executed. Collect it the way the replay loop does when
+	// it writes the block's timing row.
+	metrics.GlobalBlockReplay.LongestChainCU, metrics.GlobalBlockReplay.LongestChainTransactions = 0, 0
+	metrics.GlobalBlockReplay.LongestChainMeasurement, metrics.GlobalBlockReplay.LongestChainWait = metrics.Timing{}, metrics.Timing{}
+	blockLongestChain.record(slotCtx)
+	require.Equal(t, uint64(1), metrics.GlobalBlockReplay.LongestChainMeasurement.Count, "the bank's own pass was joined")
+	require.Equal(t, uint64(1), metrics.GlobalBlockReplay.LongestChainWait.Count)
+	require.Nil(t, blockLongestChain.last, "no pass is left in flight once the row has its chain")
+	require.NotZero(t, metrics.GlobalBlockReplay.LongestChainCU)
+	require.NotZero(t, metrics.GlobalBlockReplay.LongestChainTransactions)
 	return lifecycleOutcome{
-		bankhash:      append([]byte(nil), slotCtx.FinalBankhash...),
-		numSignatures: slotCtx.NumSignatures,
-		computeUnits:  slotCtx.TotalComputeUnitsConsumed,
-		lamportsBurnt: slotCtx.LamportsBurnt,
-		delta:         delta,
+		bankhash:        append([]byte(nil), slotCtx.FinalBankhash...),
+		numSignatures:   slotCtx.NumSignatures,
+		computeUnits:    slotCtx.TotalComputeUnitsConsumed,
+		lamportsBurnt:   slotCtx.LamportsBurnt,
+		delta:           delta,
+		longestChainCU:  metrics.GlobalBlockReplay.LongestChainCU,
+		longestChainTxs: metrics.GlobalBlockReplay.LongestChainTransactions,
 	}
 }
 
@@ -217,6 +235,8 @@ func requireSameLifecycleOutcome(t *testing.T, want, got lifecycleOutcome) {
 	require.Equal(t, want.numSignatures, got.numSignatures)
 	require.Equal(t, want.computeUnits, got.computeUnits)
 	require.Equal(t, want.lamportsBurnt, got.lamportsBurnt)
+	require.Equal(t, want.longestChainCU, got.longestChainCU, "longest chain CU")
+	require.Equal(t, want.longestChainTxs, got.longestChainTxs, "longest chain transactions")
 	wantKeys := make([]string, 0, len(want.delta))
 	for key := range want.delta {
 		wantKeys = append(wantKeys, key.String())
@@ -254,6 +274,25 @@ func lifecycleWholeBlock(t *testing.T, env *lifecycleEnv, txs []*solana.Transact
 // execute at finalize.
 func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int) (lifecycleOutcome, *streamingExecutor) {
 	t.Helper()
+	s, exec, tail := lifecycleOpenStream(t, env, txs, splits, suffixTxs, workers)
+
+	block := env.block(txs)
+	block.MarkTransactionSignaturesVerified()
+	slotCtx, ok, err := s.finalize(block, env.parent)
+	require.NoError(t, err)
+	require.True(t, ok, "the stream must accept its own block")
+	require.Nil(t, s.current)
+	require.True(t, exec.closed)
+	require.Equal(t, uint64(1), metrics.GlobalBlockReplay.StreamingExecution.Opened)
+	require.Equal(t, uint64(len(txs)), metrics.GlobalBlockReplay.StreamingExecution.Transactions)
+	return lifecycleOutcomeOf(t, slotCtx, tail), s
+}
+
+// lifecycleOpenStream is lifecycleStream up to, and not including, finalize:
+// the stream has executed every transaction but the suffix and is waiting for
+// the complete block.
+func lifecycleOpenStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int) (*streamingExecutor, *blockExecution, *lifecycleTail) {
+	t.Helper()
 	tail := &lifecycleTail{durable: env.durable}
 	statuses := NewTransactionStatusCache()
 	shell := env.block(nil)
@@ -270,8 +309,6 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 		epochSchedule:       env.epochSchedule,
 		tail:                tail,
 		transactionStatuses: statuses,
-		alpenglowMode:       true,
-		unrootedTailUsed:    true,
 		frontier:            func() uint64 { return lifecycleParentSlot },
 		lastSlotCtx:         func() *sealevel.SlotCtx { return nil },
 		currentFeatures:     func() *features.Features { return env.feats },
@@ -302,17 +339,90 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 	require.NotNil(t, s.current, "no group may have discarded the stream (%s)", metrics.GlobalBlockReplay.StreamingExecution.DiscardReason)
 	sameTransactions(t, streamed, s.current.origin)
 	sameCopies(t, streamed, exec.transactions)
+	return s, exec, tail
+}
 
-	block := env.block(txs)
-	block.MarkTransactionSignaturesVerified()
-	slotCtx, ok, err := s.finalize(block, env.parent)
-	require.NoError(t, err)
-	require.True(t, ok, "the stream must accept its own block")
-	require.Nil(t, s.current)
-	require.True(t, exec.closed)
-	require.Equal(t, uint64(1), metrics.GlobalBlockReplay.StreamingExecution.Opened)
-	require.Equal(t, uint64(len(txs)), metrics.GlobalBlockReplay.StreamingExecution.Transactions)
-	return lifecycleOutcomeOf(t, slotCtx, tail), s
+// A bank whose tail fails is abandoned after its longest-chain measurement has
+// started. finalize joins the measurement before returning, so nothing is
+// still reading the bank's transactions when the caller discards it, and the
+// next bank is measured as if the failed one had never run. The capture check
+// stands in for any tail failure: it runs after the bank hash.
+func TestFailedBlockTailJoinsItsLongestChain(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	previousCapture := CaptureBankHashes
+	defer func() { CaptureBankHashes = previousCapture }()
+	txs := transferTransactions(t, 12, 999_000)
+	CaptureBankHashes = nil
+	want := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4)
+
+	t.Run("whole block", func(t *testing.T) {
+		CaptureBankHashes = map[uint64][32]byte{}
+		env := newLifecycleEnv(t)
+		block := env.block(txs)
+		block.MarkTransactionSignaturesVerified()
+		slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, 4, nil, &persistedTracker{}, &lifecycleTail{durable: env.durable}, NewTransactionStatusCache(), false, env.parent)
+		require.ErrorIs(t, err, ErrCaptureBankHash)
+		require.Nil(t, slotCtx)
+		require.Nil(t, blockLongestChain.last, "the failed bank's pass was joined and dropped")
+
+		CaptureBankHashes = nil
+		requireSameLifecycleOutcome(t, want, lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4))
+	})
+
+	t.Run("streamed", func(t *testing.T) {
+		CaptureBankHashes = nil
+		env := newLifecycleEnv(t)
+		s, exec, tail := lifecycleOpenStream(t, env, txs, []int{3, 7}, 2, 4)
+		CaptureBankHashes = map[uint64][32]byte{}
+		block := env.block(txs)
+		block.MarkTransactionSignaturesVerified()
+		slotCtx, ok, err := s.finalize(block, env.parent)
+		require.True(t, ok, "the stream had accepted the block")
+		require.ErrorIs(t, err, ErrCaptureBankHash)
+		require.Nil(t, slotCtx)
+		require.Nil(t, s.current, "the stream is discarded")
+		require.True(t, exec.closed)
+		require.Empty(t, tail.added)
+		require.Nil(t, blockLongestChain.last, "the failed bank's pass was joined before the stream was discarded")
+
+		CaptureBankHashes = nil
+		streamed, _ := lifecycleStream(t, newLifecycleEnv(t), txs, []int{3, 7}, 2, 4)
+		requireSameLifecycleOutcome(t, want, streamed)
+	})
+}
+
+// A bank can finalize and still never reach its timing row: the replay loop
+// stops on an error between ProcessBlock and the row. Its measurement is then
+// joined by the loop's exit (drain). A caller that does neither still gets
+// the right chain for the next bank, whose pass waits for the stranded one.
+func TestFinalizedBlockWithoutARowDoesNotStrandItsLongestChain(t *testing.T) {
+	txs := transferTransactions(t, 12, 999_000)
+	want := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4)
+	finalizeWithoutRow := func() *sealevel.SlotCtx {
+		env := newLifecycleEnv(t)
+		block := env.block(txs)
+		block.MarkTransactionSignaturesVerified()
+		slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, 4, nil, &persistedTracker{}, &lifecycleTail{durable: env.durable}, NewTransactionStatusCache(), false, env.parent)
+		require.NoError(t, err)
+		return slotCtx
+	}
+
+	stranded := finalizeWithoutRow()
+	pass := blockLongestChain.last
+	require.NotNil(t, pass, "the finalized bank's pass is tracked until it is joined")
+	require.Same(t, stranded, pass.bank)
+	blockLongestChain.drain()
+	select {
+	case <-pass.done:
+	default:
+		t.Fatal("drain returned with the pass still running")
+	}
+	require.Nil(t, blockLongestChain.last)
+
+	// Without the drain, the next bank still records its own chain.
+	finalizeWithoutRow()
+	requireSameLifecycleOutcome(t, want, lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4))
 }
 
 func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {
@@ -327,6 +437,10 @@ func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {
 
 	whole := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 0)
 	require.Equal(t, txCountBefore+uint64(len(txs)), global.TransactionCount())
+	// Every transfer writes the payer, so the whole block is one chain, the
+	// failed transfers included.
+	require.Equal(t, uint32(len(txs)), whole.longestChainTxs)
+	require.Equal(t, whole.computeUnits, whole.longestChainCU)
 	wholeParallel := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4)
 	requireSameLifecycleOutcome(t, whole, wholeParallel)
 
@@ -576,6 +690,8 @@ func TestStreamingLifecycleV0LookupsMatchWholeBlock(t *testing.T) {
 	whole := lifecycleWholeBlock(t, newLifecycleEnvWithTable(t, dest), decodeTransactions(t, wires), 2)
 	require.Contains(t, whole.delta, dest)
 	require.Equal(t, uint64(10_000_000+6*1_000+0+1+2+3+4+5), whole.delta[dest].Lamports, "every transfer reached the table's entry")
+	require.Equal(t, uint32(len(wires)), whole.longestChainTxs)
+	require.Equal(t, whole.computeUnits, whole.longestChainCU)
 
 	orig := decodeTransactions(t, wires)
 	streamed, _ := lifecycleStream(t, newLifecycleEnvWithTable(t, dest), orig, []int{2}, 2, 2)

@@ -1,6 +1,8 @@
 package sbpf
 
 import (
+	"sync/atomic"
+
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/sbpfver"
 )
 
@@ -17,6 +19,50 @@ type Program struct {
 	// CallTargets[pc] holds the resolved internal function target for a
 	// `call imm` slot at pc (non-static-syscall versions), or -1.
 	CallTargets []int64
+
+	// callCheck remembers the last answer of unshadowedCallTargets.
+	callCheck atomic.Pointer[callCheck]
+}
+
+// callCheck is the result of checking a program's internal call targets
+// against one syscall registry, identified by (id, gen).
+type callCheck struct {
+	id    any
+	gen   uint64
+	clean bool
+}
+
+// unshadowedCallTargets returns CallTargets if the interpreter may take an
+// internal call from it without asking the registry first, and nil otherwise.
+//
+// A legacy `call imm` names a syscall if the invocation's registry knows the
+// immediate, and only otherwise the internal function resolved at load time.
+// Under the registry identified by (id, gen) (see VMOpts.SyscallsID) that
+// answer is fixed, so it is checked once: if the registry knows none of the
+// immediates that have an internal target, every slot with CallTargets[pc] >= 0
+// is an internal call. If it knows even one, the program keeps the lookup.
+func (p *Program) unshadowedCallTargets(id any, gen uint64, registry SyscallRegistry) []int64 {
+	if id == nil || registry == nil || len(p.CallTargets) == 0 || len(p.CallTargets) != len(p.Text) {
+		return nil
+	}
+	c := p.callCheck.Load()
+	if c == nil || c.gen != gen || c.id != id {
+		c = &callCheck{id: id, gen: gen, clean: true}
+		for pc, target := range p.CallTargets {
+			if target < 0 {
+				continue
+			}
+			if _, isSyscall := registry(p.Text[pc].Uimm()); isSyscall {
+				c.clean = false
+				break
+			}
+		}
+		p.callCheck.Store(c)
+	}
+	if !c.clean {
+		return nil
+	}
+	return p.CallTargets
 }
 
 // ResolveCallTargets precomputes CallTargets from Funcs so the interpreter

@@ -201,14 +201,27 @@ func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
-	var err error
-	rpcServer := &RpcServer{genesisHash: genesisHash.String()}
-
-	addrStr := fmt.Sprintf("0.0.0.0:%d", port)
-	rpcServer.listener, err = net.Listen("tcp", addrStr)
+	rpcServer, err := NewRpcServerWithBindAddress(acctsDb, "0.0.0.0", port, epochSchedule, genesisHash)
 	if err != nil {
 		panic(err)
 	}
+	return rpcServer
+}
+
+// NewRpcServerWithBindAddress binds the shared HTTP and WebSocket listener to
+// an explicit IP. Reject empty addresses and hostnames rather than resolving a
+// private-listener configuration to an unintended interface.
+func NewRpcServerWithBindAddress(acctsDb *accountsdb.AccountsDb, bindAddress string, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) (*RpcServer, error) {
+	ip := net.ParseIP(bindAddress)
+	if ip == nil {
+		return nil, fmt.Errorf("RPC bind address must be a literal IP address: %q", bindAddress)
+	}
+	addrStr := net.JoinHostPort(ip.String(), fmt.Sprint(port))
+	listener, err := net.Listen("tcp", addrStr)
+	if err != nil {
+		return nil, fmt.Errorf("listen for RPC on %s: %w", addrStr, err)
+	}
+	rpcServer := &RpcServer{genesisHash: genesisHash.String(), listener: listener}
 
 	rpcErrors := rpcErrorRegistry()
 	rpcServer.rpcService = jsonrpc.NewServer(
@@ -232,7 +245,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 	rpcServer.transactionSender = defaultTransactionSender
 	rpcServer.sendTransactionLeaderForwardCount = sendTransactionLeaderForwardCount
 
-	return rpcServer
+	return rpcServer, nil
 }
 
 func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *sealevel.SysvarEpochSchedule {

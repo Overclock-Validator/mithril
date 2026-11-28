@@ -353,6 +353,11 @@ func (bs *BlockSource) runTurbineStream() {
 				mlog.Log.Warnf("shred spool disabled (%s): %v", bs.shredSpoolDir, serr)
 			} else {
 				receiver.SetShredSpool(spool)
+				if dir, aerr := turbine.ArchiveFromEnv(spool); aerr != nil {
+					mlog.Log.Warnf("shred archive disabled (%s): %v", dir, aerr)
+				} else if dir != "" {
+					mlog.Log.Infof("shred archive: slots behind replay move to %s instead of being deleted", dir)
+				}
 				if slots, bytes := spool.Stats(); slots > 0 {
 					mlog.Log.Infof("shred spool: adopted %d spooled slots (%d proven complete, %.1f MiB) from a previous run — complete slots need zero network", slots, spool.CompleteSlots(), float64(bytes)/(1<<20))
 				}

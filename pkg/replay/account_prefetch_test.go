@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -392,4 +393,27 @@ func TestAccountPrefetchCompletedBlockBeyondWindow(t *testing.T) {
 	p.Started(slot)
 	p.Offer(blk)
 	assert.Equal(t, uint64(1), p.late.Load(), "completed summaries do not bypass the started-slot gate")
+}
+
+// Programs a transaction can invoke from another program are among its loaded
+// accounts: executable accounts of a BPF loader that are not top-level
+// programs are preload candidates; data accounts, native programs and
+// top-level programs are not.
+func TestAccountPrefetchLoadedPrograms(t *testing.T) {
+	top, invoked, v2, data, native := solana.NewWallet().PublicKey(), solana.NewWallet().PublicKey(), solana.NewWallet().PublicKey(), solana.NewWallet().PublicKey(), solana.SystemProgramID
+	upgradeable := [32]byte(addresses.BpfLoaderUpgradeableAddr)
+	keys := []solana.PublicKey{top, invoked, v2, data, native}
+	loaded := []*accounts.Account{
+		{Key: top, Executable: true, Owner: upgradeable},
+		{Key: invoked, Executable: true, Owner: upgradeable},
+		{Key: v2, Executable: true, Owner: [32]byte(addresses.BpfLoader2Addr)},
+		{Key: data, Owner: upgradeable},
+		{Key: native, Executable: true, Owner: [32]byte(addresses.NativeLoaderAddr)},
+	}
+	programs, accts := loadedPrograms([]solana.PublicKey{top}, keys, loaded)
+	assert.Equal(t, []solana.PublicKey{invoked, v2}, programs)
+	require.Len(t, accts, 2)
+	assert.Equal(t, invoked, accts[0].Key)
+	programs, _ = loadedPrograms(nil, keys, loaded[:2])
+	assert.Nil(t, programs, "a partial read yields no candidates")
 }

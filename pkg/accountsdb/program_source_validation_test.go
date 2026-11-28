@@ -51,7 +51,7 @@ func TestImmutableProgramSourceValidation(t *testing.T) {
 		t.Fatal("replacement was not validated")
 	}
 	// Models an expired weak reference without depending on GC scheduling.
-	entry.validatedSource.Store(&immutableProgramSource{length: len(source)})
+	entry.validatedSource.Store(&immutableProgramSource{})
 	if !entry.MatchesImmutableSource(source, f) {
 		t.Fatal("expired memo prevented full validation")
 	}
@@ -174,5 +174,26 @@ func TestImmutableSourceMemoTracksFeatureMutationAndRebind(t *testing.T) {
 	bank.DisableFeature(features.Alpenglow)
 	if entry.MatchesImmutableSource(source, bank) {
 		t.Fatal("disable bypassed feature validation")
+	}
+}
+
+func TestImmutableProgramSourceDistinguishesRangesWithinAllocation(t *testing.T) {
+	data := bytes.Repeat([]byte{4}, 513)
+	data[512] = 5
+	f := features.NewFeaturesDefault()
+	entry := new(ProgramCacheEntry)
+	entry.BindSource(data[:512], f)
+	if !entry.MatchesImmutableSource(data[:512], f) {
+		t.Fatal("original byte range did not match")
+	}
+	runtime.GC()
+	if entry.MatchesImmutableSource(data[1:], f) {
+		t.Fatal("different offset in same allocation matched")
+	}
+	if entry.MatchesImmutableSource(data[:511], f) {
+		t.Fatal("different length at same address matched")
+	}
+	if !entry.MatchesImmutableSource(data[:512], f) {
+		t.Fatal("original range no longer matched")
 	}
 }

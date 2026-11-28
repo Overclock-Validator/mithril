@@ -86,7 +86,6 @@ func TestEarlyProcessingResultsStillCollectTokenBalances(t *testing.T) {
 	copy(tokenData[tokenAccountMintOffset:], mintKey[:])
 	copy(tokenData[tokenAccountOwnerOffset:], ownerKey[:])
 	binary.LittleEndian.PutUint64(tokenData[tokenAccountAmountOffset:], 42)
-	tokenData[108] = 1
 
 	slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewMemAccounts()}
 	require.NoError(t, slotCtx.SetAccount(payerKey, &accounts.Account{

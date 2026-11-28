@@ -185,9 +185,7 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 		Owner:     a.SystemProgramAddr,
 		RentEpoch: 0,
 	}
-	parentStored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{parent}, 10, func() { close(parentStored) }))
-	<-parentStored
+	seedDurableAccounts(t, db, []*accounts.Account{parent}, 10)
 
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.FullInflationEnable, 0)
@@ -204,8 +202,9 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 		115, startingCapitalization, 5_000_000,
 	)
 	require.NoError(t, err)
-	require.Equal(t, parent.Clone(), capturedParent)
-	require.Equal(t, uint64(11), updated.Slot)
+	wantParent := parent.Clone()
+	wantParent.Slot = 10 // read back from the fold that seeded it
+	require.Equal(t, wantParent, capturedParent)
 	require.Equal(t, a.SystemProgramAddr, updated.Owner)
 	require.Equal(t, rent.MinimumBalance(uint64(len(updated.Data))), updated.Lamports)
 	require.Equal(t, startingCapitalization+updated.Lamports-parent.Lamports, replayCtx.Capitalization)
@@ -217,11 +216,12 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 	require.NotNil(t, state.Prev)
 	require.Equal(t, existing.Current, *state.Prev)
 
-	db.WaitForStoreWorker()
+	// Staging never writes AccountsDB: the updated account reaches disk only
+	// when slot 11's delta is folded.
 	stored, err := db.GetAccount(11, VoteRewardAccountAddr())
 	require.NoError(t, err)
-	require.Equal(t, updated.Data, stored.Data)
-	require.Equal(t, updated.Lamports, stored.Lamports)
+	require.Equal(t, parent.Data, stored.Data)
+	require.Equal(t, parent.Lamports, stored.Lamports)
 }
 
 func TestLoadEpochInflationAccountStateForReplayPrefersStagedBoundaryAccount(t *testing.T) {

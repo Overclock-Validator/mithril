@@ -586,10 +586,13 @@ func (bs *BlockSource) synthesizeAlpenglowParentLinkedSkipsLocked() bool {
 	if childSlot-waitingSlot > alpenglowMaxParentLinkedSkipRun {
 		return false
 	}
-	// Never skip over an observed candidate, even if a later branch reconnects
-	// to the anchor. A certificate must adjudicate that fork explicitly.
+	// Never skip over an eligible observed candidate, even if a later branch
+	// reconnects to the anchor. Delayed blocks from an already-rejected suffix
+	// must not strand a recovered source before it can reach this child. The
+	// emitter discards those identities when each slot reaches the frontier;
+	// certificate decisions are still applied first and can re-authorize them.
 	for slot, candidate := range bs.reorderBuffer {
-		if candidate != nil && slot >= waitingSlot && slot < childSlot {
+		if candidate != nil && slot >= waitingSlot && slot < childSlot && !bs.isRejectedAlpenglowBlock(candidate) {
 			return false
 		}
 	}

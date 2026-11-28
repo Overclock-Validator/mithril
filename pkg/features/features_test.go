@@ -145,3 +145,63 @@ func TestAccountDataDirectMappingFeatureGate(t *testing.T) {
 	assert.Equal(t, base58.MustDecodeFromString("CR3dVN2Yoo95Y96kLSTaziWDAQT2MNEpiWh5cqVq2pNE"), AccountDataDirectMapping.Address)
 	assert.Contains(t, AllFeatureGates, AccountDataDirectMapping)
 }
+
+func TestRegisteredGatesHaveDistinctIndexes(t *testing.T) {
+	seen := make(map[uint16]string)
+	for _, gate := range AllFeatureGates {
+		assert.NotZero(t, gate.index, gate.Name)
+		assert.Less(t, int(gate.index), maxFeatureGates)
+		if prev, ok := seen[gate.index]; ok {
+			t.Fatalf("%s and %s share index %d", prev, gate.Name, gate.index)
+		}
+		seen[gate.index] = gate.Name
+	}
+}
+
+func TestIsActiveMatchesActivations(t *testing.T) {
+	unregistered := FeatureGate{Name: "Unregistered", Address: [32]byte{1}}
+	f := NewFeaturesDefault()
+	for i, gate := range AllFeatureGates {
+		switch i % 3 {
+		case 0:
+			f.EnableFeature(gate, uint64(i))
+		case 1:
+			f.DisableFeature(gate)
+		}
+	}
+	f.EnableFeature(unregistered, 7)
+	for i, gate := range AllFeatureGates {
+		info, ok := f.Info(gate)
+		assert.Equal(t, ok && info.Enabled, f.IsActive(gate), gate.Name)
+		assert.Equal(t, i%3 == 0, f.IsActive(gate), gate.Name)
+	}
+	assert.True(t, f.IsActive(unregistered))
+	assert.False(t, f.IsActive(FeatureGate{Name: "Other", Address: [32]byte{2}}))
+	slot, ok := f.ActivationSlot(AllFeatureGates[3])
+	assert.True(t, ok)
+	assert.Equal(t, uint64(3), slot)
+
+	var zero Features
+	assert.False(t, zero.IsActive(AllFeatureGates[0]))
+	assert.False(t, (*Features)(nil).IsActive(AllFeatureGates[0]))
+}
+
+func TestFeaturesCopiesShareCloneDoesNot(t *testing.T) {
+	f := NewFeaturesDefault()
+	copied := *f
+	clone := f.Clone()
+	assert.True(t, f.Identity() == copied.Identity())
+	assert.True(t, f.Identity() != clone.Identity())
+	assert.True(t, f.Equal(clone))
+
+	f.EnableFeature(StopTruncatingStringsInSyscalls, 1)
+	assert.True(t, copied.IsActive(StopTruncatingStringsInSyscalls))
+	assert.False(t, clone.IsActive(StopTruncatingStringsInSyscalls))
+	assert.False(t, f.Equal(clone))
+
+	clone.EnableFeature(StopTruncatingStringsInSyscalls, 1)
+	assert.True(t, f.Equal(clone))
+	f.DisableFeature(StopTruncatingStringsInSyscalls)
+	assert.True(t, clone.IsActive(StopTruncatingStringsInSyscalls))
+	assert.False(t, f.IsActive(StopTruncatingStringsInSyscalls))
+}

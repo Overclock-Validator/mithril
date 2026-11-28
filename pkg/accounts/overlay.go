@@ -3,8 +3,11 @@ package accounts
 import (
 	"hash/maphash"
 	"maps"
+	"os"
+	"strconv"
 	"sync"
 
+	"github.com/Overclock-Validator/mithril/pkg/spinlock"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -56,7 +59,23 @@ func NewOverlayAccountsWithSizing(parent Accounts, keyCount, writeCapacity int) 
 	}
 }
 
+// overlayFixedShards is MITHRIL_OVERLAY_SHARDS (bench knob): when it is a
+// power of two, every overlay uses exactly that many shards instead of one
+// per overlayTargetEntriesPerShard keys. Commits lock one shard per touched
+// key and reads hold a shard's read lock across the parent read, so with few
+// shards, unrelated keys of concurrently executing transactions collide.
+var overlayFixedShards = func() int {
+	n, err := strconv.Atoi(os.Getenv("MITHRIL_OVERLAY_SHARDS"))
+	if err != nil || n <= 0 || n&(n-1) != 0 || n > 1<<16 {
+		return 0
+	}
+	return n
+}()
+
 func overlayShardCount(length int) int {
+	if overlayFixedShards != 0 {
+		return overlayFixedShards
+	}
 	requested := 0
 	if length > 0 {
 		requested = (length-1)/overlayTargetEntriesPerShard + 1
@@ -92,17 +111,40 @@ func (o *OverlayAccounts) setAccountOnShard(shard *overlayAccountShard, pubkey [
 
 func (o *OverlayAccounts) GetAccount(pubkey *[32]byte) (*Account, error) {
 	shard := o.shardForKey(*pubkey)
-	shard.mu.RLock()
-	if acct, ok := shard.delta[*pubkey]; ok {
-		shard.mu.RUnlock()
+	spinlock.RLock(&shard.mu)
+	acct, ok := shard.delta[*pubkey]
+	shard.mu.RUnlock()
+	if ok {
 		return acct, nil
 	}
-	// Lock order is always overlay shard -> parent, so holding RLock across
-	// the parent read closes the same-key delta/parent race without coupling
-	// unrelated shards.
-	acct, err := o.parent.GetAccount(pubkey)
+	// The shard lock guards only the delta map. Overlay writes never reach the
+	// parent, so the parent value read after a delta miss is the value the key
+	// had at that miss, whether or not a writer publishes it meanwhile; holding
+	// the shard lock across the parent read would only make writers wait.
+	return o.parent.GetAccount(pubkey)
+}
+
+// DeltaVersion returns the account stored in the delta for pubkey, or nil if the
+// delta has none. Every store installs a new object and entries are never
+// removed, so an unchanged result means no store to the key happened in between.
+func (o *OverlayAccounts) DeltaVersion(pubkey [32]byte) *Account {
+	shard := o.shardForKey(pubkey)
+	shard.mu.RLock()
+	acct := shard.delta[pubkey]
 	shard.mu.RUnlock()
-	return acct, err
+	return acct
+}
+
+// GetAccountByValue keeps the pinned overlay's shard locking and parent lookup order.
+func (o *OverlayAccounts) GetAccountByValue(pubkey solana.PublicKey) (*Account, error) {
+	shard := o.shardForKey(pubkey)
+	spinlock.RLock(&shard.mu)
+	acct, ok := shard.delta[pubkey]
+	shard.mu.RUnlock()
+	if ok {
+		return acct, nil
+	}
+	return GetAccountByValue(o.parent, pubkey)
 }
 
 func (o *OverlayAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error) {
@@ -115,7 +157,7 @@ func (o *OverlayAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Accou
 
 func (o *OverlayAccounts) SetAccount(pubkey *[32]byte, acct *Account) error {
 	shard := o.shardForKey(*pubkey)
-	shard.mu.Lock()
+	spinlock.WLock(&shard.mu)
 	o.setAccountOnShard(shard, *pubkey, acct)
 	shard.mu.Unlock()
 	return nil
@@ -132,7 +174,7 @@ func (o *OverlayAccounts) SetTransactionAccounts(accountStates []*Account, touch
 func (o *OverlayAccounts) setTransactionAccounts(accountStates []*Account, touched []bool) {
 	if len(o.shards) == 1 {
 		shard := &o.shards[0]
-		shard.mu.Lock()
+		spinlock.WLock(&shard.mu)
 		defer shard.mu.Unlock()
 		for idx, acct := range accountStates {
 			if touched[idx] {
@@ -149,7 +191,7 @@ func (o *OverlayAccounts) setTransactionAccounts(accountStates []*Account, touch
 			continue
 		}
 		shard := o.shardForKey(acct.Key)
-		shard.mu.Lock()
+		spinlock.WLock(&shard.mu)
 		o.setAccountOnShard(shard, acct.Key, transactionAccountForStorage(acct))
 		shard.mu.Unlock()
 	}

@@ -124,9 +124,12 @@ func callLoopProgram(n uint32, ver uint32) *Program {
 
 func runProgram(b *testing.B, p *Program, input []byte, syscalls SyscallRegistry, budget uint64) uint64 {
 	cm := cu.NewComputeMeter(budget)
+	// Every benchmark runs its program with a single registry, so one
+	// identity serves them all (execution passes its feature set's).
 	ip := NewInterpreter(p, &VMOpts{
 		HeapMax:      32 * 1024,
 		Syscalls:     syscalls,
+		SyscallsID:   "bench",
 		ComputeMeter: &cm,
 		Input:        input,
 	})

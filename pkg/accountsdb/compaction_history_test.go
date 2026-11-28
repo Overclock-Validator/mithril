@@ -128,7 +128,6 @@ func TestCompactionHistoryCrashChild(t *testing.T) {
 	DisableIndexWAL = os.Getenv("MITHRIL_HISTORY_WAL_OFF") == "true"
 	db, err := OpenDb(dir)
 	require.NoError(t, err)
-	db.RootedDurable = true
 	db.InitCaches()
 	_, err = db.RecoverFoldState()
 	require.NoError(t, err)
@@ -170,7 +169,6 @@ func TestCompactionHistoryProcessCrashes(t *testing.T) {
 				db, err = OpenDb(dir)
 				require.NoError(t, err)
 				defer db.CloseDb()
-				db.RootedDurable = true
 				db.InitCaches()
 				_, err = db.RecoverFoldState()
 				require.NoError(t, err)

@@ -2,6 +2,7 @@ package loader
 
 import (
 	"bufio"
+	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
@@ -447,6 +448,20 @@ func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) 
 	if offset > l.fileSize || offset+readLen > l.fileSize {
 		return "", io.ErrUnexpectedEOF
 	}
+	if directELFStrings && l.input != nil {
+		// Constructors retain the same immutable input already held by rd.
+		// Check against the actual slice too, so a malformed loader cannot panic.
+		if offset > uint64(len(l.input)) || readLen > uint64(len(l.input))-offset {
+			return "", io.ErrUnexpectedEOF
+		}
+		window := l.input[offset : offset+readLen]
+		if end := bytes.IndexByte(window, 0); end >= 0 {
+			return string(window[:end]), nil
+		}
+		return "", io.EOF
+	}
+
+	// Retain ReaderAt behavior for loaders constructed around another source.
 	rd := bufio.NewReader(io.NewSectionReader(l.rd, int64(offset), int64(readLen)))
 	var builder strings.Builder
 	for {
@@ -717,6 +732,7 @@ type shTableIter struct {
 	elemSize uint16
 	elem     elf.Section64
 	err      error
+	scratch  [shEntLen]byte
 }
 
 type phTableIter struct {
@@ -727,6 +743,7 @@ type phTableIter struct {
 	elemSize uint16
 	elem     elf.Prog64
 	err      error
+	scratch  [phEntLen]byte
 }
 
 type dynTableIter struct {
@@ -737,6 +754,7 @@ type dynTableIter struct {
 	elemSize uint16
 	elem     elf.Dyn64
 	err      error
+	scratch  [dynLen]byte
 }
 
 type symTableIter struct {
@@ -757,6 +775,7 @@ type relTableIter struct {
 	elemSize uint16
 	elem     elf.Rel64
 	err      error
+	scratch  [relLen]byte
 }
 
 // newRelTableIter is like newTableIterator, but with all necessary bounds checks.
@@ -811,22 +830,29 @@ func (it *shTableIter) getNext() (bool, error) {
 
 	rd := io.NewSectionReader(it.l.rd, int64(it.off), int64(it.elemSize))
 
-	var entryBytes [shEntLen]byte
-	_, err := rd.Read(entryBytes[:])
+	var readBytes []byte
+	if iteratorScratch {
+		clear(it.scratch[:])
+		readBytes = it.scratch[:]
+	} else {
+		var entryBytes [shEntLen]byte
+		readBytes = entryBytes[:]
+	}
+	_, err := rd.Read(readBytes)
 	if err != nil {
 		return false, err
 	}
 
-	it.elem.Name = binary.LittleEndian.Uint32(entryBytes[:4])
-	it.elem.Type = binary.LittleEndian.Uint32(entryBytes[4:8])
-	it.elem.Flags = binary.LittleEndian.Uint64(entryBytes[8:16])
-	it.elem.Addr = binary.LittleEndian.Uint64(entryBytes[16:24])
-	it.elem.Off = binary.LittleEndian.Uint64(entryBytes[24:32])
-	it.elem.Size = binary.LittleEndian.Uint64(entryBytes[32:40])
-	it.elem.Link = binary.LittleEndian.Uint32(entryBytes[40:44])
-	it.elem.Info = binary.LittleEndian.Uint32(entryBytes[44:48])
-	it.elem.Addralign = binary.LittleEndian.Uint64(entryBytes[48:56])
-	it.elem.Entsize = binary.LittleEndian.Uint64(entryBytes[56:64])
+	it.elem.Name = binary.LittleEndian.Uint32(readBytes[:4])
+	it.elem.Type = binary.LittleEndian.Uint32(readBytes[4:8])
+	it.elem.Flags = binary.LittleEndian.Uint64(readBytes[8:16])
+	it.elem.Addr = binary.LittleEndian.Uint64(readBytes[16:24])
+	it.elem.Off = binary.LittleEndian.Uint64(readBytes[24:32])
+	it.elem.Size = binary.LittleEndian.Uint64(readBytes[32:40])
+	it.elem.Link = binary.LittleEndian.Uint32(readBytes[40:44])
+	it.elem.Info = binary.LittleEndian.Uint32(readBytes[44:48])
+	it.elem.Addralign = binary.LittleEndian.Uint64(readBytes[48:56])
+	it.elem.Entsize = binary.LittleEndian.Uint64(readBytes[56:64])
 
 	it.off += uint64(it.elemSize)
 	it.i++
@@ -864,20 +890,27 @@ func (it *phTableIter) getNext() (bool, error) {
 
 	rd := io.NewSectionReader(it.l.rd, int64(it.off), int64(it.elemSize))
 
-	var entryBytes [phEntLen]byte
-	_, err := rd.Read(entryBytes[:])
+	var readBytes []byte
+	if iteratorScratch {
+		clear(it.scratch[:])
+		readBytes = it.scratch[:]
+	} else {
+		var entryBytes [phEntLen]byte
+		readBytes = entryBytes[:]
+	}
+	_, err := rd.Read(readBytes)
 	if err != nil {
 		return false, err
 	}
 
-	it.elem.Type = binary.LittleEndian.Uint32(entryBytes[:4])
-	it.elem.Flags = binary.LittleEndian.Uint32(entryBytes[4:8])
-	it.elem.Off = binary.LittleEndian.Uint64(entryBytes[8:16])
-	it.elem.Vaddr = binary.LittleEndian.Uint64(entryBytes[16:24])
-	it.elem.Paddr = binary.LittleEndian.Uint64(entryBytes[24:32])
-	it.elem.Filesz = binary.LittleEndian.Uint64(entryBytes[32:40])
-	it.elem.Memsz = binary.LittleEndian.Uint64(entryBytes[40:48])
-	it.elem.Align = binary.LittleEndian.Uint64(entryBytes[48:56])
+	it.elem.Type = binary.LittleEndian.Uint32(readBytes[:4])
+	it.elem.Flags = binary.LittleEndian.Uint32(readBytes[4:8])
+	it.elem.Off = binary.LittleEndian.Uint64(readBytes[8:16])
+	it.elem.Vaddr = binary.LittleEndian.Uint64(readBytes[16:24])
+	it.elem.Paddr = binary.LittleEndian.Uint64(readBytes[24:32])
+	it.elem.Filesz = binary.LittleEndian.Uint64(readBytes[32:40])
+	it.elem.Memsz = binary.LittleEndian.Uint64(readBytes[40:48])
+	it.elem.Align = binary.LittleEndian.Uint64(readBytes[48:56])
 
 	it.off += uint64(it.elemSize)
 	it.i++
@@ -915,14 +948,21 @@ func (it *dynTableIter) getNext() (bool, error) {
 
 	rd := io.NewSectionReader(it.l.rd, int64(it.off), int64(it.elemSize))
 
-	var entryBytes [dynLen]byte
-	_, err := rd.Read(entryBytes[:])
+	var readBytes []byte
+	if iteratorScratch {
+		clear(it.scratch[:])
+		readBytes = it.scratch[:]
+	} else {
+		var entryBytes [dynLen]byte
+		readBytes = entryBytes[:]
+	}
+	_, err := rd.Read(readBytes)
 	if err != nil {
 		return false, err
 	}
 
-	it.elem.Tag = int64(binary.LittleEndian.Uint64(entryBytes[:8]))
-	it.elem.Val = binary.LittleEndian.Uint64(entryBytes[8:16])
+	it.elem.Tag = int64(binary.LittleEndian.Uint64(readBytes[:8]))
+	it.elem.Val = binary.LittleEndian.Uint64(readBytes[8:16])
 
 	it.off += uint64(it.elemSize)
 	it.i++
@@ -960,14 +1000,21 @@ func (it *relTableIter) getNext() (bool, error) {
 
 	rd := io.NewSectionReader(it.l.rd, int64(it.off), int64(it.elemSize))
 
-	var entryBytes [relLen]byte
-	_, err := rd.Read(entryBytes[:])
+	var readBytes []byte
+	if iteratorScratch {
+		clear(it.scratch[:])
+		readBytes = it.scratch[:]
+	} else {
+		var entryBytes [relLen]byte
+		readBytes = entryBytes[:]
+	}
+	_, err := rd.Read(readBytes)
 	if err != nil {
 		return false, err
 	}
 
-	it.elem.Off = binary.LittleEndian.Uint64(entryBytes[:8])
-	it.elem.Info = binary.LittleEndian.Uint64(entryBytes[8:16])
+	it.elem.Off = binary.LittleEndian.Uint64(readBytes[:8])
+	it.elem.Info = binary.LittleEndian.Uint64(readBytes[8:16])
 
 	it.off += uint64(it.elemSize)
 	it.i++

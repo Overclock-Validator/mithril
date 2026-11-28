@@ -6,17 +6,18 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
 
 func TestNewReadyStateForBootstrapAlwaysBindsChain(t *testing.T) {
 	for _, mode := range []string{"explicit", "snapshot", "new-snapshot", "new-incremental", "auto"} {
 		t.Run(mode, func(t *testing.T) {
-			got, err := newReadyStateForBootstrap(2233733, 41, mode, "alpenglow", testNodeGenesisHash)
+			got, err := newReadyStateForBootstrap(2233733, 41, mode, "mainnet", testNodeGenesisHash)
 			if err != nil {
 				t.Fatalf("new ready state: %v", err)
 			}
-			if got.Cluster != "alpenglow" || got.GenesisHash != testNodeGenesisHash || got.BuildMode != mode {
+			if got.Cluster != "mainnet" || got.GenesisHash != testNodeGenesisHash || got.BuildMode != mode {
 				t.Fatalf("ready state lost bootstrap metadata: %+v", got)
 			}
 			if !got.IsReady() || got.SnapshotSlot != 2233733 || got.SnapshotEpoch != 41 {
@@ -27,7 +28,7 @@ func TestNewReadyStateForBootstrapAlwaysBindsChain(t *testing.T) {
 }
 
 func TestNewReadyStateForBootstrapRejectsUnboundBuild(t *testing.T) {
-	if _, err := newReadyStateForBootstrap(1, 0, "new-snapshot", "alpenglow", ""); err == nil {
+	if _, err := newReadyStateForBootstrap(1, 0, "new-snapshot", "mainnet", ""); err == nil {
 		t.Fatal("ready state accepted an empty genesis hash")
 	}
 	if _, err := newReadyStateForBootstrap(1, 0, "new-snapshot", "", testNodeGenesisHash); err == nil {
@@ -130,3 +131,26 @@ func TestLoadBootstrapStateKeepsMarkedCorruptionRebuildable(t *testing.T) {
 
 const testNodeGenesisHash = "87WDnn84R1RVXsaBC4JkugZtLaL2biu6e6kkwx6Z8ruJ"
 const testNodeOldGenesisHash = "HtRW7y9hJZaEBgH8cvUomQQjaXY5vM8J54nqbZJz7MjW"
+
+func TestStateBoundToOneClusterRefusesAnother(t *testing.T) {
+	// An AccountsDB built on mainnet must not resume on testnet even when the
+	// testnet config and its RPC agree with each other.
+	mainnet, err := config.ResolveCluster("mainnet-beta", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testnet, err := config.ResolveCluster("testnet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testnet.CheckGenesis(testnet.GenesisHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := mainnet.CheckGenesis(testnet.GenesisHash); err == nil {
+		t.Fatal("mainnet config accepted a testnet RPC")
+	}
+	_, mismatch, err := validateAccountsGenesisForBootstrap(true, mainnet.GenesisHash, "", testnet.GenesisHash, "auto")
+	if !mismatch || err == nil {
+		t.Fatalf("mainnet-bound AccountsDB resumed on testnet: mismatch=%t err=%v", mismatch, err)
+	}
+}

@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/Overclock-Validator/mithril/pkg/base58"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -13,6 +12,7 @@ import (
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	mithrilsolana "github.com/Overclock-Validator/mithril/pkg/solana"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -76,16 +76,9 @@ func translateInstructionC(vm sbpf.VM, addr uint64) (Instruction, error) {
 		return Instruction{}, err
 	}
 
-	accountMetaReader := bytes.NewReader(accountMetasData)
-
-	accountMetas := make([]SolAccountMetaC, 0, ix.AccountsLen)
-	for count := uint64(0); count < ix.AccountsLen; count++ {
-		var am SolAccountMetaC
-		err = am.Unmarshal(accountMetaReader)
-		if err != nil {
-			return Instruction{}, err
-		}
-		accountMetas = append(accountMetas, am)
+	accountMetas := make([]SolAccountMetaC, ix.AccountsLen)
+	for i := range accountMetas {
+		accountMetas[i].decode(accountMetasData[i*SolAccountMetaCSize:])
 	}
 
 	data, err := vm.Translate(ix.DataAddr, ix.DataLen, false)
@@ -160,16 +153,11 @@ func translateInstructionRust(vm sbpf.VM, addr uint64) (Instruction, error) {
 		return Instruction{}, err
 	}
 
-	byteReader.Reset(accountMetasData)
-	accountMetas := make([]AccountMeta, 0, ix.Accounts.Len)
-
-	for i := uint64(0); i < ix.Accounts.Len; i++ {
-		var accountMeta AccountMeta
-		err = accountMeta.Unmarshal(byteReader)
-		if err != nil {
+	accountMetas := make([]AccountMeta, ix.Accounts.Len)
+	for i := range accountMetas {
+		if err := accountMetas[i].decode(accountMetasData[i*AccountMetaSize:]); err != nil {
 			return Instruction{}, err
 		}
-		accountMetas = append(accountMetas, accountMeta)
 	}
 
 	data, err := vm.Translate(ix.Data.Addr, ix.Data.Len, false)
@@ -258,11 +246,12 @@ func translateSigners(vm sbpf.VM, programId solana.PublicKey, signersSeedsAddr, 
 			seedBytes = append(seedBytes, seedFragmentMem)
 		}
 
-		pubkey, err := solana.CreateProgramAddress(seedBytes, programId)
+		// The PDA syscalls' derivation, whose on-curve check is memoized.
+		pubkey, err := mithrilsolana.CreateProgramAddressBytes(seedBytes, programId[:])
 		if err != nil {
 			return nil, PubkeyErrInvalidSeeds
 		}
-		pdas = append(pdas, pubkey)
+		pdas = append(pdas, solana.PublicKeyFromBytes(pubkey))
 	}
 
 	return pdas, nil
@@ -294,7 +283,7 @@ func isPrecompile(programId solana.PublicKey) bool {
 
 func checkAuthorizedProgram(execCtx *ExecutionCtx, programId solana.PublicKey, instructionData []byte) error {
 
-	if programId == base58.MustDecodeFromString("NativeLoader1111111111111111111111111111111") ||
+	if programId == a.NativeLoaderAddr ||
 		programId == solana.BPFLoaderProgramID ||
 		programId == solana.BPFLoaderDeprecatedProgramID ||
 		(programId == solana.BPFLoaderUpgradeableProgramID &&
@@ -338,8 +327,20 @@ func cpiInvokeUnits(f *features.Features) uint64 {
 	return cu.CUInvokeUnits
 }
 
+// VASA's account regions require the same AccountInfo validation as the
+// parameter-address feature. Agave v4.4.1 applies these checks when reading
+// the caller's serialized account data.
+func cpiAccountInfoValidationActive(execCtx *ExecutionCtx) bool {
+	return execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) ||
+		execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments)
+}
+
+func cpiInputAddressRestricted(execCtx *ExecutionCtx, addr uint64) bool {
+	return cpiAccountInfoValidationActive(execCtx) && addr >= sbpf.VaddrInput
+}
+
 func syscallParameterAddressRangeRestricted(execCtx *ExecutionCtx, addr, size uint64) bool {
-	return execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) &&
+	return cpiAccountInfoValidationActive(execCtx) &&
 		safemath.SaturatingAddU64(addr, size) >= sbpf.VaddrInput
 }
 
@@ -362,14 +363,14 @@ func checkAccountInfoPointer(vmAddr, expectedVmAddr uint64) error {
 }
 
 func accountDataLenForCpi(execCtx *ExecutionCtx, refToLenInVm []byte, fallbackLen uint64) uint64 {
-	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if cpiAccountInfoValidationActive(execCtx) {
 		return binary.LittleEndian.Uint64(refToLenInVm)
 	}
 	return fallbackLen
 }
 
 func checkCpiDataLength(execCtx *ExecutionCtx, dataLen, originalDataLen uint64, isLoaderDeprecated bool) error {
-	if !execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if !cpiAccountInfoValidationActive(execCtx) {
 		return nil
 	}
 
@@ -385,10 +386,6 @@ func checkCpiDataLength(execCtx *ExecutionCtx, dataLen, originalDataLen uint64, 
 
 type inputBackingTranslator interface {
 	TranslateInput(addr uint64, size uint64) ([]byte, error)
-}
-
-type inputRegionLengthUpdater interface {
-	SetInputRegionLength(addr uint64, length uint64, writable bool) bool
 }
 
 type inputRegionDataUpdater interface {
@@ -419,16 +416,10 @@ func translateAccountInfosC(vm sbpf.VM, accountInfosAddr, accountInfosLen uint64
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoC, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoC
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	// Translate returned exactly accountInfosLen complete records.
+	accountInfos := make([]SolAccountInfoC, accountInfosLen)
+	for i := range accountInfos {
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoCSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -469,16 +460,10 @@ func translateAccountInfosRust(vm sbpf.VM, accountInfosAddr, accountInfosLen uin
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoRust, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoRust
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	// Translate returned exactly accountInfosLen complete records.
+	accountInfos := make([]SolAccountInfoRust, accountInfosLen)
+	for i := range accountInfos {
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoRustSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -520,7 +505,7 @@ func callerAccountFromAccountInfoC(vm sbpf.VM, execCtx *ExecutionCtx, indexInCal
 		}
 		originalDataLen = accountMetadata.originalDataLen
 	}
-	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if cpiAccountInfoValidationActive(execCtx) {
 		if err = checkAccountInfoPointer(accountInfo.KeyAddr, accountMetadata.vmKeyAddr); err != nil {
 			return CallerAccount{}, err
 		}
@@ -546,7 +531,7 @@ func callerAccountFromAccountInfoC(vm sbpf.VM, execCtx *ExecutionCtx, indexInCal
 	}
 
 	dataLenVmAddr := accountInfosAddr + (callerAcctIdx * SolAccountInfoCSize) + solAccountInfoCDataLenOffset
-	if syscallParameterAddressRestricted(execCtx, dataLenVmAddr) {
+	if cpiInputAddressRestricted(execCtx, dataLenVmAddr) {
 		return CallerAccount{}, SyscallErrInvalidPointer
 	}
 
@@ -589,14 +574,14 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 			return CallerAccount{}, err
 		}
 	}
-	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if cpiAccountInfoValidationActive(execCtx) {
 		if err = checkAccountInfoPointer(accountInfo.PubkeyAddr, accountMetadata.vmKeyAddr); err != nil {
 			return CallerAccount{}, err
 		}
 		if err = checkAccountInfoPointer(accountInfo.OwnerAddr, accountMetadata.vmOwnerAddr); err != nil {
 			return CallerAccount{}, err
 		}
-		if syscallParameterAddressRestricted(execCtx, accountInfo.LamportsBoxAddr) {
+		if cpiInputAddressRestricted(execCtx, accountInfo.LamportsBoxAddr) {
 			return CallerAccount{}, SyscallErrInvalidPointer
 		}
 	}
@@ -606,15 +591,10 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader := bytes.NewReader(lamportsBoxData)
-
 	var lamportsBox RefCellRust
-	err = lamportsBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	lamportsBox.decode(lamportsBoxData)
 
-	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if cpiAccountInfoValidationActive(execCtx) {
 		if err = checkAccountInfoPointer(lamportsBox.Addr, accountMetadata.vmLamportsAddr); err != nil {
 			return CallerAccount{}, err
 		}
@@ -630,7 +610,7 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	if syscallParameterAddressRestricted(execCtx, accountInfo.DataBoxAddr) {
+	if cpiInputAddressRestricted(execCtx, accountInfo.DataBoxAddr) {
 		return CallerAccount{}, SyscallErrInvalidPointer
 	}
 
@@ -639,26 +619,21 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader.Reset(dataBoxBytes)
-
 	var dataBox RefCellVecRust
-	err = dataBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	dataBox.decode(dataBoxBytes)
 
 	originalDataLen := dataBox.Len
 	if usesSerializedAccountMetadata {
 		originalDataLen = accountMetadata.originalDataLen
 	}
-	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
+	if cpiAccountInfoValidationActive(execCtx) {
 		if err = checkAccountInfoPointer(dataBox.Addr, accountMetadata.vmDataAddr); err != nil {
 			return CallerAccount{}, err
 		}
 	}
 
 	dataLenVmAddr := safemath.SaturatingAddU64(accountInfo.DataBoxAddr, solAccountInfoRustDataLenOffset)
-	if syscallParameterAddressRestricted(execCtx, dataLenVmAddr) {
+	if cpiInputAddressRestricted(execCtx, dataLenVmAddr) {
 		return CallerAccount{}, SyscallErrInvalidPointer
 	}
 
@@ -730,13 +705,13 @@ func updateCalleeAccount(vm sbpf.VM, execCtx *ExecutionCtx, callerAccount Caller
 			if uint64(len(callerAccount.SerializedData)) < postLen {
 				return false, InstrErrAccountDataTooSmall
 			}
-			err = calleeAccount.SetData(execCtx.Features, callerAccount.SerializedData[:postLen])
+			err = calleeAccount.SetData(execCtx.Features, bytes.Clone(callerAccount.SerializedData[:postLen]))
 			if err != nil {
 				return false, err
 			}
 		}
 	} else {
-		err1 := calleeAccount.CanDataBeResized(uint64(len(callerAccount.SerializedData)))
+		err1 := calleeAccount.CanDataBeResized(uint64(len(callerAccount.SerializedData)), execCtx.Features)
 		err2 := calleeAccount.DataCanBeChanged(execCtx.Features)
 
 		if err1 != nil {
@@ -752,7 +727,7 @@ func updateCalleeAccount(vm sbpf.VM, execCtx *ExecutionCtx, callerAccount Caller
 			}
 			err = nil
 		} else {
-			err = calleeAccount.SetData(execCtx.Features, callerAccount.SerializedData)
+			err = calleeAccount.SetData(execCtx.Features, bytes.Clone(callerAccount.SerializedData))
 			if err != nil {
 				return false, err
 			}
@@ -776,7 +751,7 @@ func updateCallerAccount(vm sbpf.VM, callerAcct *CallerAccount, calleeAcct *Borr
 	prevLen := binary.LittleEndian.Uint64(callerAcct.RefToLenInVm)
 	postLen := uint64(len(calleeAcct.Data()))
 	execCtx := executionCtx(vm)
-	syscallParameterAddressRestrictions := execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions)
+	syscallParameterAddressRestrictions := cpiAccountInfoValidationActive(execCtx)
 	directMapping := accountDataDirectMappingActive(execCtx)
 	maxPermittedIncrease := uint64(MaxPermittedDataIncrease)
 	if syscallParameterAddressRestrictions && isLoaderDeprecated {
@@ -867,11 +842,14 @@ func updateCallerAccountRegion(vm sbpf.VM, execCtx *ExecutionCtx, callerAcct *Ca
 			return InstrErrMissingAccount
 		}
 	} else {
-		updater, ok := vm.(inputRegionLengthUpdater)
+		updater, ok := vm.(inputRegionDataUpdater)
 		if !ok {
 			return nil
 		}
-		if !updater.SetInputRegionLength(callerAcct.VmDataAddr, uint64(len(calleeAcct.Data())), writable) {
+		// CPI may change the account owner or length. Keep the serialized
+		// backing, and restore the copied region's growth handler accordingly.
+		onWrite := copiedAccountDataOnWrite(execCtx, calleeAcct, reserved)
+		if !updater.SetInputRegionData(callerAcct.VmDataAddr, nil, uint64(len(calleeAcct.Data())), writable, onWrite) {
 			return InstrErrMissingAccount
 		}
 	}
@@ -881,14 +859,14 @@ func updateCallerAccountRegion(vm sbpf.VM, execCtx *ExecutionCtx, callerAcct *Ca
 func translateAndUpdateAccountsC(vm sbpf.VM, instructionAccts []InstructionAccount, programIndices []uint64, accountInfoKeys []solana.PublicKey, accountInfos []SolAccountInfoC, accountInfosAddr uint64, isLoaderDeprecated bool) (TranslatedAccounts, error) {
 	execCtx := executionCtx(vm)
 	txCtx := execCtx.TransactionContext
-	syscallParameterAddressRestrictions := execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions)
+	syscallParameterAddressRestrictions := cpiAccountInfoValidationActive(execCtx)
 
 	ixCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {
@@ -990,14 +968,14 @@ func translateAndUpdateAccountsC(vm sbpf.VM, instructionAccts []InstructionAccou
 func translateAndUpdateAccountsRust(vm sbpf.VM, instructionAccts []InstructionAccount, programIndices []uint64, accountInfoKeys []solana.PublicKey, accountInfos []SolAccountInfoRust, accountInfosAddr uint64, isLoaderDeprecated bool) (TranslatedAccounts, error) {
 	execCtx := executionCtx(vm)
 	txCtx := execCtx.TransactionContext
-	syscallParameterAddressRestrictions := execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions)
+	syscallParameterAddressRestrictions := cpiAccountInfoValidationActive(execCtx)
 
 	ixCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {

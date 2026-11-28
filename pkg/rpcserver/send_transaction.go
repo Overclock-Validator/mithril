@@ -3,7 +3,6 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -74,44 +73,36 @@ var errInvalidSanitizedTransaction = &InvalidParamsError{
 }
 
 func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawParams) (string, error) {
-	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
+	params, err := jsonrpc.DecodeParams[[]interface{}](p)
 	if err != nil {
 		return "", &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
 	}
-	if len(params) < 1 || len(params) > 2 {
+	if len(params) < 1 {
 		return "", &InvalidParamsError{Message: "sendTransaction requires a transaction string as first parameter"}
 	}
 
-	var txStr *string
-	if err := json.Unmarshal(params[0], &txStr); err != nil || txStr == nil {
+	txStr, ok := params[0].(string)
+	if !ok {
 		return "", &InvalidParamsError{Message: "sendTransaction requires a transaction string as first parameter"}
 	}
 
-	conf, err := parseSendTransactionConfig(params)
+	conf := parseSendTransactionConfig(params)
+
+	tx, wire, err := decodeSendTransaction(txStr, conf.encoding)
 	if err != nil {
 		return "", err
 	}
 
-	tx, wire, err := decodeSendTransaction(*txStr, conf.encoding)
-	if err != nil {
+	if err := validateSendTransactionSanitize(tx, featuresForSendValidation(rpcServer.getSlotCtx())); err != nil {
 		return "", err
 	}
 
-	slotCtx := rpcServer.getSlotCtx()
-	if err := validateSendTransactionSanitize(tx, featuresForSendValidation(slotCtx)); err != nil {
-		return "", err
-	}
-
-	if conf.minContextSlot != nil {
-		if slotCtx == nil {
-			return "", fmt.Errorf("node is not ready for transaction preflight")
-		}
-		if slotCtx.Slot < *conf.minContextSlot {
-			return "", &MinContextSlotNotReachedError{ContextSlot: slotCtx.Slot}
-		}
+	if conf.minContextSlot != nil && global.Slot() < *conf.minContextSlot {
+		return "", &MinContextSlotNotReachedError{ContextSlot: *conf.minContextSlot}
 	}
 
 	if !conf.skipPreflight {
+		slotCtx := rpcServer.getSlotCtx()
 		if slotCtx == nil {
 			return "", fmt.Errorf("node is not ready for transaction preflight")
 		}
@@ -132,37 +123,38 @@ func (rpcServer *RpcServer) SendTransaction(ctx context.Context, p jsonrpc.RawPa
 	return signature.String(), nil
 }
 
-func parseSendTransactionConfig(params []json.RawMessage) (sendTransactionConfig, error) {
+func parseSendTransactionConfig(params []interface{}) sendTransactionConfig {
 	conf := sendTransactionConfig{
 		encoding: "base58",
 	}
 	if len(params) < 2 {
-		return conf, nil
+		return conf
 	}
 
-	var options struct {
-		Encoding            *string `json:"encoding"`
-		SkipPreflight       *bool   `json:"skipPreflight"`
-		PreflightCommitment *string `json:"preflightCommitment"`
-		MaxRetries          *uint   `json:"maxRetries"`
-		MinContextSlot      *uint64 `json:"minContextSlot"`
-	}
-	if err := json.Unmarshal(params[1], &options); err != nil {
-		return conf, &InvalidParamsError{Message: fmt.Sprintf("invalid sendTransaction config: %v", err)}
+	confMap, ok := params[1].(map[string]interface{})
+	if !ok {
+		return conf
 	}
 
-	if options.Encoding != nil {
-		conf.encoding = *options.Encoding
+	if encoding, ok := confMap["encoding"].(string); ok {
+		conf.encoding = encoding
 	}
-	if options.SkipPreflight != nil {
-		conf.skipPreflight = *options.SkipPreflight
+	if skipPreflight, ok := confMap["skipPreflight"].(bool); ok {
+		conf.skipPreflight = skipPreflight
 	}
-	if options.PreflightCommitment != nil {
-		conf.preflightCommitment = *options.PreflightCommitment
+	if preflightCommitment, ok := confMap["preflightCommitment"].(string); ok {
+		conf.preflightCommitment = preflightCommitment
 	}
-	conf.maxRetries = options.MaxRetries
-	conf.minContextSlot = options.MinContextSlot
-	return conf, nil
+	if maxRetries, ok := confMap["maxRetries"].(float64); ok && maxRetries >= 0 {
+		v := uint(maxRetries)
+		conf.maxRetries = &v
+	}
+	if minContextSlot, ok := confMap["minContextSlot"].(float64); ok && minContextSlot >= 0 {
+		v := uint64(minContextSlot)
+		conf.minContextSlot = &v
+	}
+
+	return conf
 }
 
 func decodeSendTransaction(txStr string, encoding string) (*solana.Transaction, []byte, error) {

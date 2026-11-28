@@ -29,7 +29,6 @@ func newMultiDirTestDb(t *testing.T, n int, bootstrapHigh uint64) (*AccountsDb, 
 	require.NoError(t, WriteAccountsDirCount(paths[0], n))
 	db, err := OpenDbPaths(paths)
 	require.NoError(t, err)
-	db.RootedDurable = true
 	db.InitCaches()
 	return db, paths
 }
@@ -142,7 +141,6 @@ func TestMultiDirReadFoldCompactRecover(t *testing.T) {
 	db.CloseDb()
 	db, err = OpenDbPaths(paths)
 	require.NoError(t, err)
-	db.RootedDurable = true
 	db.InitCaches()
 	assert.Equal(t, uint64(200), mustColdRead(t, db, 50, solana.PublicKey{2}).Lamports)
 	assert.Equal(t, uint64(900), mustColdRead(t, db, 110, solana.PublicKey{9}).Lamports)

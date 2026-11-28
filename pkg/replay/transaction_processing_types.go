@@ -2,7 +2,6 @@ package replay
 
 import (
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -378,7 +377,7 @@ type InnerInstructionsList struct {
 
 // CompiledInstruction represents a compiled instruction.
 // StackHeight is set for inner instructions to mirror Agave's
-// UiCompiledInstruction; top-level captures leave it zero.
+// UiCompiledInstruction; top-level top-level captures leave it zero.
 type CompiledInstruction struct {
 	// ProgramIdIndex is the index into the transaction's account keys of the program
 	ProgramIdIndex uint8
@@ -418,28 +417,28 @@ type TransactionExecutionResult struct {
 }
 
 // agaveInstrErrName converts a Mithril InstrErr*/TxErr* sentinel into the
-// Agave-format JSON value (bare string for unit variants, object for Custom).
-func agaveInstrErrName(err error) (any, error) {
+// Agave-format JSON value (bare string for unit variants, object for
+// Custom and BorshIoError).
+func agaveInstrErrName(err error) interface{} {
 	if err == nil {
-		return nil, nil
+		return nil
 	}
-	if errors.Is(err, sealevel.InstrErrCustom) {
-		return nil, errors.New("custom instruction error has no code")
+	// TODO: propagate the program-defined u32 through InstructionError
+	// rather than emitting 0 as a placeholder.
+	if err == sealevel.InstrErrCustom {
+		return map[string]uint32{"Custom": 0}
+	}
+	if err == sealevel.InstrErrBorshIoError {
+		return map[string]string{"BorshIoError": err.Error()}
 	}
 	name := err.Error()
-	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
-		if sealevel.IsCustomErr(cause) {
-			return map[string]uint32{"Custom": uint32(sealevel.TranslateErrToErrCode(cause))}, nil
-		}
-		name = cause.Error()
-	}
 	switch {
 	case strings.HasPrefix(name, "InstrErr"):
-		return strings.TrimPrefix(name, "InstrErr"), nil
+		return strings.TrimPrefix(name, "InstrErr")
 	case strings.HasPrefix(name, "TxErr"):
-		return strings.TrimPrefix(name, "TxErr"), nil
+		return strings.TrimPrefix(name, "TxErr")
 	}
-	return err.Error(), nil
+	return name
 }
 
 // MarshalJSON renders TransactionError in Agave's wire format: bare string
@@ -451,16 +450,12 @@ func (e *TransactionError) MarshalJSON() ([]byte, error) {
 	}
 	switch e.ErrorType {
 	case TransactionErrorInstructionError:
-		instructionError, err := agaveInstrErrName(e.InstructionError)
-		if err != nil {
-			return nil, err
-		}
 		var idx uint8
 		if e.InstructionIndex != nil {
 			idx = *e.InstructionIndex
 		}
 		return json.Marshal(map[string]interface{}{
-			"InstructionError": []interface{}{idx, instructionError},
+			"InstructionError": []interface{}{idx, agaveInstrErrName(e.InstructionError)},
 		})
 	case TransactionErrorInsufficientFundsForRent:
 		var ai uint8

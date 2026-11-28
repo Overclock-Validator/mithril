@@ -1,12 +1,11 @@
 # Alpenglow Branch Engine
 
-This document describes the engine selected by `network.cluster = "alpenglow"`.
-It uses an **execute-on-receipt** model where certificates gate *promotion to
-durable state* rather than execution.
+This document describes the engine every cluster runs (`mainnet`, `testnet`,
+`devnet`, and custom clusters). It uses an **execute-on-receipt** model where
+certificates gate *promotion to durable state* rather than execution.
 
-> `mainnet-beta`, `testnet`, and `devnet` do not enter this path. They retain
-> Mithril's established verifying-only RPC replay and per-slot persistence;
-> validator mode is rejected for those clusters.
+> The cluster name only selects the chain (its genesis hash and default
+> network endpoints); it never selects a replay path.
 
 ## Model in one paragraph
 

@@ -155,8 +155,6 @@ func newRealFeedRig(t *testing.T, dest solana.PublicKey, eventBuffer int) *realF
 		persistedHashes:     &persistedTracker{},
 		tail:                rig.tail,
 		transactionStatuses: rig.statuses,
-		alpenglowMode:       true,
-		unrootedTailUsed:    true,
 		lastSlotCtx:         func() *sealevel.SlotCtx { return rig.lastCtx },
 		frontier:            func() uint64 { return realFeedParentSlot },
 		frontierMark:        func() streamingFrontierMark { return rig.mark },

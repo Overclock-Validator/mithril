@@ -3,6 +3,7 @@ package replay
 import (
 	"errors"
 	"math"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
@@ -18,6 +19,14 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
+func overrideFor(overrides map[solana.PublicKey]*accounts.Account, tx *solana.Transaction) (*accounts.Account, bool) {
+	if len(overrides) == 0 || len(tx.Message.AccountKeys) == 0 {
+		return nil, false
+	}
+	acct, ok := overrides[tx.Message.AccountKeys[0]]
+	return acct, ok
+}
+
 // LoadAndExecuteTransactionInput contains all the input state needed for pure transaction processing
 type LoadAndExecuteTransactionInput struct {
 	// SlotCtx provides access to accounts and slot state (used read-only)
@@ -30,6 +39,21 @@ type LoadAndExecuteTransactionInput struct {
 	TxMeta *rpc.TransactionMeta
 	// IsSimulation indicates this is a simulation (no side effects on shared state)
 	IsSimulation bool
+	// Speculative and PrivateParameters set the ExecutionCtx fields (see there).
+	SpeculativeCancel *atomic.Bool
+	Speculative       bool
+	PrivateParameters bool
+	// PrivateAccounts gives the execution deep copies of every loaded account
+	// instead of shared committed objects (diagnostic).
+	PrivateAccounts bool
+	// PrivatePrograms sets ExecutionCtx.PrivatePrograms (diagnostic).
+	PrivatePrograms bool
+	// AccountOverrides replaces the bank's state of these accounts for this
+	// execution (an early execution's predicted state): the fee-payer check,
+	// the account loaders and execution all read them, never slot state.
+	// Overrides are treated as shared: a write clones them, so the caller's
+	// objects stay unchanged.
+	AccountOverrides map[solana.PublicKey]*accounts.Account
 	// RecordInnerInstructions enables CPI recording. The simulate handler
 	// sets this when the RPC request asks for innerInstructions.
 	RecordInnerInstructions bool
@@ -39,9 +63,11 @@ type LoadAndExecuteTransactionInput struct {
 	// leaves this false to retain the rich result.
 	LeanResult bool
 	// SkipTimingMetrics omits the detailed transaction and instruction-dispatch
-	// timings for leader execution. Replay and simulation retain their default
-	// instrumentation; program-specific instrumentation is independent.
+	// timings for leader execution. Replay retains them unless SkipPhaseTimers
+	// is set; program-specific instrumentation is independent.
 	SkipTimingMetrics bool
+	// TimingRecorder is owned by the calling worker, never retained in a result.
+	TimingRecorder *metrics.TransactionTimings
 	// CapturePreBalances retains pre-fee balances in lean mode. Rich mode
 	// always captures them for RPC compatibility.
 	CapturePreBalances bool
@@ -86,13 +112,13 @@ func feePayerTransactionError(err error) (TransactionErrorType, *uint8) {
 // feeOnlyRollbackAccountsDataSize reproduces the pre-amendment SIMD-0186
 // accounting for a fees-only transaction: the raw data lengths of the
 // rollback fee payer and, for a distinct durable nonce, the nonce account.
-func feeOnlyRollbackAccountsDataSize(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []sealevel.Instruction) uint32 {
+func feeOnlyRollbackAccountsDataSize(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []sealevel.Instruction, overrides map[solana.PublicKey]*accounts.Account) uint32 {
 	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 {
 		return 0
 	}
 
 	load := func(key solana.PublicKey) *accounts.Account {
-		acct, err := slotCtx.GetAccountShared(key)
+		acct, err := sharedAccount(slotCtx, overrides, key)
 		if err == nil {
 			return acct
 		}
@@ -189,7 +215,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				},
 			}
 		}
-		metrics.GlobalBlockReplay.InstructionsAndAccountMetasFromTx.AddTimingSince(start)
+		input.TimingRecorder.AddTimingSince(metrics.TransactionInstructionsAndAccountMetasFromTx, start)
 
 		// Compute budget limits
 		start = metrics.StartTiming(!input.SkipTimingMetrics)
@@ -205,7 +231,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				Instrs: instrs,
 			}
 		}
-		metrics.GlobalBlockReplay.ComputeBudgetExecutionInstructions.AddTimingSince(start)
+		input.TimingRecorder.AddTimingSince(metrics.TransactionComputeBudgetExecutionInstructions, start)
 
 	}
 
@@ -227,7 +253,13 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	// especially visible for V1, whose omitted loaded-data limit defaults to
 	// zero. Deduction still occurs on the transaction-local clone below so this
 	// function remains side-effect free.
-	validatedFeeInfo, payerErr := fees.ValidateTransactionFeePayer(slotCtx, tx, instrs, computeBudgetLimits)
+	var validatedFeeInfo *fees.TxFeeInfo
+	var payerErr error
+	if payer, ok := overrideFor(input.AccountOverrides, tx); ok {
+		validatedFeeInfo, payerErr = fees.ValidateTransactionFeePayerAccount(slotCtx, tx, instrs, computeBudgetLimits, payer)
+	} else {
+		validatedFeeInfo, payerErr = fees.ValidateTransactionFeePayer(slotCtx, tx, instrs, computeBudgetLimits)
+	}
 	if payerErr != nil {
 		errType, accountIndex := feePayerTransactionError(payerErr)
 		isNoOp := slotCtx.Features.IsActive(features.RelaxFeePayerConstraint) &&
@@ -268,9 +300,17 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	var loadedAccountsDataSize uint32
 
 	if slotCtx.Features.IsActive(features.FormalizeLoadedTransactionDataSize) {
-		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAcctsSimd186(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
+		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAcctsSimd186(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes, input.AccountOverrides)
 	} else {
-		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAccts(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
+		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAccts(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes, input.AccountOverrides)
+	}
+	if input.PrivateAccounts && transactionAccts != nil {
+		for i, acct := range transactionAccts.Accounts {
+			if transactionAccts.Shared[i] {
+				transactionAccts.Accounts[i] = acct.Clone()
+				transactionAccts.Shared[i] = false
+			}
+		}
 	}
 
 	// Base output fields for all paths after parsing
@@ -282,7 +322,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 
 	if err == TxErrMaxLoadedAccountsDataSizeExceeded || err == TxErrInvalidProgramForExecution || err == TxErrProgramAccountNotFound {
 		if !slotCtx.Features.IsActive(features.DefineLtdsFeeOnlySemantics) {
-			loadedAccountsDataSize = feeOnlyRollbackAccountsDataSize(slotCtx, tx, instrs)
+			loadedAccountsDataSize = feeOnlyRollbackAccountsDataSize(slotCtx, tx, instrs, input.AccountOverrides)
 		}
 		errType := mapLoadErrorType(err)
 		out := LoadAndExecuteTransactionOutput{
@@ -308,7 +348,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		baseFields(&out)
 		return out
 	}
-	metrics.GlobalBlockReplay.AccountsFromTx.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionAccountsFromTx, start)
 
 	// Create execution context
 	var logRecorder *sealevel.LogRecorder
@@ -318,12 +358,19 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		logger = logRecorder
 	}
 	execCtx := newExecCtx(slotCtx, transactionAccts, computeBudgetLimits, logger)
-	execCtx.SkipStableLogs = logRecorder == nil
 	execCtx.TransactionContext.AllInstructions = instrs
 	execCtx.TransactionContext.Signature = tx.Signatures[0]
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena
 	execCtx.IsSimulation = input.IsSimulation
+	execCtx.Speculative = input.Speculative
+	if input.Speculative {
+		execCtx.SpeculativeCancel = input.SpeculativeCancel
+	}
+	execCtx.PrivateParameters = input.PrivateParameters
+	execCtx.PrivatePrograms = input.PrivatePrograms
 	execCtx.SkipTimingMetrics = input.SkipTimingMetrics
+	execCtx.TimingRecorder = input.TimingRecorder
+	defer func() { execCtx.TimingRecorder = nil }()
 	execCtx.RecordInnerInstructions = input.RecordInnerInstructions
 
 	// Capture pre-balance lamports (before fee deduction)
@@ -373,7 +420,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		baseFields(&out)
 		return out
 	}
-	metrics.GlobalBlockReplay.CalcAndDeductFees.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionCalcAndDeductFees, start)
 
 	// Read rent sysvar
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
@@ -392,20 +439,18 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			ComputeBudgetLimits: computeBudgetLimits,
 		}
 	}
-	metrics.GlobalBlockReplay.ReadRentSysvar.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionReadRentSysvar, start)
 
 	// Set rent-exempt rent epoch max and compute pre-tx rent states
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	rent.MaybeSetRentExemptRentEpochMax(slotCtx, &rentSysvar, &execCtx.Features, &execCtx.TransactionContext.Accounts)
 	preTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
-	metrics.GlobalBlockReplay.PreTxRentStates.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionPreTxRentStates, start)
 
 	// Execute all instructions
 	var instrErr error
-	var currentInstrIdx uint8
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	for instrIdx, instr := range tx.Message.Instructions {
-		currentInstrIdx = uint8(instrIdx)
 		execCtx.SetCurrentTopLevelInstr(uint8(instrIdx))
 		if instructionsSysvarIdx >= 0 {
 			ixStart := metrics.StartTiming(!input.SkipTimingMetrics)
@@ -414,7 +459,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				instrErr = err
 				break
 			}
-			metrics.GlobalBlockReplay.FixupInstructionsSysvarAccount.AddTimingSince(ixStart)
+			input.TimingRecorder.AddTimingSince(metrics.TransactionFixupInstructionsSysvarAccount, ixStart)
 		}
 
 		instructionAccts := instructionAcctsPerInstr[instrIdx]
@@ -438,28 +483,28 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			}
 		} else {
 			instrErr = err
+			if depTraceDir != "" {
+				depTraceFailedPrefix(tx, instructionAcctsPerInstr, instrIdx)
+			}
 			break
 		}
 	}
-	metrics.GlobalBlockReplay.IxLoop.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionIxLoop, start)
 
 	// Check rent state transitions
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	postTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
 	rentStateErr := rent.VerifyRentStateChanges(preTxRentStates, postTxRentStates, execCtx.TransactionContext)
-	metrics.GlobalBlockReplay.PostTxRentStates.AddTimingSince(start)
+	input.TimingRecorder.AddTimingSince(metrics.TransactionPostTxRentStates, start)
 
 	// If there was an error, return failed transaction result
 	if instrErr != nil || rentStateErr != nil {
 		var relevantErr error
 		var errType TransactionErrorType
-		var instructionIndex *uint8
 		var accountIndex *uint8
 		if instrErr != nil {
 			relevantErr = instrErr
 			errType = TransactionErrorInstructionError
-			idx := currentInstrIdx
-			instructionIndex = &idx
 		} else {
 			relevantErr = rentStateErr
 			errType = TransactionErrorInsufficientFundsForRent
@@ -474,7 +519,6 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			ProcessingResult: TransactionProcessingResult{
 				TransactionError: &TransactionError{
 					ErrorType:        errType,
-					InstructionIndex: instructionIndex,
 					InstructionError: relevantErr,
 					AccountIndex:     accountIndex,
 				},
