@@ -2,6 +2,7 @@ package sealevel
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -73,6 +74,29 @@ func (sr *SysvarSlotHistory) MustUnmarshalWithDecoder(decoder *bin.Decoder) {
 }
 
 func (sr *SysvarSlotHistory) MustMarshal() []byte {
+	n := sr.Bits.Bits.BlocksLen
+	if n <= slotHistoryMaxEntries/bitsPerBlock && n <= uint64(len(sr.Bits.Bits.Blocks)) {
+		capacity := 1 + 2*8
+		if n != 0 {
+			capacity += 8 + int(n)*8
+		}
+		out := make([]byte, 0, capacity)
+		if n == 0 {
+			out = append(out, 0)
+		} else {
+			out = append(out, 1)
+			out = binary.LittleEndian.AppendUint64(out, n)
+			for _, word := range sr.Bits.Bits.Blocks[:int(n)] {
+				out = binary.LittleEndian.AppendUint64(out, word)
+			}
+		}
+		out = binary.LittleEndian.AppendUint64(out, sr.Bits.Len)
+		return binary.LittleEndian.AppendUint64(out, sr.NextSlot)
+	}
+	return sr.mustMarshalSlotHistoryBuffer()
+}
+
+func (sr *SysvarSlotHistory) mustMarshalSlotHistoryBuffer() []byte {
 	data := new(bytes.Buffer)
 	enc := bin.NewBinEncoder(data)
 
