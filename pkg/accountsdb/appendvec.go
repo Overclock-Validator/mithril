@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/util"
@@ -118,15 +119,29 @@ func (parser *appendVecParser) parseNextAcct(pk *solana.PublicKey, a *AccountInd
 }
 
 func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
+	return acct.unmarshal(buf, math.MaxUint64)
+}
+
+func (acct *AppendVecAccount) unmarshal(buf io.Reader, maxDataBytes uint64) error {
+	return acct.unmarshalWithBudget(buf, maxDataBytes, nil)
+}
+
+func (acct *AppendVecAccount) unmarshalWithBudget(buf io.Reader, maxDataBytes uint64, budget *accountDataBudget) error {
 	var err error
 	var hdrBytes [hdrLen]byte
-	_, err = buf.Read(hdrBytes[:])
+	_, err = io.ReadFull(buf, hdrBytes[:])
 	if err != nil {
 		return err
 	}
 
 	acct.WriteVersion = binary.LittleEndian.Uint64(hdrBytes[:8])
 	acct.DataLen = binary.LittleEndian.Uint64(hdrBytes[8:16])
+	if acct.DataLen > maxDataBytes {
+		return accountDataLimitError(acct.DataLen, maxDataBytes)
+	}
+	if err := budget.reserve(acct.DataLen); err != nil {
+		return err
+	}
 	copy(acct.Pubkey[:], hdrBytes[16:48])
 	acct.Lamports = binary.LittleEndian.Uint64(hdrBytes[48:56])
 	acct.RentEpoch = binary.LittleEndian.Uint64(hdrBytes[56:64])
@@ -136,7 +151,7 @@ func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
 	copy(acct.Hash[:], hdrBytes[104:136])
 
 	acct.Data = make([]byte, acct.DataLen)
-	_, err = buf.Read(acct.Data)
+	_, err = io.ReadFull(buf, acct.Data)
 
 	return err
 }
